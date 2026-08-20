@@ -1,0 +1,4 @@
+<resources>
+    <string name="test_student_id" translatable="false">admin</string>
+    <string name="test_password" translatable="false">admin</string>
+</resources>
