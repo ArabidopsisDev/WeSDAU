@@ -1,18 +1,55 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
 
+val keystorePropertiesFile = rootProject.file("keystore.properties")
+val keystoreProperties = Properties().apply {
+    if (keystorePropertiesFile.exists()) {
+        keystorePropertiesFile.inputStream().use(::load)
+    }
+}
+
 android {
-    namespace = "com.sdau.classschedule"
+    namespace = "com.sdau.campuskit"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.sdau.classschedule"
+        applicationId = "com.sdau.campuskit"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "V0.2"
+        versionCode = 3
+        versionName = "0.2.1"
+        resourceConfigurations += setOf("zh", "en")
+    }
+
+    signingConfigs {
+        if (keystorePropertiesFile.exists()) {
+            create("release") {
+                storeFile = rootProject.file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
+                enableV4Signing = true
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            signingConfigs.findByName("release")?.let { signingConfig = it }
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
     }
 
     compileOptions {

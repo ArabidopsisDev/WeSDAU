@@ -47,3 +47,8 @@ local.defaults.properties
 Thumbs.db
 desktop.ini
 
+# Android Studio exported releases
+/app/release/
+
+# Protect the entire signing directory
+/signing/

@@ -1,4 +1,8 @@
 <resources>
     <string name="test_student_id" translatable="false">admin</string>
     <string name="test_password" translatable="false">admin</string>
+    <string name="widget_description">显示接下来的两门课程</string>
+    <string name="widget_name_large">详细课程</string>
+    <string name="widget_name_compact">缩略课程</string>
+    <string name="widget_compact_description">紧凑显示接下来的两门课程</string>
 </resources>

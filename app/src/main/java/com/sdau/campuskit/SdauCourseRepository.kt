@@ -1,0 +1,573 @@
+package com.sdau.campuskit
+
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.OutputStreamWriter
+import java.net.CookieHandler
+import java.net.CookieManager
+import java.net.CookiePolicy
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+import java.nio.charset.Charset
+import java.nio.charset.StandardCharsets
+import java.util.Base64
+import java.util.Locale
+
+data class RemoteCourse(
+    val day: Int,
+    val startSlot: Int,
+    val slotCount: Int,
+    val name: String,
+    val room: String,
+    val teacher: String,
+    val weeks: String = "",
+    val courseCode: String = ""
+)
+
+data class RemoteScore(
+    val courseCode: String,
+    val courseName: String,
+    val credit: String,
+    val score: String,
+    val gpa: String,
+    val studentIdRaw: String = "",
+    val teachingTaskId: String = "",
+    val scoreRecordId: String = ""
+)
+
+data class RemoteScoreResult(
+    val term: String,
+    val records: List<RemoteScore>,
+    val averageScore: String,
+    val averageCreditGpa: String,
+    val totalCredits: String
+)
+
+fun scoreToNumericValue(score: String): Double? {
+    val normalized = score.trim().replace(Regex("\\s+"), "")
+    return when (normalized) {
+        "优秀" -> 95.0
+        "良好" -> 85.0
+        "中等" -> 75.0
+        "及格" -> 65.0
+        "不及格", "不合格" -> 0.0
+        else -> normalized.toDoubleOrNull()
+    }
+}
+
+fun scoreToGradePoint(score: String): Double? {
+    val numericScore = scoreToNumericValue(score) ?: return null
+    return if (numericScore < 60.0) 0.0 else numericScore / 10.0 - 5.0
+}
+
+private fun formatGradePoint(value: Double): String = String.format(Locale.US, "%.1f", value)
+
+fun applyCalculatedGradePoints(records: List<RemoteScore>): List<RemoteScore> = records.map { record ->
+    record.copy(gpa = scoreToGradePoint(record.score)?.let(::formatGradePoint) ?: "-")
+}
+
+fun calculateAverageCreditGpa(records: List<RemoteScore>): String {
+    val weightedCourses = records.mapNotNull { record ->
+        val credit = record.credit.toDoubleOrNull()?.takeIf { it > 0.0 } ?: return@mapNotNull null
+        val gradePoint = scoreToGradePoint(record.score) ?: return@mapNotNull null
+        credit to gradePoint
+    }
+    val validCredits = weightedCourses.sumOf { it.first }
+    return if (validCredits > 0.0) {
+        String.format(Locale.US, "%.2f", weightedCourses.sumOf { it.first * it.second } / validCredits)
+    } else {
+        "-"
+    }
+}
+
+fun calculateAverageScore(records: List<RemoteScore>): String {
+    val numericScores = records.mapNotNull { scoreToNumericValue(it.score) }
+    return if (numericScores.isNotEmpty()) {
+        String.format(Locale.US, "%.2f", numericScores.average())
+    } else {
+        "-"
+    }
+}
+
+fun recalculateScoreResult(
+    result: RemoteScoreResult,
+    allTermRecords: List<RemoteScore> = result.records
+): RemoteScoreResult {
+    return result.copy(
+        records = applyCalculatedGradePoints(result.records),
+        averageScore = calculateAverageScore(allTermRecords),
+        averageCreditGpa = calculateAverageCreditGpa(allTermRecords)
+    )
+}
+
+data class RemoteScoreDetail(
+    val usualScore: String,
+    val usualRatio: String,
+    val finalScore: String,
+    val finalRatio: String,
+    val totalScore: String
+)
+
+data class RemoteExam(
+    val courseName: String,
+    val examWeek: String,
+    val examWeekday: String,
+    val examSessions: String,
+    val classroom: String
+)
+
+private data class RemoteMeeting(val day: Int, val startSlot: Int, val slotCount: Int, val weeks: String)
+private data class PersonalMeeting(val name: String, val code: String, val day: Int, val startSlot: Int, val slotCount: Int, val weeks: String, val room: String)
+
+class SdauCourseRepository {
+    private val cookies = CookieManager(null, CookiePolicy.ACCEPT_ALL)
+
+    init {
+        CookieHandler.setDefault(cookies)
+    }
+
+    fun queryCourses(account: String, password: String, term: String): List<RemoteCourse> {
+        login(account, password)
+        val path = "/xkgl/loadXsxkjgList?lx=xkrz&type=list&pageNum=1&pageSize=200&xnxqid=" +
+            URLEncoder.encode(term, "UTF-8")
+        val selected = try {
+            parseCourses(requestStage("读取已选课程") { request(path, "GET", null) })
+        } catch (error: Exception) {
+            throw IllegalStateException("已选课结果解析失败：${error.message ?: "返回数据格式异常"}", error)
+        }
+        val personal = runCatching {
+            parsePersonalTimetable(request("/xskb/xskb_list.do?viweType=0&xnxq01id=" + URLEncoder.encode(term, "UTF-8"), "GET", null))
+        }.getOrDefault(emptyList())
+        return selected.map { course ->
+            val weeks = findPersonalWeeks(course, personal)
+            if (weeks.isBlank()) course else course.copy(weeks = weeks)
+        }
+    }
+
+    fun queryScores(
+        account: String,
+        password: String,
+        term: String,
+        allTerms: List<String> = listOf(term)
+    ): RemoteScoreResult {
+        login(account, password)
+        val formPath = "/kscj/cjcx_frm"
+        requestStage("打开成绩查询页") { request(formPath, "GET", null) }
+        val referer = "$BASE_URL$formPath"
+        fun scorePath(selectedTerm: String): String {
+            val parameters = linkedMapOf(
+                "pageNum" to "1",
+                "pageSize" to "200",
+                "kksj" to selectedTerm,
+                "kcxz" to "",
+                "kcsx" to "",
+                "kcmc" to "",
+                "xsfs" to "all",
+                "sfxsbcxq" to "1"
+            )
+            return "/kscj/cjcx_list?" + parameters.entries.joinToString("&") {
+                URLEncoder.encode(it.key, "UTF-8") + "=" + URLEncoder.encode(it.value, "UTF-8")
+            }
+        }
+        val listBody = requestStage("读取课程成绩") {
+            request(scorePath(term), "GET", null, referer)
+        }
+        val summaryBody = runCatching {
+            request(scorePath(""), "GET", null, referer)
+        }.getOrDefault("{}")
+        val selectedRecords = parseScoreRecords(listBody, term)
+        val allTermRecords = allTerms.distinct().flatMap { scoreTerm ->
+            if (scoreTerm == term) {
+                selectedRecords
+            } else {
+                parseScoreRecords(
+                    requestStage("读取 $scoreTerm 学期成绩") {
+                        request(scorePath(scoreTerm), "GET", null, referer)
+                    },
+                    scoreTerm
+                )
+            }
+        }
+        return parseScoreResult(selectedRecords, summaryBody, term, allTermRecords)
+    }
+
+    fun queryExams(account: String, password: String, term: String): List<RemoteExam> {
+        login(account, password)
+
+        // 正常考试安排接口先接入请求链路。当前尚无可验证样本，保留原始响应但暂不参与展示解析。
+        val scheduledPath = "/xsks/xsksap_list?pageNum=1&pageSize=20&xnxqid=" +
+            URLEncoder.encode(term, "UTF-8") + "&xqlb="
+        runCatching {
+            requestStage("读取考试安排") { request(scheduledPath, "GET", null) }
+        }
+
+        val earlyPath = "/xsks/xsstk_list?pageNum=1&pageSize=20&xnxqid=" +
+            URLEncoder.encode(term, "UTF-8") + "&kslb="
+        val earlyBody = requestStage("读取提前考试安排") {
+            request(earlyPath, "GET", null)
+        }
+        return parseEarlyExams(earlyBody)
+    }
+
+    fun queryScoreDetail(account: String, password: String, score: RemoteScore): RemoteScoreDetail {
+        if (score.studentIdRaw.isBlank() || score.teachingTaskId.isBlank() || score.scoreRecordId.isBlank()) {
+            throw IllegalStateException("该课程缺少成绩明细参数")
+        }
+        login(account, password)
+        val parameters = linkedMapOf(
+            "xs0101id" to score.studentIdRaw,
+            "jx0404id" to score.teachingTaskId,
+            "cj0708id" to score.scoreRecordId,
+            "zcj" to score.score
+        )
+        val path = "/kscj/pscj_list.do?" + parameters.entries.joinToString("&") {
+            URLEncoder.encode(it.key, "UTF-8") + "=" + URLEncoder.encode(it.value, "UTF-8")
+        }
+        val body = requestStage("读取成绩构成") { request(path, "GET", null) }
+        val arrayText = Regex("(?:let\\s+)?arr\\s*=\\s*(\\[[\\s\\S]*?]);?", RegexOption.IGNORE_CASE)
+            .find(body.trimStart('\uFEFF'))?.groupValues?.getOrNull(1)
+            ?: throw IllegalStateException("成绩构成接口返回格式异常")
+        val first = runCatching { JSONArray(arrayText).optJSONObject(0) }.getOrNull()
+            ?: throw IllegalStateException("暂无成绩构成数据")
+        // 教务页面的字段语义与编号相反：cjxm3 是平时，cjxm1 是期末。
+        return RemoteScoreDetail(
+            usualScore = jsonText(first, "cjxm3").ifBlank { "-" },
+            usualRatio = jsonText(first, "cjxm3bl").ifBlank { "-" },
+            finalScore = jsonText(first, "cjxm1").ifBlank { "-" },
+            finalRatio = jsonText(first, "cjxm1bl").ifBlank { "-" },
+            totalScore = jsonText(first, "zcj").ifBlank { score.score.ifBlank { "-" } }
+        )
+    }
+
+    private fun login(account: String, password: String) {
+        val loginPage = requestStage("读取登录页") { request("/", "GET", null) }
+        val scode = capture(loginPage, "var\\s+scode\\s*=\\s*['\"](.*?)['\"]")
+        val sxh = capture(loginPage, "var\\s+sxh\\s*=\\s*['\"](.*?)['\"]")
+        if (scode.isEmpty() || sxh.isEmpty()) throw IllegalStateException("无法提取登录动态参数")
+
+        val form = linkedMapOf(
+            "loginMethod" to "LoginToXk",
+            "userlanguage" to "0",
+            "userAccount" to account,
+            "userPassword" to "",
+            "encoded" to buildCredential(account, password, scode, sxh)
+        )
+        val loginResponse = requestStage("提交登录") { request("/xk/LoginToXk", "POST", form) }
+        if (loginResponse.contains("请先登录系统") || loginResponse.contains("欢迎登录教务系统")) {
+            throw IllegalArgumentException("学号或密码错误")
+        }
+    }
+
+    private fun parseScoreRecords(listBody: String, term: String): List<RemoteScore> {
+        val rows = normalizeJsonRows(listBody)
+        val records = mutableListOf<RemoteScore>()
+        for (index in 0 until rows.length()) {
+            val row = rows.optJSONObject(index) ?: continue
+            val courseCode = jsonText(row, "kch", "courseCode", "kcdm")
+            val courseName = jsonText(row, "kc_mc", "kcmc", "courseName")
+            if (courseCode.isBlank() && courseName.isBlank()) continue
+            records += RemoteScore(
+                courseCode = courseCode,
+                courseName = courseName,
+                credit = jsonText(row, "xf", "credit"),
+                score = jsonText(row, "zcj", "zcjstr", "score").ifBlank { "-" },
+                // 单科绩点统一由总成绩换算，不采用教务系统更新可能滞后的 jd 字段。
+                gpa = "-",
+                studentIdRaw = jsonText(row, "xs0101id"),
+                teachingTaskId = jsonText(row, "jx0404id"),
+                scoreRecordId = jsonText(row, "cj0708id")
+            )
+        }
+        return records.distinctBy {
+            it.scoreRecordId.ifBlank { "$term|${it.courseCode}|${it.courseName}" }
+        }
+    }
+
+    private fun parseScoreResult(
+        selectedRecords: List<RemoteScore>,
+        summaryBody: String,
+        term: String,
+        allTermRecords: List<RemoteScore>
+    ): RemoteScoreResult {
+        val unique = selectedRecords
+        val summary = runCatching { JSONObject(summaryBody.trimStart('\uFEFF').trim()) }.getOrNull()
+        val credits = unique.mapNotNull { it.credit.toDoubleOrNull() }
+        return recalculateScoreResult(RemoteScoreResult(
+            term = term,
+            records = unique,
+            averageScore = "-",
+            averageCreditGpa = "-",
+            totalCredits = summary?.let { jsonText(it, "sxzxf") }.orEmpty()
+                .ifBlank { credits.takeIf { it.isNotEmpty() }?.sum()?.let { formatNumber(it) }.orEmpty() }
+                .ifBlank { "-" }
+        ), allTermRecords)
+    }
+
+    private fun parseEarlyExams(body: String): List<RemoteExam> {
+        val root = runCatching { JSONObject(body.trimStart('\uFEFF').trim()) }.getOrElse {
+            throw IllegalStateException("提前考试接口返回格式异常")
+        }
+        if (root.optInt("code", 0) != 0) {
+            throw IllegalStateException(root.optString("msg").ifBlank { "提前考试接口查询失败" })
+        }
+        val data = root.optJSONArray("data") ?: JSONArray()
+        return buildList {
+            for (index in 0 until data.length()) {
+                val row = data.optJSONObject(index) ?: continue
+                val courseName = jsonText(row, "kc_mc")
+                if (courseName.isBlank()) continue
+                add(RemoteExam(
+                    courseName = courseName,
+                    examWeek = normalizeExamNumber(jsonText(row, "kszc")),
+                    examWeekday = normalizeExamNumber(jsonText(row, "ksxq")),
+                    examSessions = normalizeExamSessions(jsonText(row, "ksjc")),
+                    classroom = jsonText(row, "js_mc").ifBlank { "-" }
+                ))
+            }
+        }.distinct()
+    }
+
+    private fun normalizeExamNumber(value: String): String = value.trim().toIntOrNull()?.toString()
+        ?: value.trim().trimStart('0').ifBlank { value.trim() }
+
+    private fun normalizeExamSessions(value: String): String {
+        val numbers = Regex("\\d+").findAll(value).mapNotNull { it.value.toIntOrNull() }.toList()
+        return when {
+            numbers.size >= 2 -> "${numbers.first()}-${numbers.last()}"
+            numbers.size == 1 -> numbers.first().toString()
+            else -> value.trim()
+        }
+    }
+
+    private fun normalizeJsonRows(body: String): JSONArray {
+        val raw = body.trimStart('\uFEFF').trim()
+        runCatching { JSONArray(raw) }.getOrNull()?.let { return it }
+        val root = runCatching { JSONObject(raw) }.getOrElse {
+            throw IllegalStateException("课程成绩接口返回格式异常")
+        }
+        return root.optJSONArray("rows") ?: root.optJSONArray("data") ?: root.optJSONArray("list")
+            ?: root.optJSONArray("result") ?: JSONArray()
+    }
+
+    private fun jsonText(row: JSONObject, vararg keys: String): String {
+        keys.forEach { key ->
+            if (row.has(key) && !row.isNull(key)) return row.opt(key)?.toString()?.trim().orEmpty()
+        }
+        return ""
+    }
+
+    private fun formatNumber(value: Double): String = if (value % 1.0 == 0.0) value.toInt().toString() else "%.1f".format(value)
+
+    /**
+     * The selected-course endpoint owns the placement.  The HTML timetable is
+     * used solely to fill its precise week range: merged cells on that page can
+     * report a shifted weekday, so requiring every field to match loses valid
+     * data.
+     */
+    private fun findPersonalWeeks(course: RemoteCourse, personal: List<PersonalMeeting>): String {
+        val related = personal.filter { item ->
+            val sameCode = course.courseCode.isNotBlank() && item.code.isNotBlank() && item.code == course.courseCode
+            sameCode || item.name == course.name
+        }
+        fun oneRange(items: List<PersonalMeeting>): String {
+            val values = items.map { it.weeks.trim() }.filter { it.isNotBlank() }
+            return if (values.isEmpty()) "" else normalizeWeekText(values.joinToString(","))
+        }
+
+        return oneRange(related.filter {
+            it.day == course.day && it.startSlot == course.startSlot && it.slotCount == course.slotCount
+        }).ifBlank {
+            oneRange(related.filter {
+                it.startSlot == course.startSlot && it.slotCount == course.slotCount
+            })
+        }.ifBlank {
+            oneRange(related)
+        }
+    }
+
+    private inline fun requestStage(stage: String, action: () -> String): String {
+        return try {
+            action()
+        } catch (error: Exception) {
+            throw IllegalStateException("${stage}失败：${error.message ?: "网络或教务系统响应异常"}", error)
+        }
+    }
+
+    private fun parseCourses(body: String): List<RemoteCourse> {
+        val data = JSONObject(body).optJSONArray("data")
+            ?: throw IllegalStateException("教务系统课程数据格式变化")
+        val result = mutableListOf<RemoteCourse>()
+        for (index in 0 until data.length()) {
+            val item = data.optJSONObject(index) ?: continue
+            val name = clean(item.optString("kc_mc"))
+            if (name.isEmpty()) continue
+            val teacher = clean(item.optString("xm"))
+            val courseCode = clean(item.optString("kch"))
+            val roomLines = splitLines(item.optString("skdd"))
+            parseMeetings(item.optString("sksj")).forEachIndexed { meetingIndex, meeting ->
+                val room = roomLines.getOrNull(meetingIndex) ?: roomLines.firstOrNull().orEmpty()
+                result += RemoteCourse(meeting.day, meeting.startSlot, meeting.slotCount, name, room, teacher, meeting.weeks, courseCode)
+            }
+        }
+        // Keep alternating/short-term classes that share a time and room but
+        // differ in their week ranges.
+        return result.distinct()
+    }
+
+    private fun parsePersonalTimetable(html: String): List<PersonalMeeting> {
+        val rowRegex = Regex("<tr[^>]*>(.*?)</tr>", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+        val cellRegex = Regex("<td[^>]*>(.*?)</td>", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+        val detailRegex = Regex("时间\\s*:\\s*(.*?)\\s*\\[(\\d+)(?:-(\\d+))?节\\]\\s*;\\s*地点\\s*:\\s*([^;]+?)\\s*;\\s*课程编号\\s*:\\s*([A-Za-z0-9]+)", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+        val courseRegex = Regex("([^;]+?)\\s+老师\\s*:\\s*[^;]*;\\s*时间\\s*:\\s*(.*?)\\s*\\[(\\d+)(?:-(\\d+))?节\\]\\s*;\\s*地点\\s*:\\s*([^;]+?)\\s*;\\s*课程编号\\s*:\\s*([A-Za-z0-9]+)", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+        val itemRegex = Regex("<li[^>]*class=[\\\"'][^\\\"']*courselists-item[^\\\"']*[\\\"'][^>]*>(.*?)</li>", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+        val titleRegex = Regex("qz-hasCourse-title[^>]*>(.*?)</div>", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+        val result = mutableListOf<PersonalMeeting>()
+        rowRegex.findAll(html).forEach { row ->
+            val cells = cellRegex.findAll(row.groupValues[1]).map { it.groupValues[1] }.toList()
+            for (index in 1 until minOf(cells.size, 8)) {
+                val cell = cells[index]
+                itemRegex.findAll(cell).forEach itemLoop@ { item ->
+                    val nameMatch = titleRegex.find(item.groupValues[1]) ?: return@itemLoop
+                    val name = clean(nameMatch.groupValues[1])
+                    val match = detailRegex.find(stripTags(item.groupValues[1])) ?: return@itemLoop
+                    val start = match.groupValues[2].toIntOrNull()?.minus(1) ?: return@itemLoop
+                    val end = (match.groupValues[3].toIntOrNull()?.minus(1) ?: start)
+                    if (start !in 0..9 || end !in start..9) return@itemLoop
+                    result += PersonalMeeting(name, match.groupValues[5].trim(), index - 1, start, end - start + 1, normalizeWeekText(match.groupValues[1]), clean(match.groupValues[4]))
+                }
+                // Newer timetable pages can use plain text cells instead of
+                // courselists-item nodes.
+                courseRegex.findAll(stripTags(cell)).forEach courseLoop@ { match ->
+                    val start = match.groupValues[3].toIntOrNull()?.minus(1) ?: return@courseLoop
+                    val end = match.groupValues[4].toIntOrNull()?.minus(1) ?: start
+                    if (start !in 0..9 || end !in start..9) return@courseLoop
+                    result += PersonalMeeting(clean(match.groupValues[1]), match.groupValues[6].trim(), index - 1, start, end - start + 1, normalizeWeekText(match.groupValues[2]), clean(match.groupValues[5]))
+                }
+            }
+        }
+        return result.distinct()
+    }
+
+    private fun parseMeetings(raw: String): List<RemoteMeeting> {
+        val timeRegex = Regex("周([一二三四五六日])\\s*([0-9][0-9\\s,，、-]*)\\s*节")
+        val days = mapOf('一' to 0, '二' to 1, '三' to 2, '四' to 3, '五' to 4, '六' to 5, '日' to 6)
+        return splitLines(raw).mapNotNull { line ->
+            val normalized = line.replace("星期", "周").replace("第", "")
+            val match = timeRegex.find(normalized) ?: return@mapNotNull null
+            val day = days[match.groupValues[1][0]] ?: return@mapNotNull null
+            val token = match.groupValues[2].replace(Regex("\\s+"), "")
+            val numbers = if (token.matches(Regex("\\d{4,}")) && token.length % 2 == 0) {
+                token.chunked(2).mapNotNull { it.toIntOrNull() }
+            } else {
+                Regex("\\d+").findAll(token).mapNotNull { it.value.toIntOrNull() }.toList()
+            }
+            if (numbers.isEmpty()) return@mapNotNull null
+            val start = numbers.first() - 1
+            val end = numbers.last() - 1
+            if (start !in 0..9 || end !in start..9) return@mapNotNull null
+            val weeks = normalizeWeekText(normalized)
+            RemoteMeeting(day, start, end - start + 1, weeks)
+        }.distinct()
+    }
+
+    /**
+     * 支持 `9-10周，3-5周；8周`、`9-10,3-5;8周` 等混合格式。
+     * 周次通常位于“周一/星期一”等上课星期之前；若星期在前，则只提取明确带“周”的区间，
+     * 避免把 01-02 节误认为周次。
+     */
+    private fun normalizeWeekText(raw: String): String {
+        val normalized = raw
+            .replace("星期", "周")
+            .replace("第", "")
+            .replace("—", "-")
+            .replace("至", "-")
+        val weekday = Regex("周[一二三四五六日]").find(normalized)
+        val beforeWeekday = weekday?.range?.first?.takeIf { it > 0 }?.let { normalized.substring(0, it) }.orEmpty()
+        val ranges = if (beforeWeekday.any(Char::isDigit) || weekday == null) {
+            val source = beforeWeekday.takeIf { it.any(Char::isDigit) } ?: normalized
+            Regex("(\\d+)\\s*(?:-\\s*(\\d+))?").findAll(source)
+        } else {
+            Regex("(\\d+)\\s*(?:-\\s*(\\d+))?\\s*周").findAll(normalized)
+        }
+        return ranges.mapNotNull { match ->
+            val start = match.groupValues[1].toIntOrNull() ?: return@mapNotNull null
+            val end = match.groupValues[2].toIntOrNull()
+            if (end != null) "$start-$end" else start.toString()
+        }.distinct().joinToString(",")
+    }
+
+    private fun request(path: String, method: String, form: Map<String, String>?, referer: String? = null): String {
+        val connection = (URL(BASE_URL + path).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 30000
+            readTimeout = 30000
+            requestMethod = method
+            setRequestProperty("Accept", "text/html,application/json,*/*")
+            setRequestProperty("User-Agent", "SDAU-ClassSchedule-Android/2.0")
+            setRequestProperty("Cache-Control", "no-cache")
+            setRequestProperty("Pragma", "no-cache")
+            // Some mobile HTTP stacks transparently negotiate gzip.  The
+            // school server occasionally truncates that response, so request
+            // an uncompressed body and decode it explicitly below.
+            setRequestProperty("Accept-Encoding", "identity")
+            if (!referer.isNullOrBlank()) setRequestProperty("Referer", referer)
+            // The legacy login endpoint validates that the encrypted form was
+            // submitted from its login page.  Without this it may return an
+            // opaque server-side StringIndexOutOfBounds error.
+            if (path == "/xk/LoginToXk") {
+                setRequestProperty("Referer", "$BASE_URL/")
+            }
+        }
+        if (form != null) {
+            connection.doOutput = true
+            connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+            val encoded = form.entries.joinToString("&") {
+                URLEncoder.encode(it.key, "UTF-8") + "=" + URLEncoder.encode(it.value, "UTF-8")
+            }
+            OutputStreamWriter(connection.outputStream, StandardCharsets.UTF_8).use { it.write(encoded) }
+        }
+        val status = connection.responseCode
+        val stream = if (status >= 400) connection.errorStream else connection.inputStream
+        if (stream == null) throw IllegalStateException("教务系统无响应（HTTP $status）")
+        val bytes = stream.use { it.readBytes() }
+        val charset = responseCharset(connection.contentType)
+        val body = bytes.toString(charset)
+        if (status !in 200..299) throw IllegalStateException("教务系统返回 HTTP $status")
+        return body
+    }
+
+    private fun responseCharset(contentType: String?): Charset {
+        val name = Regex("charset\\s*=\\s*[\\\"']?([A-Za-z0-9._-]+)", RegexOption.IGNORE_CASE)
+            .find(contentType.orEmpty())
+            ?.groupValues
+            ?.getOrNull(1)
+        return name?.let { runCatching { Charset.forName(it) }.getOrNull() }
+            ?: StandardCharsets.UTF_8
+    }
+
+    private fun buildCredential(account: String, password: String, seed: String, sxh: String): String {
+        val code = "${b64(account)}%%%${b64(password)}%%%${b64(" ")}"
+        var remaining = seed
+        val output = StringBuilder()
+        for (index in code.indices) {
+            if (index >= 55) { output.append(code.substring(index)); break }
+            val take = sxh.getOrNull(index)?.digitToIntOrNull() ?: 0
+            val actual = minOf(take, remaining.length)
+            output.append(code[index])
+            output.append(remaining.take(actual))
+            remaining = remaining.drop(actual)
+        }
+        return output.toString()
+    }
+
+    private fun b64(value: String) = Base64.getEncoder().encodeToString(value.toByteArray(StandardCharsets.UTF_8))
+    private fun capture(value: String, expression: String) = Regex(expression, setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)).find(value)?.groupValues?.getOrNull(1)?.trim().orEmpty()
+    private fun clean(value: String) = value.replace(Regex("<[^>]+>"), " ").replace(Regex("\\s+"), " ").trim()
+    private fun cleanLocation(value: String) = value.replace(Regex("(?i)<br\\s*/?>"), " / ").replace(Regex("<[^>]+>"), " ").replace(Regex("\\s+"), " ").trim()
+    private fun stripTags(value: String) = value.replace(Regex("<[^>]+>"), " ").replace(Regex("\\s+"), " ").trim()
+    private fun splitLines(value: String) = value.replace(Regex("(?i)<br\\s*/?>"), "\n").split('\n').map { clean(it) }.filter { it.isNotEmpty() }
+
+    companion object {
+        private const val BASE_URL = "https://jw.sdau.edu.cn"
+    }
+}

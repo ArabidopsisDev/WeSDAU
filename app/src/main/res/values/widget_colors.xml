@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="widget_title_text">#808697</color>
+    <color name="widget_header_text">#4E566B</color>
+    <color name="widget_weekday_text">#4C5CC4</color>
+    <color name="widget_course_name_text">#1C2230</color>
+    <color name="widget_course_meta_text">#667085</color>
+    <color name="widget_time_start_text">#343B4D</color>
+    <color name="widget_time_end_text">#667085</color>
+    <color name="widget_empty_text">#667085</color>
+</resources>
