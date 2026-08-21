@@ -69,6 +69,76 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 class MainActivity : android.app.Activity() {
+    private class EmptyRoomPriorityScrollView(context: Context) : ScrollView(context) {
+        private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+        private val density = resources.displayMetrics.density
+        private val scrollThumbPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(126, 91, 108, 165)
+        }
+        private var downY = 0f
+        private var lastY = 0f
+
+        init {
+            isVerticalScrollBarEnabled = false
+            isSmoothScrollingEnabled = true
+            overScrollMode = View.OVER_SCROLL_NEVER
+            clipToPadding = false
+        }
+
+        override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downY = event.y
+                    lastY = event.y
+                    parent?.requestDisallowInterceptTouchEvent(true)
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val deltaY = lastY - event.y
+                    if (kotlin.math.abs(event.y - downY) > touchSlop && deltaY != 0f) {
+                        val direction = if (deltaY > 0f) 1 else -1
+                        parent?.requestDisallowInterceptTouchEvent(canScrollVertically(direction))
+                    }
+                    lastY = event.y
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    parent?.requestDisallowInterceptTouchEvent(false)
+                }
+            }
+            return super.dispatchTouchEvent(event)
+        }
+
+        override fun dispatchDraw(canvas: Canvas) {
+            super.dispatchDraw(canvas)
+            val content = getChildAt(0) ?: return
+            val viewportHeight = (height - paddingTop - paddingBottom).coerceAtLeast(1)
+            val contentHeight = content.height
+            if (contentHeight <= viewportHeight) return
+
+            val thumbWidth = 2.5f * density
+            val thumbMargin = 3f * density
+            val minimumThumbHeight = 22f * density
+            val thumbHeight = kotlin.math.max(
+                minimumThumbHeight,
+                viewportHeight.toFloat() * viewportHeight / contentHeight
+            ).coerceAtMost(viewportHeight.toFloat())
+            val scrollRange = (contentHeight - viewportHeight).coerceAtLeast(1)
+            val travelRange = viewportHeight - thumbHeight
+            val thumbTop = scrollY + paddingTop +
+                travelRange * (scrollY.toFloat() / scrollRange).coerceIn(0f, 1f)
+            val thumbRight = scrollX + width - thumbMargin
+            val cornerRadius = thumbWidth / 2f
+            canvas.drawRoundRect(
+                thumbRight - thumbWidth,
+                thumbTop,
+                thumbRight,
+                thumbTop + thumbHeight,
+                cornerRadius,
+                cornerRadius,
+                scrollThumbPaint
+            )
+        }
+    }
+
     private lateinit var pageHost: FrameLayout
     private lateinit var studentIdBox: TextInputLayout
     private lateinit var passwordBox: TextInputLayout
@@ -82,12 +152,14 @@ class MainActivity : android.app.Activity() {
     private var scheduleGrid: ScheduleGridView? = null
     private var mainSectionHost: FrameLayout? = null
     private var currentMainSection = 0
+    private var mainSectionTransitionGeneration = 0
     private var detailOverlay: View? = null
     private var editorOverlay: View? = null
     private var modeOverlay: View? = null
     private var semesterOverlay: View? = null
     private var scoreTermOverlay: View? = null
     private var scoreDetailOverlay: View? = null
+    private var emptyRoomFilterOverlay: View? = null
     private var shareOverlay: View? = null
     private var updateOverlay: View? = null
     private var pendingTestNotification = false
@@ -98,14 +170,42 @@ class MainActivity : android.app.Activity() {
     private var scoreLoadError: String? = null
     private var examsLoading = false
     private var examLoadError: String? = null
+    private var emptyRoomsLoading = false
+    private var emptyRoomLoadError: String? = null
+    private var emptyRoomResult: RemoteEmptyRoomResult? = null
+    private var emptyRoomRequestGeneration = 0
+    private var emptyRoomCampus = "泮河校区"
+    private var emptyRoomWeek = 1
+    private var emptyRoomWeekday = Calendar.getInstance().let {
+        val day = it.get(Calendar.DAY_OF_WEEK)
+        if (day == Calendar.SUNDAY) 7 else day - 1
+    }
+    private var emptyRoomSectionCode = "0102"
+    private var emptyRoomQueryExpanded = true
+    private val collapsedEmptyRoomGroups = mutableSetOf<String>()
     private var pushEnabled = false
     private var scheduleMode = ScheduleMode.SPRING
     private var currentWeek = 1
     private var pendingApkUrl = APK_URL
     private val networkExecutor = Executors.newSingleThreadExecutor()
     private val updateExecutor = Executors.newSingleThreadExecutor()
+    @Suppress("DEPRECATION")
+    private val currentVersionCode: Int by lazy {
+        packageManager.getPackageInfo(packageName, 0).let { info ->
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) info.longVersionCode.toInt()
+            else info.versionCode
+        }
+    }
+    @Suppress("DEPRECATION")
+    private val appDisplayVersion: String by lazy {
+        val installedName = packageManager.getPackageInfo(packageName, 0).versionName.orEmpty().ifBlank {
+            currentVersionCode.toString()
+        }
+        if (installedName.startsWith("V", ignoreCase = true)) installedName else "V$installedName"
+    }
     private data class RemoteUpdate(val code: Int, val name: String, val changelog: String, val url: String)
     private data class ExamCache(val term: String, val records: List<RemoteExam>)
+    private data class EmptyRoomGroup(val title: String, val accent: Int, val rooms: List<String>)
 
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
@@ -124,7 +224,7 @@ class MainActivity : android.app.Activity() {
         updateExecutor.execute {
             try {
                 val update = readRemoteUpdate() ?: return@execute
-                if (update.code <= CURRENT_VERSION_CODE) return@execute
+                if (update.code <= currentVersionCode) return@execute
                 val preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
                 if (preferences.getInt(KEY_UPDATE_STARTED_CODE, 0) >= update.code) return@execute
                 pendingApkUrl = update.url
@@ -319,6 +419,10 @@ class MainActivity : android.app.Activity() {
     private fun showLoginPage(animate: Boolean) {
         setSystemBars(PAGE_BACKGROUND)
         cancelSystemCourseReminder()
+        emptyRoomRequestGeneration++
+        emptyRoomsLoading = false
+        emptyRoomLoadError = null
+        emptyRoomResult = null
         bottomNavigation = null
         pushButton = null
         detailOverlay = null
@@ -327,6 +431,7 @@ class MainActivity : android.app.Activity() {
         semesterOverlay = null
         scoreTermOverlay = null
         scoreDetailOverlay = null
+        emptyRoomFilterOverlay = null
         shareOverlay = null
         swapPage(buildLoginPage(), false, animate)
     }
@@ -341,6 +446,7 @@ class MainActivity : android.app.Activity() {
             saveExamCache(selectedTerm(), sampleExams())
         }
         currentWeek = weekForTerm(selectedTerm())
+        if (emptyRoomResult == null) syncEmptyRoomDefaultsToNow()
         currentMainSection = 0
         setSystemBars(GRADIENT_START)
         window.navigationBarColor = GRADIENT_END
@@ -673,7 +779,7 @@ class MainActivity : android.app.Activity() {
         bottomNavigation = LiquidGlassNavigationView(this).apply {
             onItemSelected = { index, _ -> showMainSection(index) }
         }
-        page.addView(bottomNavigation, FrameLayout.LayoutParams(dp(180), navigationHeight, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+        page.addView(bottomNavigation, FrameLayout.LayoutParams(dp(216), navigationHeight, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
             bottomMargin = navigationBottomMargin
         })
         return page
@@ -688,7 +794,7 @@ class MainActivity : android.app.Activity() {
         scheduleGrid?.setWeekIndex(currentWeek)
         content.addView(scheduleGrid, LinearLayout.LayoutParams(-1, 0, 1f))
         section.addView(content, FrameLayout.LayoutParams(-1, -1))
-        section.addView(text(APP_DISPLAY_VERSION, 10f, Color.rgb(145, 150, 162), Typeface.NORMAL).apply {
+        section.addView(text(appDisplayVersion, 10f, Color.rgb(145, 150, 162), Typeface.NORMAL).apply {
             gravity = Gravity.CENTER
             includeFontPadding = false
         }, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply {
@@ -708,19 +814,79 @@ class MainActivity : android.app.Activity() {
         val host = mainSectionHost ?: return
         val previousIndex = currentMainSection
         currentMainSection = index
+        if (index == 3 && emptyRoomResult == null && !emptyRoomsLoading) {
+            syncEmptyRoomDefaultsToNow()
+        }
         val next = when (index) {
             1 -> buildExamSection()
             2 -> buildGradesSection()
+            3 -> buildEmptyRoomSection()
             else -> buildScheduleSection()
         }
         val distance = dp(42).toFloat() * if (index > previousIndex) 1f else -1f
-        val previous = host.getChildAt(0)
+        replaceMainSection(host, next, index, distance, 230L)
+    }
+
+    /**
+     * 始终只保留“当前页 + 正在进入页”两层，并用代次阻止旧动画清理新页面。
+     * 这同时覆盖底栏快速切换和教务数据异步刷新，避免多个半透明页面偶发叠加。
+     */
+    private fun replaceMainSection(
+        host: FrameLayout,
+        next: View,
+        sectionIndex: Int,
+        enterTranslationX: Float = 0f,
+        enterDuration: Long = 180L
+    ) {
+        if (host !== mainSectionHost || currentMainSection != sectionIndex) return
+        val generation = ++mainSectionTransitionGeneration
+
+        // 最上层子 View 才是用户当前看到的页面；更早的残留层立即移除。
+        val previous = host.getChildAt(host.childCount - 1)
+        for (childIndex in host.childCount - 1 downTo 0) {
+            val child = host.getChildAt(childIndex)
+            child.animate().setListener(null).withEndAction(null).cancel()
+            if (child !== previous) host.removeViewAt(childIndex)
+        }
+
+        next.animate().setListener(null).withEndAction(null).cancel()
         next.alpha = 0f
-        next.translationX = distance
+        next.translationX = enterTranslationX
         host.addView(next, FrameLayout.LayoutParams(-1, -1))
-        next.animate().alpha(1f).translationX(0f).setDuration(230).start()
-        previous?.animate()?.alpha(0f)?.translationX(-distance * .55f)?.setDuration(180)
-            ?.withEndAction { host.removeView(previous) }?.start()
+
+        next.animate()
+            .alpha(1f)
+            .translationX(0f)
+            .setDuration(enterDuration)
+            .withEndAction {
+                if (
+                    generation == mainSectionTransitionGeneration &&
+                    host === mainSectionHost &&
+                    currentMainSection == sectionIndex &&
+                    next.parent === host
+                ) {
+                    // 动画完成后强制恢复单层，防止刷新回调与导航回调交错留下旧页。
+                    for (childIndex in host.childCount - 1 downTo 0) {
+                        val child = host.getChildAt(childIndex)
+                        if (child !== next) {
+                            child.animate().setListener(null).withEndAction(null).cancel()
+                            host.removeViewAt(childIndex)
+                        }
+                    }
+                    next.alpha = 1f
+                    next.translationX = 0f
+                }
+            }
+            .start()
+
+        previous?.animate()
+            ?.alpha(0f)
+            ?.translationX(-enterTranslationX * .55f)
+            ?.setDuration(minOf(160L, enterDuration))
+            ?.withEndAction {
+                if (previous.parent === host) host.removeView(previous)
+            }
+            ?.start()
     }
 
     private fun buildExamSection(refresh: Boolean = true): View {
@@ -785,13 +951,7 @@ class MainActivity : android.app.Activity() {
     private fun refreshVisibleExams() {
         if (currentMainSection != 1) return
         val host = mainSectionHost ?: return
-        val next = buildExamSection(refresh = false).apply { alpha = 0f }
-        val previous = host.getChildAt(host.childCount - 1)
-        host.addView(next, FrameLayout.LayoutParams(-1, -1))
-        next.animate().alpha(1f).setDuration(170).start()
-        previous?.animate()?.alpha(0f)?.setDuration(140)?.withEndAction {
-            host.removeView(previous)
-        }?.start()
+        replaceMainSection(host, buildExamSection(refresh = false), 1, 0f, 170L)
     }
 
     private fun buildExamStateSection(term: String, hasLoaded: Boolean, error: String?): View {
@@ -960,13 +1120,701 @@ class MainActivity : android.app.Activity() {
     private fun refreshVisibleGrades() {
         if (currentMainSection != 2) return
         val host = mainSectionHost ?: return
-        val next = buildGradesSection(refresh = false).apply { alpha = 0f }
-        val previous = host.getChildAt(host.childCount - 1)
-        host.addView(next, FrameLayout.LayoutParams(-1, -1))
-        next.animate().alpha(1f).setDuration(170).start()
-        previous?.animate()?.alpha(0f)?.setDuration(140)?.withEndAction {
-            host.removeView(previous)
-        }?.start()
+        replaceMainSection(host, buildGradesSection(refresh = false), 2, 0f, 170L)
+    }
+
+    private fun buildEmptyRoomSection(): View {
+        val visibleResult = emptyRoomResult?.takeIf {
+            it.campus == emptyRoomCampus && it.week == emptyRoomWeek &&
+                it.weekday == emptyRoomWeekday && it.sectionCode == emptyRoomSectionCode
+        }
+        val visibleGroups = visibleResult?.let(::groupEmptyRooms).orEmpty()
+        val scroll = ScrollView(this).apply {
+            clipToPadding = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            setBackgroundColor(Color.TRANSPARENT)
+        }
+        val body = verticalLayout().apply { setPadding(dp(20), dp(18), dp(20), dp(28)) }
+        body.addView(text("教室使用情况", 28f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(18)))
+        body.addView(buildEmptyRoomQueryPanel(), spacedParams(dp(26)))
+
+        val resultHeader = horizontalLayout().apply {
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), 0, dp(16), 0)
+        }
+        resultHeader.addView(text("查询结果", 20f, TEXT_PRIMARY, Typeface.BOLD), LinearLayout.LayoutParams(0, -2, 1f))
+        body.addView(resultHeader, spacedParams(dp(7)))
+        body.addView(text(
+            "${emptyRoomCampus} · 第${emptyRoomWeek}周 · ${emptyRoomWeekdayLabel(emptyRoomWeekday)} · ${emptyRoomSectionLabel(emptyRoomSectionCode)}",
+            12f,
+            TEXT_SECONDARY,
+            Typeface.NORMAL
+        ).apply { setPadding(dp(16), 0, dp(16), 0) }, spacedParams(dp(15)))
+
+        val state = when {
+            emptyRoomsLoading -> emptyRoomResultSurface().apply {
+                minimumHeight = dp(260)
+                val loading = verticalLayout().apply {
+                    gravity = Gravity.CENTER
+                    addView(ProgressBar(this@MainActivity).apply {
+                        isIndeterminate = true
+                        indeterminateTintList = ColorStateList.valueOf(PRIMARY)
+                        contentDescription = "正在查询空教室"
+                    }, LinearLayout.LayoutParams(dp(36), dp(36)))
+                    addView(text("正在整理空闲教室", 13f, TEXT_SECONDARY, Typeface.NORMAL).apply {
+                        gravity = Gravity.CENTER
+                    }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(14) })
+                }
+                addView(loading, FrameLayout.LayoutParams(-1, dp(260)))
+            }
+            !emptyRoomLoadError.isNullOrBlank() -> emptyRoomResultSurface().apply {
+                minimumHeight = dp(260)
+                val errorView = verticalLayout().apply {
+                    gravity = Gravity.CENTER
+                    setPadding(dp(22), dp(32), dp(22), dp(32))
+                    addView(text("!", 21f, ERROR, Typeface.BOLD).apply { gravity = Gravity.CENTER }, LinearLayout.LayoutParams(dp(50), dp(44)).apply {
+                        bottomMargin = dp(8)
+                    })
+                    addView(text(emptyRoomLoadError.orEmpty(), 14f, TEXT_SECONDARY, Typeface.NORMAL).apply {
+                        gravity = Gravity.CENTER
+                        setLineSpacing(dp(4).toFloat(), 1f)
+                    }, matchWrapParams())
+                }
+                addView(errorView, FrameLayout.LayoutParams(-1, dp(260)))
+                isClickable = true
+                contentDescription = "空教室查询失败，点击重试"
+                setOnClickListener { refreshEmptyRooms() }
+            }
+            visibleResult == null -> buildEmptyRoomIdleState()
+            visibleGroups.isEmpty() -> emptyRoomResultSurface().apply {
+                addView(buildAcademicEmptyState(
+                    EmptyAcademicState.ROOMS,
+                    "暂无空闲教室",
+                    "当前校区与时段暂未找到可用教室\n可以更换星期或节次后再查询"
+                ), FrameLayout.LayoutParams(-1, dp(310)))
+            }
+            else -> buildEmptyRoomResults(requireNotNull(visibleResult), visibleGroups)
+        }
+        body.addView(state, matchWrapParams())
+        scroll.addView(body, FrameLayout.LayoutParams(-1, -2))
+        return scroll
+    }
+
+    private fun buildEmptyRoomQueryPanel(): View = MaterialCardView(this).apply {
+        radius = dp(25f).toFloat()
+        cardElevation = 0f
+        strokeWidth = 0
+        setCardBackgroundColor(Color.TRANSPARENT)
+        val panel = verticalLayout().apply {
+            setPadding(dp(16), dp(13), dp(16), dp(16))
+            background = ColorDrawable(Color.TRANSPARENT)
+        }
+        val titleRow = horizontalLayout().apply { gravity = Gravity.CENTER_VERTICAL }
+        titleRow.addView(text("查询条件", 20f, TEXT_PRIMARY, Typeface.BOLD), LinearLayout.LayoutParams(0, -2, 1f))
+        val queryButton = ImageButton(this@MainActivity).apply {
+            setImageResource(R.drawable.ic_search_room)
+            imageTintList = ColorStateList.valueOf(PRIMARY_DARK)
+            scaleType = ImageView.ScaleType.CENTER
+            setPadding(dp(7), dp(7), dp(7), dp(7))
+            contentDescription = if (emptyRoomsLoading) "正在查询空教室" else "查询空教室"
+            isEnabled = !emptyRoomsLoading
+            alpha = if (emptyRoomsLoading) .58f else 1f
+            background = ColorDrawable(Color.TRANSPARENT)
+            visibility = if (emptyRoomQueryExpanded) View.VISIBLE else View.GONE
+            setOnClickListener { refreshEmptyRooms() }
+        }
+        titleRow.addView(queryButton, LinearLayout.LayoutParams(dp(34), dp(34)))
+        val toggle = emptyRoomCollapseButton(emptyRoomQueryExpanded, "查询条件")
+        titleRow.addView(toggle, LinearLayout.LayoutParams(dp(34), dp(34)).apply { leftMargin = dp(2) })
+        titleRow.isClickable = true
+        titleRow.isFocusable = true
+        titleRow.contentDescription = if (emptyRoomQueryExpanded) "折叠查询条件" else "展开查询条件"
+        panel.addView(titleRow, matchWrapParams())
+
+        val queryControls = verticalLayout()
+
+        val firstFilters = horizontalLayout()
+        firstFilters.addView(emptyRoomFilterCard("校区", emptyRoomCampus) {
+            showEmptyRoomFilterPicker(
+                "选择校区",
+                listOf("岱宗校区", "泮河校区", "西北片区").map { it to it },
+                emptyRoomCampus
+            ) {
+                emptyRoomCampus = it
+                onEmptyRoomFilterChanged()
+            }
+        }, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(6) })
+        firstFilters.addView(emptyRoomFilterCard("周次", "第${emptyRoomWeek}周") {
+            showEmptyRoomFilterPicker(
+                "选择周次",
+                (1..20).map { "第${it}周" to it.toString() },
+                emptyRoomWeek.toString()
+            ) {
+                emptyRoomWeek = it.toIntOrNull()?.coerceIn(1, 20) ?: emptyRoomWeek
+                onEmptyRoomFilterChanged()
+            }
+        }, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(6) })
+        queryControls.addView(firstFilters, spacedParams(dp(10)))
+
+        val secondFilters = horizontalLayout()
+        secondFilters.addView(emptyRoomFilterCard("星期", emptyRoomWeekdayLabel(emptyRoomWeekday)) {
+            showEmptyRoomFilterPicker(
+                "选择星期",
+                (1..7).map { emptyRoomWeekdayLabel(it) to it.toString() },
+                emptyRoomWeekday.toString()
+            ) {
+                emptyRoomWeekday = it.toIntOrNull()?.coerceIn(1, 7) ?: emptyRoomWeekday
+                onEmptyRoomFilterChanged()
+            }
+        }, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(6) })
+        secondFilters.addView(emptyRoomFilterCard("节次", emptyRoomSectionLabel(emptyRoomSectionCode)) {
+            val options = listOf(
+                "第一大节" to "0102", "第二大节" to "0304", "中午" to "中午",
+                "第三大节" to "0506", "第四大节" to "0708", "第五大节" to "0910",
+                "晚间" to "晚间"
+            )
+            showEmptyRoomFilterPicker("选择节次", options, emptyRoomSectionCode) {
+                emptyRoomSectionCode = it
+                onEmptyRoomFilterChanged()
+            }
+        }, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(6) })
+        queryControls.addView(secondFilters, matchWrapParams())
+        panel.addView(queryControls, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(13) })
+        if (!emptyRoomQueryExpanded) queryControls.visibility = View.GONE
+        val toggleQuery: () -> Unit = toggle@ {
+            if (!toggle.isClickable) return@toggle
+            val expanding = !emptyRoomQueryExpanded
+            emptyRoomQueryExpanded = expanding
+            titleRow.contentDescription = if (expanding) "折叠查询条件" else "展开查询条件"
+            queryButton.animate().cancel()
+            if (expanding) {
+                queryButton.visibility = View.VISIBLE
+                queryButton.alpha = 0f
+                queryButton.animate()
+                    .alpha(if (emptyRoomsLoading) .58f else 1f)
+                    .setDuration(180L)
+                    .setStartDelay(55L)
+                    .start()
+            } else {
+                queryButton.animate()
+                    .alpha(0f)
+                    .setDuration(110L)
+                    .withEndAction {
+                        if (!emptyRoomQueryExpanded) queryButton.visibility = View.GONE
+                        queryButton.alpha = if (emptyRoomsLoading) .58f else 1f
+                    }
+                    .start()
+            }
+            animateEmptyRoomCollapsible(panel, queryControls, toggle, expanding, "查询条件")
+        }
+        titleRow.setOnClickListener { toggleQuery() }
+        toggle.setOnClickListener { toggleQuery() }
+        addView(panel)
+    }
+
+    private fun emptyRoomCollapseButton(expanded: Boolean, targetName: String): ImageButton = ImageButton(this).apply {
+        setImageResource(R.drawable.ic_expand_chevron)
+        imageTintList = ColorStateList.valueOf(PRIMARY_DARK)
+        scaleType = ImageView.ScaleType.CENTER
+        setPadding(dp(7), dp(7), dp(7), dp(7))
+        background = ColorDrawable(Color.TRANSPARENT)
+        rotation = if (expanded) 180f else 0f
+        contentDescription = if (expanded) "折叠$targetName" else "展开$targetName"
+        isClickable = true
+        isFocusable = true
+    }
+
+    private fun animateEmptyRoomCollapsible(
+        panel: LinearLayout,
+        controls: View,
+        toggle: ImageButton,
+        expanding: Boolean,
+        targetName: String
+    ) {
+        toggle.isClickable = false
+        controls.animate().cancel()
+        toggle.animate().cancel()
+        toggle.animate()
+            .rotation(if (expanding) 180f else 0f)
+            .setDuration(230L)
+            .setInterpolator(PathInterpolator(.2f, .78f, .2f, 1f))
+            .start()
+
+        val layoutParams = controls.layoutParams
+        val expandedLayoutHeight = layoutParams.height
+        val startHeight: Int
+        val endHeight: Int
+        if (expanding) {
+            controls.visibility = View.VISIBLE
+            controls.alpha = 0f
+            controls.translationY = -dp(5f).toFloat()
+            startHeight = 0
+            endHeight = if (expandedLayoutHeight > 0) {
+                expandedLayoutHeight
+            } else {
+                val availableWidth = (panel.width - panel.paddingLeft - panel.paddingRight).coerceAtLeast(1)
+                controls.measure(
+                    View.MeasureSpec.makeMeasureSpec(availableWidth, View.MeasureSpec.EXACTLY),
+                    View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+                )
+                controls.measuredHeight
+            }
+            layoutParams.height = 0
+        } else {
+            startHeight = controls.height.coerceAtLeast(controls.measuredHeight)
+            endHeight = 0
+        }
+        controls.layoutParams = layoutParams
+
+        ValueAnimator.ofInt(startHeight, endHeight).apply {
+            duration = 260L
+            interpolator = PathInterpolator(.2f, .78f, .2f, 1f)
+            addUpdateListener { animator ->
+                val fraction = animator.animatedFraction
+                layoutParams.height = animator.animatedValue as Int
+                controls.layoutParams = layoutParams
+                controls.alpha = if (expanding) fraction else 1f - fraction
+                controls.translationY = if (expanding) -dp(5f) * (1f - fraction) else -dp(5f) * fraction
+                panel.requestLayout()
+            }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: android.animation.Animator) {
+                    layoutParams.height = expandedLayoutHeight
+                    controls.layoutParams = layoutParams
+                    controls.alpha = 1f
+                    controls.translationY = 0f
+                    controls.visibility = if (expanding) View.VISIBLE else View.GONE
+                    toggle.contentDescription = if (expanding) "折叠$targetName" else "展开$targetName"
+                    toggle.isClickable = true
+                }
+            })
+            start()
+        }
+    }
+
+    private fun emptyRoomFilterCard(label: String, value: String, onClick: () -> Unit): View = MaterialCardView(this).apply {
+        radius = dp(15f).toFloat()
+        cardElevation = 0f
+        strokeWidth = 0
+        setCardBackgroundColor(Color.argb(102, 255, 255, 255))
+        isClickable = true
+        contentDescription = "$label，当前$value"
+        setOnClickListener { onClick() }
+        val content = verticalLayout().apply { setPadding(dp(13), dp(10), dp(11), dp(10)) }
+        content.addView(text(label, 11f, TEXT_SECONDARY, Typeface.NORMAL), spacedParams(dp(5)))
+        val valueRow = horizontalLayout().apply { gravity = Gravity.CENTER_VERTICAL }
+        valueRow.addView(text(value, 13.5f, TEXT_PRIMARY, Typeface.BOLD).apply {
+            maxLines = 1
+        }, LinearLayout.LayoutParams(0, -2, 1f))
+        valueRow.addView(text("⌄", 14f, TEXT_SECONDARY, Typeface.NORMAL).apply {
+            gravity = Gravity.CENTER
+        }, LinearLayout.LayoutParams(dp(18), -2))
+        content.addView(valueRow, matchWrapParams())
+        addView(content)
+    }
+
+    private fun emptyRoomResultSurface(): MaterialCardView = MaterialCardView(this).apply {
+        radius = dp(23f).toFloat()
+        cardElevation = 0f
+        strokeWidth = dp(1)
+        strokeColor = Color.argb(92, 255, 255, 255)
+        setCardBackgroundColor(Color.argb(104, 216, 225, 242))
+    }
+
+    private fun buildEmptyRoomIdleState(): View = emptyRoomResultSurface().apply {
+        addView(buildAcademicEmptyState(
+            EmptyAcademicState.ROOM_QUERY,
+            "等待查询",
+            "选择条件后点击查询"
+        ), FrameLayout.LayoutParams(-1, dp(300)))
+    }
+
+    private fun buildEmptyRoomResults(
+        result: RemoteEmptyRoomResult,
+        groups: List<EmptyRoomGroup>
+    ): View = verticalLayout().apply {
+        contentDescription = "${result.campus}空闲教室列表"
+        groups.forEachIndexed { groupIndex, group ->
+            val groupStateKey = "${result.campus}:${group.title}"
+            val groupExpanded = groupStateKey !in collapsedEmptyRoomGroups
+            val groupCard = MaterialCardView(this@MainActivity).apply {
+                radius = dp(21f).toFloat()
+                cardElevation = 0f
+                strokeWidth = dp(1)
+                strokeColor = Color.argb(118, 255, 255, 255)
+                setCardBackgroundColor(blendColors(Color.rgb(231, 236, 247), group.accent, .055f))
+            }
+            val groupBody = verticalLayout().apply { setPadding(dp(15), dp(14), dp(15), dp(15)) }
+            val header = horizontalLayout().apply { gravity = Gravity.CENTER_VERTICAL }
+            header.addView(View(this@MainActivity).apply {
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+                    cornerRadius = dp(3f).toFloat()
+                    setColor(group.accent)
+                }
+            }, LinearLayout.LayoutParams(dp(5), dp(23)).apply { rightMargin = dp(10) })
+            header.addView(text(group.title, 16f, TEXT_PRIMARY, Typeface.BOLD), LinearLayout.LayoutParams(0, -2, 1f))
+            val groupToggle = emptyRoomCollapseButton(groupExpanded, "${group.title}教室")
+            header.addView(groupToggle, LinearLayout.LayoutParams(dp(32), dp(32)))
+            header.isClickable = true
+            header.isFocusable = true
+            header.contentDescription = if (groupExpanded) "折叠${group.title}教室" else "展开${group.title}教室"
+            groupBody.addView(header, matchWrapParams())
+
+            val roomRows = group.rooms.chunked(2)
+            val roomRowHeight = dp(44)
+            val roomRowGap = dp(4)
+            val roomContent = verticalLayout()
+            roomRows.forEachIndexed { rowIndex, pair ->
+                val row = horizontalLayout()
+                pair.forEachIndexed { index, room ->
+                    val roomLabel = text(room, 14f, TEXT_PRIMARY, Typeface.BOLD).apply {
+                        gravity = Gravity.CENTER_VERTICAL
+                        setPadding(dp(10), dp(6), dp(8), dp(6))
+                        maxLines = 2
+                    }
+                    row.addView(roomLabel, LinearLayout.LayoutParams(0, -1, 1f).apply {
+                        if (index == 0) rightMargin = dp(4) else leftMargin = dp(4)
+                    })
+                }
+                if (pair.size == 1) {
+                    row.addView(Space(this@MainActivity), LinearLayout.LayoutParams(0, 1, 1f).apply { leftMargin = dp(4) })
+                }
+                roomContent.addView(row, LinearLayout.LayoutParams(-1, roomRowHeight).apply {
+                    if (rowIndex < roomRows.lastIndex) bottomMargin = roomRowGap
+                })
+            }
+            val maxVisibleRows = 4
+            val roomViewport: View
+            val roomViewportHeight: Int
+            if (roomRows.size > maxVisibleRows) {
+                roomViewport = EmptyRoomPriorityScrollView(this@MainActivity).apply {
+                    addView(roomContent, FrameLayout.LayoutParams(-1, -2))
+                }
+                roomViewportHeight = roomRowHeight * maxVisibleRows + roomRowGap * (maxVisibleRows - 1)
+            } else {
+                roomViewport = roomContent
+                roomViewportHeight = ViewGroup.LayoutParams.WRAP_CONTENT
+            }
+            groupBody.addView(roomViewport, LinearLayout.LayoutParams(-1, roomViewportHeight).apply {
+                topMargin = dp(12)
+            })
+            if (!groupExpanded) roomViewport.visibility = View.GONE
+            val toggleGroup: () -> Unit = toggle@ {
+                if (!groupToggle.isClickable) return@toggle
+                val expanding = groupStateKey in collapsedEmptyRoomGroups
+                if (expanding) collapsedEmptyRoomGroups.remove(groupStateKey)
+                else collapsedEmptyRoomGroups.add(groupStateKey)
+                header.contentDescription = if (expanding) "折叠${group.title}教室" else "展开${group.title}教室"
+                animateEmptyRoomCollapsible(
+                    groupBody,
+                    roomViewport,
+                    groupToggle,
+                    expanding,
+                    "${group.title}教室"
+                )
+            }
+            header.setOnClickListener { toggleGroup() }
+            groupToggle.setOnClickListener { toggleGroup() }
+            groupCard.addView(groupBody)
+            addView(groupCard, if (groupIndex == groups.lastIndex) matchWrapParams() else spacedParams(dp(11)))
+        }
+    }
+
+    private fun groupEmptyRooms(result: RemoteEmptyRoomResult): List<EmptyRoomGroup> {
+        val rooms = result.rooms.asSequence()
+            .map { it.trim().removePrefix("@").trim() }
+            .filter { it.isNotBlank() && shouldDisplayEmptyRoom(result.campus, it) }
+            .distinctBy { emptyRoomMatchKey(it) }
+            .sortedBy(::emptyRoomNaturalSortKey)
+            .toList()
+
+        val buckets = when (result.campus) {
+            "岱宗校区" -> linkedMapOf(
+                ("5N" to Color.rgb(103, 151, 214)) to mutableListOf<String>(),
+                ("5S" to Color.rgb(92, 181, 164)) to mutableListOf(),
+                ("文理大楼" to Color.rgb(139, 132, 199)) to mutableListOf(),
+                ("12号楼" to Color.rgb(220, 156, 96)) to mutableListOf(),
+                ("其他教室" to Color.rgb(116, 137, 174)) to mutableListOf()
+            )
+            "泮河校区" -> linkedMapOf(
+                ("中央片区" to Color.rgb(102, 146, 211)) to mutableListOf<String>(),
+                ("东南片区" to Color.rgb(219, 132, 116)) to mutableListOf(),
+                ("其他教室" to Color.rgb(91, 176, 166)) to mutableListOf()
+            )
+            else -> linkedMapOf(
+                ("22号楼" to Color.rgb(137, 129, 198)) to mutableListOf<String>(),
+                ("其他教室" to Color.rgb(103, 151, 190)) to mutableListOf()
+            )
+        }
+
+        rooms.forEach { room ->
+            val key = emptyRoomMatchKey(room)
+            val groupKey = when (result.campus) {
+                "岱宗校区" -> when {
+                    key.startsWith("5N") -> "5N"
+                    key.startsWith("5S") -> "5S"
+                    key.contains("文理大楼") -> "文理大楼"
+                    key.contains("12号楼") -> "12号楼"
+                    else -> "其他教室"
+                }
+                "泮河校区" -> when {
+                    key.startsWith("19#") -> "东南片区"
+                    key.firstOrNull() in setOf('N', 'W', 'E', 'S') -> "中央片区"
+                    else -> "其他教室"
+                }
+                else -> if (key.startsWith("22#")) "22号楼" else "其他教室"
+            }
+            buckets.entries.firstOrNull { it.key.first == groupKey }?.value?.add(room)
+        }
+
+        return buckets.mapNotNull { (definition, groupedRooms) ->
+            groupedRooms.takeIf { it.isNotEmpty() }?.let {
+                EmptyRoomGroup(definition.first, definition.second, it)
+            }
+        }
+    }
+
+    private fun shouldDisplayEmptyRoom(campus: String, room: String): Boolean {
+        val key = emptyRoomMatchKey(room)
+        if (key.contains("线上教学")) return false
+        if (campus == "泮河校区") {
+            if (key.contains("南校区体育羽毛球馆")) return false
+            if (key.contains("南校实践环节地点") && key.contains("化学实践S")) return false
+        }
+        return true
+    }
+
+    private fun emptyRoomMatchKey(room: String): String = room
+        .replace(Regex("\\s+"), "")
+        .replace('＃', '#')
+        .replace('Ｓ', 'S')
+        .uppercase(Locale.ROOT)
+
+    private fun emptyRoomNaturalSortKey(room: String): String = Regex("\\d+")
+        .replace(emptyRoomMatchKey(room)) { match -> match.value.padStart(7, '0') }
+
+    private fun blendColors(base: Int, tint: Int, amount: Float): Int {
+        val ratio = amount.coerceIn(0f, 1f)
+        fun channel(baseChannel: Int, tintChannel: Int): Int =
+            (baseChannel + (tintChannel - baseChannel) * ratio).toInt().coerceIn(0, 255)
+        return Color.rgb(
+            channel(Color.red(base), Color.red(tint)),
+            channel(Color.green(base), Color.green(tint)),
+            channel(Color.blue(base), Color.blue(tint))
+        )
+    }
+
+    private fun onEmptyRoomFilterChanged() {
+        emptyRoomRequestGeneration++
+        emptyRoomsLoading = false
+        emptyRoomLoadError = null
+        refreshVisibleEmptyRooms()
+    }
+
+    private fun collapseEmptyRoomResultGroups(result: RemoteEmptyRoomResult) {
+        val campusPrefix = "${result.campus}:"
+        collapsedEmptyRoomGroups.removeAll { it.startsWith(campusPrefix) }
+        groupEmptyRooms(result).forEach { group ->
+            collapsedEmptyRoomGroups.add("${result.campus}:${group.title}")
+        }
+    }
+
+    private fun refreshEmptyRooms() {
+        if (currentMainSection != 3) return
+        if (emptyRoomsLoading) return
+        val preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val account = preferences.getString(KEY_ACCOUNT, "").orEmpty()
+        val password = preferences.getString(KEY_PASSWORD, "").orEmpty()
+        val campus = emptyRoomCampus
+        val week = emptyRoomWeek
+        val weekday = emptyRoomWeekday
+        val section = emptyRoomSectionCode
+        val generation = ++emptyRoomRequestGeneration
+
+        if (account.isBlank() || password.isBlank()) {
+            emptyRoomsLoading = false
+            emptyRoomLoadError = "登录信息不完整，请重新登录后再查询空教室。"
+            emptyRoomQueryExpanded = false
+            refreshVisibleEmptyRooms()
+            return
+        }
+
+        emptyRoomsLoading = true
+        emptyRoomLoadError = null
+        refreshVisibleEmptyRooms()
+        if (account == "114514") {
+            val result = sampleEmptyRoomResult(campus, week, weekday, section)
+            collapseEmptyRoomResultGroups(result)
+            emptyRoomResult = result
+            emptyRoomsLoading = false
+            emptyRoomQueryExpanded = false
+            refreshVisibleEmptyRooms()
+            return
+        }
+
+        networkExecutor.execute {
+            try {
+                val result = SdauCourseRepository().queryEmptyRooms(
+                    account, password, campus, week, weekday, section
+                )
+                runOnUiThread {
+                    if (generation != emptyRoomRequestGeneration) return@runOnUiThread
+                    collapseEmptyRoomResultGroups(result)
+                    emptyRoomResult = result
+                    emptyRoomsLoading = false
+                    emptyRoomLoadError = null
+                    emptyRoomQueryExpanded = false
+                    refreshVisibleEmptyRooms()
+                }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    if (generation != emptyRoomRequestGeneration) return@runOnUiThread
+                    emptyRoomsLoading = false
+                    emptyRoomLoadError = error.message?.replace(Regex("\\s+"), " ")?.take(180)
+                        ?: "教务系统暂时无法查询空教室，请稍后重试。"
+                    emptyRoomQueryExpanded = false
+                    refreshVisibleEmptyRooms()
+                }
+            }
+        }
+    }
+
+    private fun refreshVisibleEmptyRooms() {
+        if (currentMainSection != 3) return
+        val host = mainSectionHost ?: return
+        replaceMainSection(host, buildEmptyRoomSection(), 3, 0f, 170L)
+    }
+
+    private fun sampleEmptyRoomResult(
+        campus: String,
+        week: Int,
+        weekday: Int,
+        sectionCode: String
+    ): RemoteEmptyRoomResult {
+        val rooms = when (campus) {
+            "泮河校区" -> listOf(
+                "N104", "W205", "E308", "S514", "19#201", "19#403",
+                "线上教学", "南校区体育羽毛球馆", "南校实践环节地点化学实践S"
+            )
+            "西北片区" -> listOf("22#205", "22#302", "22#402")
+            else -> listOf(
+                "5N101", "5N202", "5N306", "5S111", "5S416",
+                "文理大楼503", "北校12号楼310", "线上教学"
+            )
+        }
+        return RemoteEmptyRoomResult(selectedTerm(), week, campus, weekday, sectionCode, rooms)
+    }
+
+    private fun showEmptyRoomFilterPicker(
+        title: String,
+        options: List<Pair<String, String>>,
+        selected: String,
+        onSelected: (String) -> Unit
+    ) {
+        if (emptyRoomFilterOverlay != null) return
+        val overlay = FrameLayout(this).apply {
+            setBackgroundColor(Color.argb(145, 12, 18, 30))
+            isClickable = true
+            setOnClickListener { hideEmptyRoomFilterPicker() }
+        }
+        val card = surfaceCard(dp(24f).toFloat()).apply {
+            strokeWidth = 0
+            setCardBackgroundColor(PAGE_BACKGROUND)
+            setOnClickListener { }
+        }
+        val cardBody = verticalLayout().apply { setPadding(dp(18), dp(17), dp(18), dp(17)) }
+        cardBody.addView(text(title, 20f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(12)))
+        val optionList = verticalLayout()
+        options.forEach { (label, value) ->
+            val active = value == selected
+            val row = horizontalLayout().apply {
+                gravity = Gravity.CENTER_VERTICAL
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    cornerRadius = dp(11f).toFloat()
+                    setColor(if (active) Color.rgb(238, 241, 255) else Color.TRANSPARENT)
+                }
+                setPadding(dp(13), dp(10), dp(10), dp(10))
+                isClickable = true
+                setOnClickListener {
+                    hideEmptyRoomFilterPicker()
+                    onSelected(value)
+                }
+            }
+            row.addView(text(label, 14f, if (active) PRIMARY_DARK else TEXT_PRIMARY, if (active) Typeface.BOLD else Typeface.NORMAL), LinearLayout.LayoutParams(0, -2, 1f))
+            if (active) row.addView(ImageView(this).apply {
+                setImageResource(R.drawable.ic_check)
+                imageTintList = ColorStateList.valueOf(PRIMARY_DARK)
+            }, LinearLayout.LayoutParams(dp(24), dp(24)))
+            optionList.addView(row, spacedParams(dp(3)))
+        }
+        if (options.size > 8) {
+            cardBody.addView(ScrollView(this).apply {
+                overScrollMode = View.OVER_SCROLL_NEVER
+                addView(optionList, FrameLayout.LayoutParams(-1, -2))
+            }, LinearLayout.LayoutParams(-1, minOf(dp(430), resources.displayMetrics.heightPixels - dp(150))))
+        } else {
+            cardBody.addView(optionList, matchWrapParams())
+        }
+        card.addView(cardBody)
+        val width = minOf(dp(330), resources.displayMetrics.widthPixels - dp(36))
+        overlay.addView(card, FrameLayout.LayoutParams(width, -2, Gravity.CENTER))
+        pageHost.addView(overlay, matchParentParams())
+        emptyRoomFilterOverlay = overlay
+        overlay.alpha = 0f
+        card.scaleX = .94f
+        card.scaleY = .94f
+        overlay.animate().alpha(1f).setDuration(150).start()
+        card.animate().scaleX(1f).scaleY(1f).setDuration(190).start()
+    }
+
+    private fun hideEmptyRoomFilterPicker() {
+        val overlay = emptyRoomFilterOverlay ?: return
+        overlay.animate().alpha(0f).setDuration(130).withEndAction {
+            pageHost.removeView(overlay)
+            emptyRoomFilterOverlay = null
+        }.start()
+    }
+
+    private fun emptyRoomWeekdayLabel(day: Int): String = when (day) {
+        1 -> "星期一"
+        2 -> "星期二"
+        3 -> "星期三"
+        4 -> "星期四"
+        5 -> "星期五"
+        6 -> "星期六"
+        else -> "星期日"
+    }
+
+    private fun emptyRoomSectionLabel(code: String): String = when (code) {
+        "0102" -> "第一大节"
+        "0304" -> "第二大节"
+        "0506" -> "第三大节"
+        "0708" -> "第四大节"
+        "0910" -> "第五大节"
+        else -> code
+    }
+
+    private fun defaultEmptyRoomSection(now: Calendar = Calendar.getInstance()): String {
+        val minute = now.get(Calendar.HOUR_OF_DAY) * 60 + now.get(Calendar.MINUTE)
+        val starts = currentStartMinutes()
+        val codes = arrayOf("0102", "0304", "0506", "0708", "0910")
+        codes.indices.forEach { sectionIndex ->
+            val secondSlot = sectionIndex * 2 + 1
+            val sectionEnd = starts[secondSlot] + 45
+            if (minute <= sectionEnd) return codes[sectionIndex]
+        }
+        return "晚间"
+    }
+
+    private fun syncEmptyRoomDefaultsToNow() {
+        val now = Calendar.getInstance()
+        val termWeek = weekForTerm(selectedTerm())
+        emptyRoomWeek = if (termWeek <= 0) 1 else termWeek
+        emptyRoomWeekday = now.get(Calendar.DAY_OF_WEEK).let { day ->
+            if (day == Calendar.SUNDAY) 7 else day - 1
+        }
+        emptyRoomSectionCode = defaultEmptyRoomSection(now)
     }
 
     private fun buildScoreResultSection(result: RemoteScoreResult): View {
@@ -1420,8 +2268,8 @@ class MainActivity : android.app.Activity() {
                         panel.addView(text("检查失败，请稍后重试", 12f, TEXT_SECONDARY, Typeface.NORMAL).apply {
                             setPadding(dp(10), dp(8), dp(10), dp(8))
                         })
-                    } else if (update.code <= CURRENT_VERSION_CODE) {
-                        panel.addView(text("已是最新版本 $APP_DISPLAY_VERSION", 12f, TEXT_SECONDARY, Typeface.NORMAL).apply {
+                    } else if (update.code <= currentVersionCode) {
+                        panel.addView(text("已是最新版本 $appDisplayVersion", 12f, TEXT_SECONDARY, Typeface.NORMAL).apply {
                             setPadding(dp(10), dp(8), dp(10), dp(8))
                         })
                     } else {
@@ -2464,7 +3312,7 @@ class MainActivity : android.app.Activity() {
         }
     }
 
-    private enum class EmptyAcademicState { EXAMS, GRADES }
+    private enum class EmptyAcademicState { EXAMS, GRADES, ROOMS, ROOM_QUERY }
 
     private inner class AcademicEmptyIllustration(
         context: Context,
@@ -2475,10 +3323,16 @@ class MainActivity : android.app.Activity() {
             strokeJoin = Paint.Join.ROUND
         }
         private val illustrationRect = RectF()
+        private val illustrationPath = Path()
 
         init {
             importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
-            contentDescription = if (type == EmptyAcademicState.EXAMS) "暂无考试安排" else "暂无课程成绩"
+            contentDescription = when (type) {
+                EmptyAcademicState.EXAMS -> "暂无考试安排"
+                EmptyAcademicState.GRADES -> "暂无课程成绩"
+                EmptyAcademicState.ROOMS -> "暂无空闲教室"
+                EmptyAcademicState.ROOM_QUERY -> "等待查询空闲教室"
+            }
         }
 
         override fun onDraw(canvas: Canvas) {
@@ -2491,8 +3345,12 @@ class MainActivity : android.app.Activity() {
             canvas.drawCircle(cx, cy, dp(57f).toFloat(), illustrationPaint)
             illustrationPaint.color = Color.argb(18, 131, 140, 199)
             canvas.drawCircle(cx + dp(17f), cy - dp(8f), dp(42f).toFloat(), illustrationPaint)
-            if (type == EmptyAcademicState.EXAMS) drawEmptyExam(canvas, cx, cy)
-            else drawEmptyGrades(canvas, cx, cy)
+            when (type) {
+                EmptyAcademicState.EXAMS -> drawEmptyExam(canvas, cx, cy)
+                EmptyAcademicState.GRADES -> drawEmptyGrades(canvas, cx, cy)
+                EmptyAcademicState.ROOMS -> drawEmptyRooms(canvas, cx, cy, true)
+                EmptyAcademicState.ROOM_QUERY -> drawWaitingRoomQuery(canvas, cx, cy)
+            }
         }
 
         private fun drawEmptyExam(canvas: Canvas, cx: Float, cy: Float) {
@@ -2598,6 +3456,193 @@ class MainActivity : android.app.Activity() {
             canvas.drawLine(cx + dp(35f), cy - dp(27f), cx + dp(38f), cy - dp(24f), illustrationPaint)
             canvas.drawLine(cx + dp(38f), cy - dp(24f), cx + dp(44f), cy - dp(31f), illustrationPaint)
         }
+
+        private fun drawWaitingRoomQuery(canvas: Canvas, cx: Float, cy: Float) {
+            val cardSave = canvas.save()
+            canvas.rotate(-3f, cx, cy)
+            illustrationRect.set(cx - dp(42f), cy - dp(38f), cx + dp(33f), cy + dp(38f))
+            illustrationPaint.style = Paint.Style.FILL
+            illustrationPaint.color = Color.argb(27, 55, 72, 125)
+            canvas.drawRoundRect(
+                illustrationRect.left + dp(3f), illustrationRect.top + dp(5f),
+                illustrationRect.right + dp(3f), illustrationRect.bottom + dp(5f),
+                dp(14f).toFloat(), dp(14f).toFloat(), illustrationPaint
+            )
+            illustrationPaint.color = Color.argb(218, 252, 253, 255)
+            canvas.drawRoundRect(illustrationRect, dp(14f).toFloat(), dp(14f).toFloat(), illustrationPaint)
+            illustrationPaint.style = Paint.Style.STROKE
+            illustrationPaint.strokeWidth = dp(1.2f).toFloat()
+            illustrationPaint.color = Color.argb(100, 126, 139, 179)
+            canvas.drawRoundRect(illustrationRect, dp(14f).toFloat(), dp(14f).toFloat(), illustrationPaint)
+
+            // 彩色查询条与小圆点提供和课程空状态一致的插画层次。
+            illustrationPaint.style = Paint.Style.FILL
+            illustrationPaint.color = Color.rgb(131, 140, 199)
+            canvas.drawRoundRect(
+                illustrationRect.left + dp(13f), illustrationRect.top + dp(14f),
+                illustrationRect.right - dp(14f), illustrationRect.top + dp(25f),
+                dp(5.5f).toFloat(), dp(5.5f).toFloat(), illustrationPaint
+            )
+            illustrationPaint.color = Color.argb(215, 255, 255, 255)
+            canvas.drawRoundRect(
+                illustrationRect.left + dp(21f), illustrationRect.top + dp(18f),
+                illustrationRect.right - dp(23f), illustrationRect.top + dp(21f),
+                dp(1.5f).toFloat(), dp(1.5f).toFloat(), illustrationPaint
+            )
+
+            val resultColors = intArrayOf(
+                Color.rgb(130, 173, 247),
+                Color.rgb(105, 205, 185),
+                Color.rgb(245, 108, 126)
+            )
+            for (row in 0..2) {
+                val rowY = illustrationRect.top + dp(37f + row * 13f)
+                illustrationPaint.color = resultColors[row]
+                canvas.drawCircle(illustrationRect.left + dp(18f), rowY, dp(3.5f).toFloat(), illustrationPaint)
+                illustrationPaint.color = Color.argb(82, 105, 113, 132)
+                canvas.drawRoundRect(
+                    illustrationRect.left + dp(27f), rowY - dp(1.7f),
+                    illustrationRect.right - dp(12f + row * 5f), rowY + dp(1.7f),
+                    dp(1.7f).toFloat(), dp(1.7f).toFloat(), illustrationPaint
+                )
+            }
+            canvas.restoreToCount(cardSave)
+
+            // 右下角的大放大镜与卡片发生遮挡，形成和参考图杯子相同的前后关系。
+            val lensX = cx + dp(27f)
+            val lensY = cy + dp(20f)
+            illustrationPaint.style = Paint.Style.FILL
+            illustrationPaint.color = Color.argb(235, 248, 250, 255)
+            canvas.drawCircle(lensX, lensY, dp(19f).toFloat(), illustrationPaint)
+            illustrationPaint.style = Paint.Style.STROKE
+            illustrationPaint.strokeWidth = dp(3.2f).toFloat()
+            illustrationPaint.color = Color.rgb(131, 140, 199)
+            canvas.drawCircle(lensX - dp(2f), lensY - dp(2f), dp(13f).toFloat(), illustrationPaint)
+            canvas.drawLine(
+                lensX + dp(8f), lensY + dp(8f),
+                lensX + dp(19f), lensY + dp(19f), illustrationPaint
+            )
+
+            // 左上角两枚柔和彩叶延续图二的点缀方式。
+            illustrationPaint.style = Paint.Style.FILL
+            illustrationPaint.color = Color.rgb(105, 205, 185)
+            val leafSave = canvas.save()
+            canvas.rotate(-26f, cx - dp(34f), cy - dp(38f))
+            canvas.drawOval(cx - dp(43f), cy - dp(43f), cx - dp(26f), cy - dp(33f), illustrationPaint)
+            canvas.restoreToCount(leafSave)
+            illustrationPaint.color = Color.rgb(130, 173, 247)
+            val secondLeafSave = canvas.save()
+            canvas.rotate(28f, cx - dp(20f), cy - dp(42f))
+            canvas.drawOval(cx - dp(28f), cy - dp(47f), cx - dp(13f), cy - dp(37f), illustrationPaint)
+            canvas.restoreToCount(secondLeafSave)
+        }
+
+        private fun drawEmptyRooms(canvas: Canvas, cx: Float, cy: Float, showNoRoomBadge: Boolean) {
+            illustrationRect.set(cx - dp(39f), cy - dp(40f), cx + dp(32f), cy + dp(39f))
+            illustrationPaint.style = Paint.Style.FILL
+            illustrationPaint.color = Color.argb(27, 55, 72, 125)
+            canvas.drawRoundRect(
+                illustrationRect.left + dp(3f), illustrationRect.top + dp(4f),
+                illustrationRect.right + dp(3f), illustrationRect.bottom + dp(4f),
+                dp(13f).toFloat(), dp(13f).toFloat(), illustrationPaint
+            )
+            illustrationPaint.color = Color.argb(210, 252, 253, 255)
+            canvas.drawRoundRect(illustrationRect, dp(13f).toFloat(), dp(13f).toFloat(), illustrationPaint)
+            illustrationPaint.style = Paint.Style.STROKE
+            illustrationPaint.strokeWidth = dp(1.2f).toFloat()
+            illustrationPaint.color = Color.argb(95, 126, 139, 179)
+            canvas.drawRoundRect(illustrationRect, dp(13f).toFloat(), dp(13f).toFloat(), illustrationPaint)
+
+            // 顶部的教室门牌延续考试、成绩空状态的彩色信息条语言。
+            illustrationPaint.style = Paint.Style.FILL
+            illustrationPaint.color = Color.rgb(131, 140, 199)
+            canvas.drawRoundRect(
+                illustrationRect.left + dp(12f), illustrationRect.top + dp(10f),
+                illustrationRect.right - dp(12f), illustrationRect.top + dp(23f),
+                dp(4f).toFloat(), dp(4f).toFloat(), illustrationPaint
+            )
+            illustrationPaint.color = Color.argb(205, 255, 255, 255)
+            canvas.drawRoundRect(
+                illustrationRect.left + dp(19f), illustrationRect.top + dp(15f),
+                illustrationRect.right - dp(19f), illustrationRect.top + dp(18f),
+                dp(1.5f).toFloat(), dp(1.5f).toFloat(), illustrationPaint
+            )
+
+            val doorLeft = cx - dp(17f)
+            val doorTop = cy - dp(8f)
+            val doorRight = cx + dp(13f)
+            val doorBottom = illustrationRect.bottom
+            illustrationPaint.style = Paint.Style.STROKE
+            illustrationPaint.strokeWidth = dp(2.2f).toFloat()
+            illustrationPaint.color = Color.rgb(131, 140, 199)
+            illustrationPath.reset()
+            illustrationPath.moveTo(doorLeft, doorBottom)
+            illustrationPath.lineTo(doorLeft, doorTop)
+            illustrationPath.lineTo(doorRight, doorTop)
+            illustrationPath.lineTo(doorRight, doorBottom)
+            canvas.drawPath(illustrationPath, illustrationPaint)
+
+            if (showNoRoomBadge) {
+                illustrationPaint.style = Paint.Style.FILL
+                illustrationPaint.color = Color.rgb(221, 225, 245)
+                canvas.drawRoundRect(
+                    doorLeft + dp(5f), doorTop + dp(5f),
+                    doorRight - dp(5f), doorBottom,
+                    dp(3f).toFloat(), dp(3f).toFloat(), illustrationPaint
+                )
+                illustrationPaint.color = Color.rgb(105, 205, 185)
+                canvas.drawRoundRect(
+                    doorLeft + dp(9f), doorTop + dp(10f),
+                    doorRight - dp(9f), doorTop + dp(21f),
+                    dp(2.5f).toFloat(), dp(2.5f).toFloat(), illustrationPaint
+                )
+                illustrationPaint.color = Color.rgb(245, 108, 126)
+                canvas.drawCircle(doorRight - dp(9f), cy + dp(16f), dp(2.2f).toFloat(), illustrationPaint)
+            } else {
+                illustrationPath.reset()
+                illustrationPath.moveTo(doorLeft + dp(5f), doorTop + dp(5f))
+                illustrationPath.lineTo(doorRight + dp(9f), doorTop + dp(1f))
+                illustrationPath.lineTo(doorRight + dp(9f), doorBottom - dp(1f))
+                illustrationPath.lineTo(doorLeft + dp(5f), doorBottom - dp(6f))
+                illustrationPath.close()
+                illustrationPaint.style = Paint.Style.FILL
+                illustrationPaint.color = Color.rgb(176, 193, 238)
+                canvas.drawPath(illustrationPath, illustrationPaint)
+                illustrationPaint.style = Paint.Style.STROKE
+                illustrationPaint.strokeWidth = dp(1.7f).toFloat()
+                illustrationPaint.color = Color.rgb(131, 140, 199)
+                canvas.drawPath(illustrationPath, illustrationPaint)
+                illustrationPaint.style = Paint.Style.FILL
+                illustrationPaint.color = Color.rgb(245, 108, 126)
+                canvas.drawCircle(doorRight + dp(2f), cy + dp(15f), dp(2.2f).toFloat(), illustrationPaint)
+            }
+
+            val badgeX = cx + dp(36f)
+            val badgeY = cy + dp(25f)
+            if (showNoRoomBadge) {
+                illustrationPaint.style = Paint.Style.FILL
+                illustrationPaint.color = Color.rgb(245, 108, 126)
+                canvas.drawCircle(badgeX, badgeY, dp(14f).toFloat(), illustrationPaint)
+                illustrationPaint.style = Paint.Style.STROKE
+                illustrationPaint.strokeWidth = dp(2f).toFloat()
+                illustrationPaint.color = Color.WHITE
+                canvas.drawCircle(badgeX, badgeY, dp(7f).toFloat(), illustrationPaint)
+                canvas.drawLine(badgeX, badgeY, badgeX, badgeY - dp(4f), illustrationPaint)
+                canvas.drawLine(badgeX, badgeY, badgeX + dp(4f), badgeY + dp(2f), illustrationPaint)
+            } else {
+                illustrationPaint.style = Paint.Style.FILL
+                illustrationPaint.color = Color.rgb(248, 250, 255)
+                canvas.drawCircle(badgeX, badgeY, dp(15f).toFloat(), illustrationPaint)
+                illustrationPaint.style = Paint.Style.STROKE
+                illustrationPaint.strokeWidth = dp(2.2f).toFloat()
+                illustrationPaint.color = Color.rgb(91, 108, 190)
+                canvas.drawCircle(badgeX - dp(2f), badgeY - dp(2f), dp(8f).toFloat(), illustrationPaint)
+                canvas.drawLine(
+                    badgeX + dp(4f), badgeY + dp(4f),
+                    badgeX + dp(10f), badgeY + dp(10f), illustrationPaint
+                )
+            }
+        }
     }
 
     private enum class ScheduleMode { SPRING, SUMMER }
@@ -2609,7 +3654,7 @@ class MainActivity : android.app.Activity() {
      * 不依赖额外图片资源，也不会改变上方课程表的七列网格模型。
      */
     private inner class LiquidGlassNavigationView(context: Context) : View(context) {
-        private val labels = arrayOf("课程表", "考试安排", "成绩")
+        private val labels = arrayOf("课程表", "考试安排", "成绩", "教室使用情况")
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val bounds = RectF()
         private val indicatorBounds = RectF()
@@ -2640,7 +3685,7 @@ class MainActivity : android.app.Activity() {
             isClickable = true
             isFocusable = true
             importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
-            contentDescription = "课程表底部导航"
+            contentDescription = "校园功能底部导航"
         }
 
         override fun onSizeChanged(width: Int, height: Int, oldWidth: Int, oldHeight: Int) {
@@ -2727,7 +3772,7 @@ class MainActivity : android.app.Activity() {
         private fun lerp(start: Float, end: Float, fraction: Float) = start + (end - start) * fraction
 
         override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-            val width = resolveSize(dp(180), widthMeasureSpec)
+            val width = resolveSize(dp(216), widthMeasureSpec)
             val height = resolveSize(dp(54), heightMeasureSpec)
             setMeasuredDimension(width, height)
         }
@@ -2901,6 +3946,14 @@ class MainActivity : android.app.Activity() {
                     canvas.drawLine(cx - s * .65f, cy + s * .9f, cx - s * .65f, cy + s * .1f, paint)
                     canvas.drawLine(cx, cy + s * .9f, cx, cy - s * .45f, paint)
                     canvas.drawLine(cx + s * .65f, cy + s * .9f, cx + s * .65f, cy - s, paint)
+                }
+                3 -> {
+                    canvas.drawCircle(cx - s * .18f, cy - s * .18f, s * .58f, paint)
+                    canvas.drawLine(
+                        cx + s * .23f, cy + s * .23f,
+                        cx + s * .86f, cy + s * .86f,
+                        paint
+                    )
                 }
             }
         }
@@ -3351,7 +4404,7 @@ class MainActivity : android.app.Activity() {
             paint.color = Color.argb(95, 126, 139, 179)
             canvas.drawRoundRect(rect, dp(13f).toFloat(), dp(13f).toFloat(), paint)
 
-            // 合上的书。
+            // 两本简洁叠放的书，与参考图保持一致。
             paint.style = Paint.Style.FILL
             paint.color = Color.rgb(131, 140, 199)
             canvas.drawRoundRect(
@@ -3544,15 +4597,36 @@ class MainActivity : android.app.Activity() {
 
         private fun drawHeaders(canvas: Canvas, week: Int) {
             val monthDate = displayWeekBaseDate(week)
+            val today = Calendar.getInstance()
             val month = monthDate.get(Calendar.MONTH) + 1
             val monthSize = fittedGridTextSize(month.toString(), sp(14f), timeColumnWidth - dp(6f), Typeface.BOLD)
             drawCenteredText(canvas, month.toString(), timeColumnWidth / 2f, dp(14f).toFloat(), monthSize, TEXT_PRIMARY, Typeface.BOLD)
             drawCenteredText(canvas, "月", timeColumnWidth / 2f, dp(31f).toFloat(), sp(9f), TEXT_PRIMARY, Typeface.NORMAL)
             for (day in 0..6) {
                 val center = timeColumnWidth + day * dayColumnWidth + dayColumnWidth / 2f
-                val color = TEXT_SECONDARY
-                drawCenteredText(canvas, dayNames[day], center, dp(14f).toFloat(), sp(12f), color, Typeface.BOLD)
-                drawCenteredText(canvas, dateForDay(day, week), center, dp(31f).toFloat(), sp(8f), color, Typeface.NORMAL)
+                val headerDate = monthDate.clone() as Calendar
+                headerDate.add(Calendar.DAY_OF_MONTH, day)
+                val isToday = headerDate.get(Calendar.YEAR) == today.get(Calendar.YEAR) &&
+                    headerDate.get(Calendar.DAY_OF_YEAR) == today.get(Calendar.DAY_OF_YEAR)
+                val textColor = if (isToday) Color.rgb(22, 27, 39) else Color.rgb(142, 149, 166)
+                drawCenteredText(
+                    canvas,
+                    dayNames[day],
+                    center,
+                    dp(14f).toFloat(),
+                    sp(if (isToday) 12.6f else 11.7f),
+                    textColor,
+                    if (isToday) Typeface.BOLD else Typeface.NORMAL
+                )
+                drawCenteredText(
+                    canvas,
+                    dateForDay(day, week),
+                    center,
+                    dp(31f).toFloat(),
+                    sp(if (isToday) 8.6f else 7.8f),
+                    textColor,
+                    if (isToday) Typeface.BOLD else Typeface.NORMAL
+                )
             }
         }
 
@@ -3885,8 +4959,6 @@ class MainActivity : android.app.Activity() {
         private const val VERSION_URL = "https://raw.giteeusercontent.com/sleexy/onlinedata/raw/master/WeSDAU_Class_Schedule_version.json"
         private const val APK_URL = "https://gitee.com/sleexy/onlinedata/raw/master/ClassSchedule-modern.apk"
         private const val UPDATE_FILE_NAME = "WeSDAU课程表最新版本.apk"
-        private const val CURRENT_VERSION_CODE = 2
-        private const val APP_DISPLAY_VERSION = "V0.2"
         private const val OFFICIAL_TERM = "2026-2027-1"
         private const val OFFICIAL_TERM_START_YEAR = 2026
         private const val OFFICIAL_TERM_START_MONTH = Calendar.SEPTEMBER

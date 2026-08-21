@@ -117,8 +117,24 @@ data class RemoteExam(
     val classroom: String
 )
 
+data class RemoteEmptyRoomResult(
+    val term: String,
+    val week: Int,
+    val campus: String,
+    val weekday: Int,
+    val sectionCode: String,
+    val rooms: List<String>
+)
+
 private data class RemoteMeeting(val day: Int, val startSlot: Int, val slotCount: Int, val weeks: String)
 private data class PersonalMeeting(val name: String, val code: String, val day: Int, val startSlot: Int, val slotCount: Int, val weeks: String, val room: String)
+private data class EmptyRoomBootstrap(
+    val term: String,
+    val token: String,
+    val startWeekday: String,
+    val campusCodes: Map<String, String>
+)
+private data class EmptyRoomSectionPlan(val selectCode: String, val targetToken: String)
 
 class SdauCourseRepository {
     private val cookies = CookieManager(null, CookiePolicy.ACCEPT_ALL)
@@ -208,6 +224,86 @@ class SdauCourseRepository {
             request(earlyPath, "GET", null)
         }
         return parseEarlyExams(earlyBody)
+    }
+
+    fun queryEmptyRooms(
+        account: String,
+        password: String,
+        campus: String,
+        week: Int,
+        weekday: Int,
+        sectionCode: String
+    ): RemoteEmptyRoomResult {
+        require(week in 1..30) { "查询周次无效" }
+        require(weekday in 1..7) { "查询星期无效" }
+        login(account, password)
+
+        val pagePath = "/kbxx/jsjy_query"
+        val page = requestStage("打开空教室查询页") { request(pagePath, "GET", null) }
+        if (
+            page.contains("欢迎登录教务系统") ||
+            page.contains("请先登录系统") ||
+            (page.contains("LoginToXk") && page.contains("userAccount"))
+        ) {
+            throw IllegalStateException("登录状态已失效，请重新登录")
+        }
+        val bootstrap = parseEmptyRoomBootstrap(page)
+        val campusCode = bootstrap.campusCodes[campus] ?: when (campus) {
+            "岱宗校区" -> "001"
+            "泮河校区" -> "002"
+            "西北片区" -> "A5F850229661E843E0536685C2CAF624"
+            else -> throw IllegalArgumentException("未知校区")
+        }
+
+        var lastError: Exception? = null
+        for (plan in emptyRoomSectionPlans(sectionCode)) {
+            val form = linkedMapOf(
+                "xnxqh" to bootstrap.term,
+                "xqbh" to campusCode,
+                "jxqbh" to "",
+                "jxlbh" to "",
+                "jsbh" to "",
+                "jslx" to "",
+                "bjfh" to "=",
+                "rnrs" to "",
+                "yx" to "",
+                "kbjcmsid" to bootstrap.token,
+                "selectZc" to week.toString(),
+                "startdate" to "",
+                "enddate" to "",
+                "selectXq" to weekday.toString(),
+                "selectJc" to plan.selectCode,
+                "syjs0601id" to "",
+                "typewhere" to "jszq",
+                "qsxq" to bootstrap.startWeekday,
+                "jyms" to "0"
+            )
+            try {
+                val body = request(
+                    "/kbxx/jsjy_query2",
+                    "POST",
+                    form,
+                    "$BASE_URL$pagePath",
+                    mapOf(
+                        "Accept" to "application/json, text/javascript, */*; q=0.01",
+                        "X-Requested-With" to "XMLHttpRequest",
+                        "Origin" to BASE_URL
+                    )
+                )
+                val rooms = parseEmptyRoomRows(body, resolveEmptyRoomCellIndex(plan))
+                return RemoteEmptyRoomResult(
+                    term = bootstrap.term,
+                    week = week,
+                    campus = campus,
+                    weekday = weekday,
+                    sectionCode = sectionCode,
+                    rooms = rooms
+                )
+            } catch (error: Exception) {
+                lastError = error
+            }
+        }
+        throw IllegalStateException(lastError?.message ?: "空教室接口暂时无法查询")
     }
 
     fun queryScoreDetail(account: String, password: String, score: RemoteScore): RemoteScoreDetail {
@@ -338,6 +434,174 @@ class SdauCourseRepository {
             numbers.size == 1 -> numbers.first().toString()
             else -> value.trim()
         }
+    }
+
+    private fun parseEmptyRoomBootstrap(html: String): EmptyRoomBootstrap {
+        val term = htmlControlValue(html, "xnxqh")
+        val token = htmlControlValue(html, "kbjcmsid")
+        val startWeekday = htmlControlValue(html, "qsxq").ifBlank { "1" }
+        if (term.isBlank() || token.isBlank()) {
+            val missing = buildList {
+                if (term.isBlank()) add("xnxqh")
+                if (token.isBlank()) add("kbjcmsid")
+            }
+            throw IllegalStateException("空教室页面关键参数缺失（${missing.joinToString("、")}）")
+        }
+
+        val campusCodes = linkedMapOf<String, String>()
+        val selectBody = Regex(
+            "<select[^>]*\\bid\\s*=\\s*['\"]xqbh['\"][^>]*>([\\s\\S]*?)</select>",
+            RegexOption.IGNORE_CASE
+        ).find(html)?.groupValues?.getOrNull(1).orEmpty()
+        val optionRegex = Regex("<option([^>]*)>([\\s\\S]*?)</option>", RegexOption.IGNORE_CASE)
+        optionRegex.findAll(selectBody).forEach { match ->
+            val code = htmlAttribute(match.groupValues[1], "value")
+            val name = stripTags(match.groupValues[2]).replace(Regex("\\s+"), "")
+            if (code.isBlank() || name.isBlank()) return@forEach
+            // 实际第三项为“泮河校区西北片区”，必须先识别西北，不能覆盖泮河的 002。
+            when {
+                name.contains("西北") -> campusCodes["西北片区"] = code
+                name.contains("岱宗") || name.contains("岱总") -> campusCodes["岱宗校区"] = code
+                name.contains("泮河") || name.contains("中央") -> campusCodes["泮河校区"] = code
+            }
+        }
+        return EmptyRoomBootstrap(term, token, startWeekday, campusCodes)
+    }
+
+    private fun parseEmptyRoomRows(body: String, targetCellIndex: Int): List<String> {
+        val raw = body.trimStart('\uFEFF').trim()
+        val payload = runCatching { JSONArray(raw) }.getOrElse {
+            val message = runCatching { JSONObject(raw).optString("msg") }.getOrDefault("")
+            throw IllegalStateException(message.ifBlank { "空教室接口返回格式异常" })
+        }
+        val rows = payload.optJSONArray(4)
+            ?: throw IllegalStateException("空教室接口数据结构发生变化")
+        return buildList {
+            for (index in 0 until rows.length()) {
+                val row = rows.optJSONArray(index) ?: continue
+                val cellIndex = if (targetCellIndex < row.length()) targetCellIndex else 1
+                val occupied = jsonCellText(row.opt(cellIndex))
+                if (occupied.isNotEmpty()) continue
+                val roomName = jsonCellText(row.opt(0))
+                if (roomName.isNotEmpty()) add(roomName)
+            }
+        }.distinct()
+    }
+
+    private fun emptyRoomSectionPlans(sectionCode: String): List<EmptyRoomSectionPlan> = when (sectionCode) {
+        "0102" -> listOf(EmptyRoomSectionPlan("0102", "0102"))
+        "0304" -> listOf(EmptyRoomSectionPlan("0304", "0304"))
+        "中午" -> listOf(
+            EmptyRoomSectionPlan("中午", "中午"),
+            EmptyRoomSectionPlan("0102,中午", "中午"),
+            EmptyRoomSectionPlan("0304,中午", "中午")
+        )
+        "0506" -> listOf(
+            EmptyRoomSectionPlan("0506", "0506"),
+            EmptyRoomSectionPlan("第三大节", "第三大节"),
+            EmptyRoomSectionPlan("0102,0506", "0506"),
+            EmptyRoomSectionPlan("0304,0506", "0506"),
+            EmptyRoomSectionPlan("0102,0304,0506", "0506")
+        )
+        "0708" -> listOf(
+            EmptyRoomSectionPlan("0708", "0708"),
+            EmptyRoomSectionPlan("第四大节", "第四大节"),
+            EmptyRoomSectionPlan("0102,0708", "0708"),
+            EmptyRoomSectionPlan("0304,0708", "0708"),
+            EmptyRoomSectionPlan("0102,0304,0708", "0708")
+        )
+        "0910" -> listOf(
+            EmptyRoomSectionPlan("0910", "0910"),
+            EmptyRoomSectionPlan("第五大节", "第五大节"),
+            EmptyRoomSectionPlan("0102,0910", "0910"),
+            EmptyRoomSectionPlan("0304,0910", "0910")
+        )
+        "晚间" -> listOf(
+            EmptyRoomSectionPlan("晚间", "晚间"),
+            EmptyRoomSectionPlan("晚间时段", "晚间时段"),
+            EmptyRoomSectionPlan("0102,晚间", "晚间"),
+            EmptyRoomSectionPlan("0304,晚间", "晚间")
+        )
+        else -> throw IllegalArgumentException("未知节次")
+    }
+
+    private fun resolveEmptyRoomCellIndex(plan: EmptyRoomSectionPlan): Int {
+        fun canonical(value: String) = when (value.trim()) {
+            "第一大节" -> "0102"
+            "第二大节" -> "0304"
+            "第三大节" -> "0506"
+            "第四大节" -> "0708"
+            "第五大节" -> "0910"
+            "中午时段" -> "中午"
+            "晚间时段" -> "晚间"
+            else -> value.trim()
+        }
+        val target = canonical(plan.targetToken)
+        val index = plan.selectCode.split(',').map(::canonical).indexOf(target)
+        return if (index >= 0) index + 1 else 1
+    }
+
+    /**
+     * Mirrors the browser/jQuery `val()` behavior used by WeSDAU. The legacy
+     * teaching-system page may expose a value through an input attribute, a
+     * selected option, or a small inline script depending on its deployed UI.
+     */
+    private fun htmlControlValue(html: String, key: String): String {
+        val escapedKey = Regex.escape(key)
+        val control = Regex(
+            "<([a-z][a-z0-9]*)\\b[^>]*(?:\\bid|\\bname)\\s*=\\s*(?:['\"]$escapedKey['\"]|$escapedKey(?=\\s|/?>))[^>]*>",
+            RegexOption.IGNORE_CASE
+        ).find(html)
+        if (control != null) {
+            htmlAttribute(control.value, "value").takeIf { it.isNotBlank() }?.let { return it }
+            if (control.groupValues[1].equals("select", ignoreCase = true)) {
+                val bodyStart = control.range.last + 1
+                val bodyEnd = Regex("</select\\s*>", RegexOption.IGNORE_CASE)
+                    .find(html, bodyStart)?.range?.first ?: html.length
+                val selectBody = html.substring(bodyStart, bodyEnd)
+                val options = Regex(
+                    "<option\\b([^>]*)>([\\s\\S]*?)</option\\s*>",
+                    RegexOption.IGNORE_CASE
+                ).findAll(selectBody).toList()
+                val selectedOption = options.firstOrNull {
+                    Regex("\\bselected\\b", RegexOption.IGNORE_CASE)
+                        .containsMatchIn(it.groupValues[1])
+                } ?: options.firstOrNull()
+                selectedOption?.let { option ->
+                    htmlAttribute(option.groupValues[1], "value")
+                        .ifBlank { stripTags(option.groupValues[2]) }
+                        .takeIf { it.isNotBlank() }
+                        ?.let { return it }
+                }
+            }
+        }
+
+        val scriptValue = Regex(
+            "(?:var\\s+|let\\s+|const\\s+)?$escapedKey\\s*=\\s*['\"]([^'\"]+)['\"]",
+            RegexOption.IGNORE_CASE
+        ).find(html)?.groupValues?.getOrNull(1)?.trim().orEmpty()
+        if (scriptValue.isNotBlank()) return scriptValue
+
+        return Regex(
+            "[?&]$escapedKey=([^&'\"\\s<]+)",
+            RegexOption.IGNORE_CASE
+        ).find(html)?.groupValues?.getOrNull(1)?.trim().orEmpty()
+    }
+
+    private fun htmlAttribute(tag: String, attribute: String): String {
+        val match = Regex(
+            "\\b${Regex.escape(attribute)}\\s*=\\s*(?:(['\"])(.*?)\\1|([^\\s>]+))",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        ).find(tag) ?: return ""
+        return match.groupValues.getOrNull(2).orEmpty()
+            .ifBlank { match.groupValues.getOrNull(3).orEmpty() }
+            .trim()
+            .trimEnd('/')
+    }
+
+    private fun jsonCellText(value: Any?): String = when {
+        value == null || value === JSONObject.NULL -> ""
+        else -> value.toString().trim()
     }
 
     private fun normalizeJsonRows(body: String): JSONArray {
@@ -497,7 +761,13 @@ class SdauCourseRepository {
         }.distinct().joinToString(",")
     }
 
-    private fun request(path: String, method: String, form: Map<String, String>?, referer: String? = null): String {
+    private fun request(
+        path: String,
+        method: String,
+        form: Map<String, String>?,
+        referer: String? = null,
+        extraHeaders: Map<String, String> = emptyMap()
+    ): String {
         val connection = (URL(BASE_URL + path).openConnection() as HttpURLConnection).apply {
             connectTimeout = 30000
             readTimeout = 30000
@@ -511,6 +781,7 @@ class SdauCourseRepository {
             // an uncompressed body and decode it explicitly below.
             setRequestProperty("Accept-Encoding", "identity")
             if (!referer.isNullOrBlank()) setRequestProperty("Referer", referer)
+            extraHeaders.forEach { (name, value) -> setRequestProperty(name, value) }
             // The legacy login endpoint validates that the encrypted form was
             // submitted from its login page.  Without this it may return an
             // opaque server-side StringIndexOutOfBounds error.
