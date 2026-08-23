@@ -22,6 +22,7 @@ import android.graphics.Typeface
 import android.graphics.Bitmap
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
+import android.graphics.drawable.LayerDrawable
 import android.animation.ValueAnimator
 import android.os.Build
 import android.os.Bundle
@@ -63,9 +64,12 @@ import com.google.android.material.textfield.MaterialAutoCompleteTextView
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
-import java.util.concurrent.Executors
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.util.zip.GZIPInputStream
+import java.util.zip.GZIPOutputStream
+import java.util.concurrent.Executors
 import java.nio.charset.StandardCharsets
 import java.net.HttpURLConnection
 import java.net.URL
@@ -148,6 +152,24 @@ class MainActivity : android.app.Activity() {
     private lateinit var studentId: TextInputEditText
     private lateinit var password: TextInputEditText
     private lateinit var semesterInput: MaterialAutoCompleteTextView
+    private var loginMode = LoginMode.PERSONAL
+    private var publicCollegeSelection = ""
+    private var publicGradeSelection = ""
+    private var publicMajorSelection = ""
+    private var publicClassSelection = ""
+    private var viewingPublicSchedule = false
+    private var publicScheduleCourses: List<Course> = emptyList()
+    private var publicScheduleTerm = ""
+    private var publicScheduleLabel = ""
+    private var publicScheduleClassName = ""
+    private var publicSyncRunning = false
+    private val publicScheduleMemoryCache =
+        java.util.concurrent.ConcurrentHashMap<String, List<RemotePublicCourse>>()
+    private var onLoginPage = false
+    private lateinit var publicCollegeInput: MaterialAutoCompleteTextView
+    private lateinit var publicGradeInput: MaterialAutoCompleteTextView
+    private lateinit var publicMajorInput: MaterialAutoCompleteTextView
+    private lateinit var publicClassInput: MaterialAutoCompleteTextView
     private var loginButton: MaterialButton? = null
     private var loginStatus: TextView? = null
     private var scheduleDate: TextView? = null
@@ -163,6 +185,7 @@ class MainActivity : android.app.Activity() {
     private var scoreTermOverlay: View? = null
     private var scoreDetailOverlay: View? = null
     private var emptyRoomFilterOverlay: View? = null
+    private var publicOptionOverlay: View? = null
     private var shareOverlay: View? = null
     private var updateOverlay: View? = null
     private var pendingTestNotification = false
@@ -211,6 +234,7 @@ class MainActivity : android.app.Activity() {
     private data class RemoteUpdate(val code: Int, val name: String, val changelog: String, val url: String)
     private data class ExamCache(val term: String, val records: List<RemoteExam>)
     private data class EmptyRoomGroup(val title: String, val accent: Int, val rooms: List<String>)
+    private enum class LoginMode { PERSONAL, PUBLIC }
 
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
@@ -221,6 +245,7 @@ class MainActivity : android.app.Activity() {
         }
         pageHost = FrameLayout(this).apply { setBackgroundColor(PAGE_BACKGROUND) }
         setContentView(pageHost)
+        startPublicScheduleSyncIfNeeded(inferredCurrentTerm())
         if (hasLocalCourseCache()) showSchedulePage() else showLoginPage(false)
         checkForOnlineUpdate()
     }
@@ -422,6 +447,17 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun showLoginPage(animate: Boolean) {
+        loginMode = LoginMode.PERSONAL
+        viewingPublicSchedule = false
+        publicScheduleCourses = emptyList()
+        publicScheduleTerm = ""
+        publicScheduleLabel = ""
+        publicScheduleClassName = ""
+        publicCollegeSelection = ""
+        publicGradeSelection = ""
+        publicMajorSelection = ""
+        publicClassSelection = ""
+        onLoginPage = true
         setSystemBars(PAGE_BACKGROUND)
         cancelSystemCourseReminder()
         emptyRoomRequestGeneration++
@@ -437,11 +473,13 @@ class MainActivity : android.app.Activity() {
         scoreTermOverlay = null
         scoreDetailOverlay = null
         emptyRoomFilterOverlay = null
+        publicOptionOverlay = null
         shareOverlay = null
         swapPage(buildLoginPage(), false, animate)
     }
 
     private fun showSchedulePage() {
+        onLoginPage = false
         hideKeyboard()
         val account = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_ACCOUNT, "").orEmpty()
         if (account == "114514") {
@@ -450,7 +488,7 @@ class MainActivity : android.app.Activity() {
             if (loadScoreCache() == null) saveScoreCache(sampleScoreResult(selectedScoreTerm()))
             saveExamCache(selectedTerm(), sampleExams())
         }
-        currentWeek = weekForTerm(selectedTerm())
+        currentWeek = weekForTerm(if (viewingPublicSchedule) publicScheduleTerm else selectedTerm())
         if (emptyRoomResult == null) syncEmptyRoomDefaultsToNow()
         currentMainSection = 0
         setSystemBars(GRADIENT_START)
@@ -466,6 +504,10 @@ class MainActivity : android.app.Activity() {
 
     private fun selectedTerm(): String = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         .getString(KEY_TERM, inferredCurrentTerm()) ?: inferredCurrentTerm()
+
+    private fun activeScheduleTerm(): String = if (viewingPublicSchedule) publicScheduleTerm else selectedTerm()
+
+    private fun activeScheduleCourses(): List<Course> = if (viewingPublicSchedule) publicScheduleCourses else loadCourseCache()
 
     private fun termStartDate(term: String): Calendar {
         val date = Calendar.getInstance()
@@ -619,52 +661,238 @@ class MainActivity : android.app.Activity() {
             isFillViewport = true
             clipToPadding = false
             overScrollMode = View.OVER_SCROLL_NEVER
-            setBackgroundColor(PAGE_BACKGROUND)
+            setBackgroundColor(PUBLIC_PAGE_BACKGROUND)
         }
         val viewport = verticalLayout().apply {
             gravity = Gravity.CENTER
-            setPadding(dp(20), dp(32), dp(20), dp(32))
+            setPadding(dp(20), 0, dp(20), dp(24))
         }
         scroll.addView(viewport, FrameLayout.LayoutParams(-1, -2))
 
-        val card = surfaceCard(dp(28).toFloat())
-        val body = verticalLayout().apply { setPadding(dp(24), dp(27), dp(24), dp(24)) }
-        body.addView(text("登录", 28f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(8)))
-        body.addView(Space(this), LinearLayout.LayoutParams(1, dp(24)))
-
-        studentIdBox = inputBox("学号")
-        studentId = input(InputType.TYPE_CLASS_NUMBER).apply {
-            imeOptions = EditorInfo.IME_ACTION_NEXT
-            val savedAccount = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_ACCOUNT, "").orEmpty()
-            setText(if (savedAccount.isNotEmpty() && savedAccount.all { it.isDigit() }) savedAccount else "")
+        val card = surfaceCard(dp(28f).toFloat()).apply {
+            setCardBackgroundColor(PUBLIC_SURFACE)
+            setStrokeColor(PUBLIC_CARD_OUTLINE)
+            cardElevation = dp(2).toFloat()
         }
-        studentIdBox.addView(studentId)
-        body.addView(studentIdBox, spacedParams(dp(14)))
+        val body = verticalLayout().apply { setPadding(dp(24), dp(24), dp(24), dp(22)) }
+        body.addView(text("登录", 28f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(8)))
 
-        passwordBox = inputBox("密码")
-        password = input(InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD).apply {
-            imeOptions = EditorInfo.IME_ACTION_DONE
-            setText(getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_PASSWORD, ""))
-            setOnEditorActionListener { _, actionId, _ ->
-                if (actionId == EditorInfo.IME_ACTION_DONE) { attemptLogin(); true } else false
+        val formHost = FrameLayout(this)
+        val modeToggle = LoginModeToggle(this, loginMode) { nextMode, _ ->
+            if (nextMode != loginMode) {
+                val currentTerm = semesterInput.text?.toString().orEmpty()
+                loginMode = nextMode
+                if (nextMode == LoginMode.PUBLIC) {
+                    startPublicScheduleSyncIfNeeded(currentTerm)
+                }
+                transitionLoginModeForm(
+                    formHost,
+                    buildLoginModeForm(nextMode),
+                    nextMode == LoginMode.PUBLIC
+                )
             }
         }
-        passwordBox.endIconMode = TextInputLayout.END_ICON_PASSWORD_TOGGLE
-        passwordBox.addView(password)
-        body.addView(passwordBox, spacedParams(dp(20)))
-
-        val semesterBox = inputBox("学期")
-        val semesterOptions = semesterOptions()
-        semesterInput = MaterialAutoCompleteTextView(this).apply {
-            val savedTerm = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_TERM, "")
-            setText(if (savedTerm in semesterOptions) savedTerm else semesterOptions.first(), false)
-            setTextColor(TEXT_PRIMARY)
-            inputType = InputType.TYPE_NULL
-            isFocusable = false
-            setOnClickListener { showSemesterPicker() }
+        body.addView(modeToggle, LinearLayout.LayoutParams(-1, dp(60)).apply {
+            leftMargin = dp(16)
+            rightMargin = dp(16)
+            bottomMargin = dp(20)
+        })
+        formHost.addView(buildLoginModeForm(loginMode), FrameLayout.LayoutParams(-1, -2))
+        body.addView(formHost, matchWrapParams())
+        card.addView(body)
+        viewport.addView(card, matchWrapParams())
+        viewport.addOnLayoutChangeListener { view, _, _, _, _, _, _, _, _ ->
+            val available = view.width - view.paddingLeft - view.paddingRight
+            val width = minOf(available, dp(480))
+            val params = card.layoutParams
+            if (width > 0 && params.width != width) { params.width = width; card.layoutParams = params }
         }
-        semesterBox.addView(semesterInput)
-        body.addView(semesterBox, spacedParams(dp(22)))
+        return scroll
+    }
+
+    private fun buildLoginModeForm(mode: LoginMode): View {
+        val form = verticalLayout()
+        if (mode == LoginMode.PERSONAL) {
+            studentIdBox = inputBox("学号")
+            studentId = input(InputType.TYPE_CLASS_NUMBER).apply {
+                imeOptions = EditorInfo.IME_ACTION_NEXT
+                val savedAccount = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .getString(KEY_ACCOUNT, "").orEmpty()
+                setText(if (savedAccount.isNotEmpty() && savedAccount.all { it.isDigit() }) savedAccount else "")
+            }
+            studentIdBox.addView(studentId)
+            form.addView(studentIdBox, spacedParams(dp(14)))
+
+            passwordBox = inputBox("密码")
+            password = input(InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD).apply {
+                imeOptions = EditorInfo.IME_ACTION_DONE
+                setText(getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_PASSWORD, ""))
+                setOnEditorActionListener { _, actionId, _ ->
+                    if (actionId == EditorInfo.IME_ACTION_DONE) { attemptLogin(); true } else false
+                }
+            }
+            passwordBox.endIconMode = TextInputLayout.END_ICON_PASSWORD_TOGGLE
+            passwordBox.addView(password)
+            form.addView(passwordBox, spacedParams(dp(20)))
+
+            val semesterBox = inputBox("学期")
+            val semesterOptions = semesterOptions()
+            semesterInput = MaterialAutoCompleteTextView(this).apply {
+                val savedTerm = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_TERM, "")
+                setText(if (savedTerm in semesterOptions) savedTerm else semesterOptions.first(), false)
+                setTextColor(TEXT_PRIMARY)
+                textSize = 16f
+                inputType = InputType.TYPE_NULL
+                isFocusable = false
+                minHeight = dp(72)
+                setPadding(dp(16), dp(16), dp(16), dp(6))
+                gravity = Gravity.CENTER_VERTICAL
+                setOnClickListener { showSemesterPicker() }
+            }
+            semesterBox.addView(semesterInput)
+            form.addView(semesterBox, spacedParams(dp(18)))
+        } else {
+            semesterInput = MaterialAutoCompleteTextView(this)
+            val semesterOptions = semesterOptions().toList()
+            val savedTerm = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_TERM, "")
+            val selectedTerm = savedTerm?.takeIf { it in semesterOptions } ?: semesterOptions.first()
+            semesterInput.setText(selectedTerm, false)
+            form.addView(publicFormField("学期", semesterInput, semesterOptions, selectedTerm) {
+                showSemesterPicker()
+            }, spacedParams(dp(14)))
+            buildPublicFilterFields(form, selectedTerm)
+        }
+
+        loginStatus = text("", 13f, ERROR, Typeface.NORMAL).apply {
+            visibility = View.GONE
+            setLineSpacing(dp(2).toFloat(), 1f)
+        }
+        form.addView(loginStatus, spacedParams(dp(12)))
+
+        val login = MaterialButton(this).apply {
+            text = if (mode == LoginMode.PERSONAL) "进入个人课表" else "查询班级课表"
+            textSize = 16f
+            setTextColor(Color.WHITE)
+            setTypeface(Typeface.DEFAULT, Typeface.BOLD)
+            isAllCaps = false
+            cornerRadius = dp(if (mode == LoginMode.PERSONAL) 18 else 23)
+            insetTop = 0
+            insetBottom = 0
+            minimumHeight = dp(if (mode == LoginMode.PERSONAL) 56 else 46)
+            backgroundTintList = buttonColors()
+            setOnClickListener {
+                if (mode == LoginMode.PERSONAL) attemptLogin() else attemptPublicScheduleLookup()
+            }
+        }
+        if (mode == LoginMode.PUBLIC && !hasPublicScheduleCache(semesterInput.text?.toString().orEmpty())) {
+            login.isEnabled = false
+            login.text = "正在准备全校课表…"
+        }
+        loginButton = login
+        form.addView(login, LinearLayout.LayoutParams(-1, -2).apply {
+            if (mode == LoginMode.PUBLIC) topMargin = dp(6)
+        })
+        return form
+    }
+
+    private fun transitionLoginModeForm(host: FrameLayout, next: View, forward: Boolean) {
+        val previous = host.getChildAt(0)
+        if (previous == null || host.width <= 0) {
+            host.removeAllViews()
+            host.addView(next, FrameLayout.LayoutParams(-1, -2))
+            return
+        }
+
+        next.measure(
+            View.MeasureSpec.makeMeasureSpec(host.width, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        )
+        val startHeight = host.height
+        val targetHeight = next.measuredHeight
+        val distance = dp(24).toFloat() * if (forward) 1f else -1f
+        next.alpha = 0f
+        next.translationX = distance
+        host.addView(next, FrameLayout.LayoutParams(-1, -2))
+        host.isEnabled = false
+
+        ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 380L
+            interpolator = PathInterpolator(.2f, .78f, .2f, 1f)
+            addUpdateListener { animator ->
+                val progress = animator.animatedValue as Float
+                host.layoutParams = host.layoutParams.apply {
+                    height = (startHeight + (targetHeight - startHeight) * progress).toInt()
+                }
+                previous.alpha = 1f - progress
+                previous.translationX = -distance * .45f * progress
+                next.alpha = progress
+                next.translationX = distance * (1f - progress)
+            }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: android.animation.Animator) {
+                    host.removeView(previous)
+                    next.alpha = 1f
+                    next.translationX = 0f
+                    host.layoutParams = host.layoutParams.apply { height = ViewGroup.LayoutParams.WRAP_CONTENT }
+                    host.isEnabled = true
+                }
+            })
+            start()
+        }
+    }
+
+    /**
+     * 全校课表使用与个人登录不同的筛选表单：标签位于值的上方，字段底部使用
+     * 一条轻量分隔线，整体更接近课程查询页面而不是账号输入页面。
+     */
+    private fun buildPublicLoginPage(): View {
+        val scroll = ScheduleScrollView(this).apply {
+            isFillViewport = true
+            clipToPadding = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            setBackgroundColor(PUBLIC_PAGE_BACKGROUND)
+        }
+        val viewport = verticalLayout().apply {
+            gravity = Gravity.CENTER
+            setPadding(dp(20), 0, dp(20), dp(24))
+        }
+        scroll.addView(viewport, FrameLayout.LayoutParams(-1, -2))
+
+        val card = surfaceCard(dp(28f).toFloat()).apply {
+            setCardBackgroundColor(PUBLIC_SURFACE)
+            setStrokeColor(PUBLIC_CARD_OUTLINE)
+            cardElevation = dp(2).toFloat()
+        }
+        val body = verticalLayout().apply {
+            setPadding(dp(24), dp(24), dp(24), dp(22))
+        }
+
+        body.addView(text("登录", 28f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(8)))
+
+        // 全校课表与个人登录使用不同的表单构建分支，切换器需要
+        // 在两个分支中都显式加入，否则进入全校课表后会丢失顶部胶囊。
+        val modeToggle = LoginModeToggle(this, loginMode) { nextMode, _ ->
+            if (nextMode != loginMode) {
+                loginMode = nextMode
+                swapPage(buildLoginPage(), nextMode == LoginMode.PUBLIC, true)
+            }
+        }
+        body.addView(modeToggle, LinearLayout.LayoutParams(-1, dp(60)).apply {
+            leftMargin = dp(16)
+            rightMargin = dp(16)
+            bottomMargin = dp(18)
+        })
+
+        semesterInput = MaterialAutoCompleteTextView(this)
+        val semesterOptions = semesterOptions().toList()
+        val savedTerm = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_TERM, "")
+        val selectedTerm = savedTerm?.takeIf { it in semesterOptions } ?: semesterOptions.first()
+        semesterInput.setText(selectedTerm, false)
+        body.addView(publicFormField("学期", semesterInput, semesterOptions, selectedTerm) {
+            showSemesterPicker()
+        }, spacedParams(dp(14)))
+
+        buildPublicFilterFields(body, selectedTerm)
 
         loginStatus = text("", 13f, ERROR, Typeface.NORMAL).apply {
             visibility = View.GONE
@@ -673,25 +901,37 @@ class MainActivity : android.app.Activity() {
         body.addView(loginStatus, spacedParams(dp(12)))
 
         val login = MaterialButton(this).apply {
-            text = "进入课程表"
+            text = "查询班级课表"
             textSize = 16f
             setTextColor(Color.WHITE)
             setTypeface(Typeface.DEFAULT, Typeface.BOLD)
             isAllCaps = false
-            cornerRadius = dp(18)
-            minimumHeight = dp(56)
+            cornerRadius = dp(23)
+            insetTop = 0
+            insetBottom = 0
+            minimumHeight = dp(46)
             backgroundTintList = buttonColors()
-            setOnClickListener { attemptLogin() }
+            setOnClickListener { attemptPublicScheduleLookup() }
+        }
+        if (!hasPublicScheduleCache(selectedTerm)) {
+            login.isEnabled = false
+            login.text = "正在准备全校课表…"
         }
         loginButton = login
-        body.addView(login, matchWrapParams())
+        body.addView(login, LinearLayout.LayoutParams(-1, -2).apply {
+            topMargin = dp(6)
+        })
+
         card.addView(body)
         viewport.addView(card, matchWrapParams())
         viewport.addOnLayoutChangeListener { view, _, _, _, _, _, _, _, _ ->
             val available = view.width - view.paddingLeft - view.paddingRight
             val width = minOf(available, dp(480))
             val params = card.layoutParams
-            if (width > 0 && params.width != width) { params.width = width; card.layoutParams = params }
+            if (width > 0 && params.width != width) {
+                params.width = width
+                card.layoutParams = params
+            }
         }
         return scroll
     }
@@ -765,6 +1005,278 @@ class MainActivity : android.app.Activity() {
         }
     }
 
+    private fun publicGradeLabel(value: String): String {
+        val normalized = value.trim().removeSuffix("级")
+        return if (normalized.isBlank()) "未标注年级" else "${normalized}级"
+    }
+
+    private fun publicSelectorBox(
+        label: String,
+        options: List<String>,
+        selected: String,
+        onSelected: (String) -> Unit
+    ): TextInputLayout = publicSelectorBox(label, options, selected, onSelected, true)
+
+    private fun publicSelectorBox(
+        label: String,
+        options: List<String>,
+        selected: String,
+        onSelected: (String) -> Unit,
+        enabled: Boolean
+    ): TextInputLayout {
+        val selectorEnabled = enabled && when (label) {
+            "年级" -> publicCollegeSelection.isNotBlank()
+            "专业" -> publicGradeSelection.isNotBlank()
+            "班级" -> publicMajorSelection.isNotBlank()
+            else -> true
+        }
+        val box = selectorInputBox(label).apply {
+            isEnabled = selectorEnabled
+            alpha = if (selectorEnabled) 1f else .55f
+        }
+        val field = MaterialAutoCompleteTextView(this).apply {
+            setText(selected.takeIf { it in options }.orEmpty(), false)
+            setTextColor(TEXT_PRIMARY)
+            textSize = 18f
+            inputType = InputType.TYPE_NULL
+            isFocusable = false
+            minHeight = dp(54)
+            setPadding(dp(16), dp(6), dp(16), dp(2))
+            background = selectorFieldBackground(selectorEnabled)
+            gravity = Gravity.BOTTOM
+            isEnabled = selectorEnabled
+            setOnClickListener {
+                if (!selectorEnabled) return@setOnClickListener
+                showPublicOptionPicker(label, options, text?.toString().orEmpty()) { value ->
+                    setText(value, false)
+                    onSelected(value)
+                }
+            }
+        }
+        box.addView(field)
+        return box
+    }
+
+    private fun showPublicOptionPicker(
+        title: String,
+        options: List<String>,
+        selected: String,
+        onSelected: (String) -> Unit
+    ) {
+        if (publicOptionOverlay != null || options.isEmpty()) return
+        val overlay = FrameLayout(this).apply {
+            setBackgroundColor(Color.argb(145, 12, 18, 30))
+            isClickable = true
+            setOnClickListener { hidePublicOptionPicker() }
+        }
+        val card = surfaceCard(dp(24f).toFloat()).apply {
+            setCardBackgroundColor(PAGE_BACKGROUND)
+            setOnClickListener { }
+        }
+        val body = verticalLayout().apply { setPadding(dp(20), dp(18), dp(20), dp(18)) }
+        body.addView(text("选择$title", 20f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(12)))
+        val optionList = verticalLayout()
+        options.forEach { option ->
+            val row = MaterialCardView(this).apply {
+                radius = dp(13f).toFloat()
+                cardElevation = 0f
+                strokeWidth = 0
+                setCardBackgroundColor(if (option == selected) PRIMARY_CONTAINER else Color.TRANSPARENT)
+                setOnClickListener {
+                    hidePublicOptionPicker()
+                    onSelected(option)
+                }
+            }
+            val rowContent = horizontalLayout().apply {
+                gravity = Gravity.CENTER_VERTICAL
+                addView(text(option, 15f, TEXT_PRIMARY, Typeface.NORMAL).apply {
+                    setPadding(dp(14), dp(11), dp(14), dp(11))
+                }, LinearLayout.LayoutParams(0, -2, 1f))
+                if (option == selected) {
+                    addView(ImageView(this@MainActivity).apply {
+                        setImageResource(R.drawable.ic_check)
+                        setColorFilter(PRIMARY_DARK)
+                        setPadding(dp(8), dp(8), dp(14), dp(8))
+                    }, LinearLayout.LayoutParams(dp(40), dp(48)))
+                }
+            }
+            row.addView(rowContent)
+            optionList.addView(row, spacedParams(dp(7)))
+        }
+        if (title == "学院") {
+            val scroll = ScrollView(this).apply {
+                isVerticalScrollBarEnabled = true
+                isScrollbarFadingEnabled = false
+                scrollBarStyle = View.SCROLLBARS_INSIDE_INSET
+                overScrollMode = View.OVER_SCROLL_NEVER
+                addView(optionList, FrameLayout.LayoutParams(-1, -2))
+            }
+            body.addView(scroll, LinearLayout.LayoutParams(-1, dp(6 * 52)))
+        } else {
+            body.addView(optionList)
+        }
+        card.addView(body)
+        val width = minOf(dp(360f), resources.displayMetrics.widthPixels - dp(36f))
+        overlay.addView(card, FrameLayout.LayoutParams(width, -2, Gravity.CENTER))
+        pageHost.addView(overlay, matchParentParams())
+        publicOptionOverlay = overlay
+        overlay.alpha = 0f
+        card.scaleX = .94f
+        card.scaleY = .94f
+        overlay.animate().alpha(1f).setDuration(150).start()
+        card.animate().scaleX(1f).scaleY(1f).setDuration(190).start()
+    }
+
+    private fun hidePublicOptionPicker() {
+        val overlay = publicOptionOverlay ?: return
+        overlay.animate().alpha(0f).setDuration(130).withEndAction {
+            pageHost.removeView(overlay)
+            publicOptionOverlay = null
+        }.start()
+    }
+
+    private fun choosePublicOption(current: String, options: List<String>, preferred: List<String>): String {
+        return current.takeIf { it in options }
+            ?: preferred.firstOrNull { it in options }
+            ?: ""
+    }
+
+    private fun buildPublicFilterFields(body: LinearLayout, term: String) {
+        val records = loadPublicScheduleCache(term)
+        val colleges = records.map { it.college }.filter { it.isNotBlank() }.distinct().sorted()
+        val college = choosePublicOption(publicCollegeSelection, colleges, listOf("农学院"))
+        val gradeRecords = records.filter { college.isBlank() || it.college == college }
+        val grades = gradeRecords.map { publicGradeLabel(it.grade) }.distinct().sorted()
+        val grade = choosePublicOption(publicGradeSelection, grades, listOf("2026级"))
+        val majorRecords = gradeRecords.filter { grade.isBlank() || publicGradeLabel(it.grade) == grade }
+        val majors = majorRecords.map { it.major }.filter { it.isNotBlank() }.distinct().sorted()
+        val major = choosePublicOption(
+            publicMajorSelection,
+            majors,
+            listOf("农业（拔尖基地班）", "农学（拔尖基地班）")
+        )
+        val classRecords = majorRecords.filter { major.isBlank() || it.major == major }
+        val classes = classRecords.map { it.className }.filter { it.isNotBlank() }.distinct().sorted()
+        val className = choosePublicOption(publicClassSelection, classes, listOf("农基2601"))
+
+        publicCollegeSelection = college
+        publicGradeSelection = grade
+        publicMajorSelection = major
+        publicClassSelection = className
+
+        publicCollegeInput = MaterialAutoCompleteTextView(this)
+        body.addView(publicFormField("学院", publicCollegeInput, colleges, college) {
+            publicCollegeSelection = it
+            publicGradeSelection = ""
+            publicMajorSelection = ""
+            publicClassSelection = ""
+            swapPage(buildLoginPage(), false, false)
+        }, spacedParams(dp(14)))
+        publicGradeInput = MaterialAutoCompleteTextView(this)
+        body.addView(publicFormField("年级", publicGradeInput, grades, grade) {
+            publicGradeSelection = it
+            publicMajorSelection = ""
+            publicClassSelection = ""
+            swapPage(buildLoginPage(), false, false)
+        }, spacedParams(dp(14)))
+        publicMajorInput = MaterialAutoCompleteTextView(this)
+        body.addView(publicFormField("专业", publicMajorInput, majors, major) {
+            publicMajorSelection = it
+            publicClassSelection = ""
+            swapPage(buildLoginPage(), false, false)
+        }, spacedParams(dp(14)))
+        publicClassInput = MaterialAutoCompleteTextView(this)
+        body.addView(publicFormField("班级", publicClassInput, classes, className) {
+            publicClassSelection = it
+            swapPage(buildLoginPage(), false, false)
+        }, spacedParams(dp(14)))
+        if (records.isEmpty()) {
+            body.addView(text("全校课表正在准备，准备完成后可筛选查询", 13f, TEXT_SECONDARY, Typeface.NORMAL).apply {
+                setLineSpacing(dp(3).toFloat(), 1f)
+            }, spacedParams(dp(8)))
+        }
+    }
+
+    private fun publicFormField(
+        label: String,
+        field: MaterialAutoCompleteTextView,
+        options: List<String>,
+        selected: String = "",
+        onSelected: (String) -> Unit
+    ): View {
+        val enabled = options.isNotEmpty()
+        val container = verticalLayout()
+        container.addView(text(label, 14f, TEXT_SECONDARY, Typeface.NORMAL).apply {
+            includeFontPadding = true
+        }, matchWrapParams())
+        field.apply {
+            setText(selected.takeIf { it in options }.orEmpty(), false)
+            setTextColor(TEXT_PRIMARY)
+            textSize = 18f
+            setTypeface(Typeface.DEFAULT, Typeface.NORMAL)
+            inputType = InputType.TYPE_NULL
+            isFocusable = false
+            isEnabled = enabled
+            alpha = if (enabled) 1f else .55f
+            minHeight = dp(34)
+            setPadding(0, 0, 0, dp(2))
+            gravity = Gravity.CENTER_VERTICAL
+            background = ColorDrawable(Color.TRANSPARENT)
+            setOnClickListener {
+                if (!enabled) return@setOnClickListener
+                showPublicOptionPicker(label, options, text?.toString().orEmpty()) { value ->
+                    setText(value, false)
+                    onSelected(value)
+                }
+            }
+        }
+        container.addView(field, matchWrapParams())
+        container.addView(View(this).apply {
+            setBackgroundColor(PUBLIC_FIELD_DIVIDER)
+            alpha = if (enabled) 1f else .55f
+        }, LinearLayout.LayoutParams(-1, dp(1)))
+        return container
+    }
+
+    private fun attemptPublicScheduleLookup() {
+        val term = semesterInput.text?.toString()?.trim().orEmpty()
+        val records = loadPublicScheduleCache(term)
+        if (records.isEmpty()) {
+            loginStatus?.text = "暂无本地全校课表缓存，请先使用个人账号登录"
+            loginStatus?.visibility = View.VISIBLE
+            return
+        }
+        if (publicCollegeSelection.isBlank() || publicGradeSelection.isBlank() ||
+            publicMajorSelection.isBlank() || publicClassSelection.isBlank()
+        ) {
+            loginStatus?.text = "请选择学院、年级、专业和班级"
+            loginStatus?.visibility = View.VISIBLE
+            return
+        }
+        val selected = records.filter {
+            it.college == publicCollegeSelection &&
+                publicGradeLabel(it.grade) == publicGradeSelection &&
+                it.major == publicMajorSelection &&
+                it.className == publicClassSelection
+        }
+        if (selected.isEmpty()) {
+            loginStatus?.text = "未找到该班级的课程信息"
+            loginStatus?.visibility = View.VISIBLE
+            return
+        }
+        val colors = selected.map { it.name }.distinct().withIndex().associate { it.value to COURSE_COLORS[it.index % COURSE_COLORS.size] }
+        publicScheduleCourses = selected.map {
+            Course(it.day, it.startSlot, it.slotCount, it.name, it.room, it.teacher,
+                colors[it.name] ?: COURSE_COLORS.first(), Color.WHITE, it.weeks)
+        }
+        publicScheduleTerm = term
+        publicScheduleLabel = "$publicCollegeSelection · $publicGradeSelection · $publicMajorSelection · $publicClassSelection"
+        publicScheduleClassName = publicClassSelection
+        viewingPublicSchedule = true
+        currentWeek = weekForTerm(term)
+        showSchedulePage()
+    }
+
     private fun showLoginError(error: Exception) {
         val detail = error.message?.replace(Regex("\\s+"), " ")?.trim()
             ?.takeIf { it.isNotEmpty() }
@@ -800,7 +1312,7 @@ class MainActivity : android.app.Activity() {
         val section = FrameLayout(this).apply { setBackgroundColor(Color.TRANSPARENT) }
         val content = verticalLayout().apply { setBackgroundColor(Color.TRANSPARENT) }
         content.addView(buildScheduleHeader(), matchWrapParams())
-        scheduleGrid = ScheduleGridView(this, loadCourseCache())
+        scheduleGrid = ScheduleGridView(this, activeScheduleCourses())
         scheduleGrid?.setScheduleMode(scheduleMode)
         scheduleGrid?.setWeekIndex(currentWeek)
         content.addView(scheduleGrid, LinearLayout.LayoutParams(-1, 0, 1f))
@@ -901,7 +1413,13 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun buildExamSection(refresh: Boolean = true): View {
-        val term = selectedTerm()
+        if (viewingPublicSchedule) {
+            return buildExamStateSection(
+                activeScheduleTerm(), hasLoaded = true, error = null,
+                emptyDescription = "此功能暂不可用\n请切换回个人账号重新查询"
+            )
+        }
+        val term = activeScheduleTerm()
         val cached = loadExamCache()?.takeIf { it.term == term }
         val section = if (!cached?.records.isNullOrEmpty()) {
             buildExamResultSection(term, cached!!.records)
@@ -913,6 +1431,7 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun refreshExams() {
+        if (viewingPublicSchedule) return
         if (examsLoading) return
         val preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         val account = preferences.getString(KEY_ACCOUNT, "").orEmpty()
@@ -965,7 +1484,13 @@ class MainActivity : android.app.Activity() {
         replaceMainSection(host, buildExamSection(refresh = false), 1, 0f, 170L)
     }
 
-    private fun buildExamStateSection(term: String, hasLoaded: Boolean, error: String?): View {
+    private fun buildExamStateSection(
+        term: String,
+        hasLoaded: Boolean,
+        error: String?,
+        emptyTitle: String = "暂无考试安排",
+        emptyDescription: String = "本学期暂未发布考试信息\n后续安排会在查询后显示在这里"
+    ): View {
         val scroll = ScrollView(this).apply {
             isFillViewport = true
             clipToPadding = false
@@ -997,8 +1522,8 @@ class MainActivity : android.app.Activity() {
             }
             else -> buildAcademicEmptyState(
                 EmptyAcademicState.EXAMS,
-                "暂无考试安排",
-                "本学期暂未发布考试信息\n后续安排会在查询后显示在这里"
+                emptyTitle,
+                emptyDescription
             )
         }
         body.addView(stateView, LinearLayout.LayoutParams(-1, 0, 1f))
@@ -1068,6 +1593,13 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun buildGradesSection(refresh: Boolean = true): View {
+        if (viewingPublicSchedule) {
+            return buildGradeStateSection(
+                activeScheduleTerm(), hasLoadedResult = true, error = null,
+                emptyTitle = "暂无成绩信息",
+                emptyDescription = "此功能暂不可用\n请切换回个人账号重新查询"
+            )
+        }
         val selectedTerm = selectedScoreTerm()
         val cached = loadScoreCache()?.takeIf { it.term == selectedTerm }
         val result = if (cached != null && cached.records.isNotEmpty()) {
@@ -1080,6 +1612,7 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun refreshScores() {
+        if (viewingPublicSchedule) return
         if (scoresLoading) return
         val preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         val account = preferences.getString(KEY_ACCOUNT, "").orEmpty()
@@ -2130,7 +2663,7 @@ class MainActivity : android.app.Activity() {
             setOnClickListener { hideScoreDetail() }
         }
         val card = surfaceCard(dp(25f).toFloat()).apply {
-            cardElevation = dp(4).toFloat()
+            cardElevation = dp(3).toFloat()
             strokeWidth = 0
             setCardBackgroundColor(Color.rgb(250, 252, 254))
             setOnClickListener { }
@@ -2293,7 +2826,13 @@ class MainActivity : android.app.Activity() {
         body.addView(header, spacedParams(dp(18)))
     }
 
-    private fun buildGradeStateSection(term: String, hasLoadedResult: Boolean, error: String?): View {
+    private fun buildGradeStateSection(
+        term: String,
+        hasLoadedResult: Boolean,
+        error: String?,
+        emptyTitle: String = "暂无成绩信息",
+        emptyDescription: String = "本学期暂未发布课程成绩\n成绩公布后会自动显示在这里"
+    ): View {
         val scroll = ScrollView(this).apply {
             isFillViewport = true
             clipToPadding = false
@@ -2314,8 +2853,8 @@ class MainActivity : android.app.Activity() {
             }
             hasLoadedResult -> buildAcademicEmptyState(
                 EmptyAcademicState.GRADES,
-                "暂无课程成绩",
-                "本学期暂未发布课程成绩\n成绩公布后会自动显示在这里"
+                emptyTitle,
+                emptyDescription
             )
             else -> verticalLayout().apply {
                 gravity = Gravity.CENTER
@@ -2444,7 +2983,13 @@ class MainActivity : android.app.Activity() {
         }
         val row = horizontalLayout().apply { gravity = Gravity.CENTER_VERTICAL }
         val group = verticalLayout()
-        scheduleDate = fixedAdaptiveText(todayLabel(), 26f, 20f, TEXT_PRIMARY, Typeface.BOLD)
+        scheduleDate = fixedAdaptiveText(
+            if (viewingPublicSchedule) publicScheduleClassName else todayLabel(),
+            26f,
+            20f,
+            TEXT_PRIMARY,
+            Typeface.BOLD
+        )
         scheduleWeek = fixedAdaptiveText(formatWeekLabel(currentWeek), 13f, 11f, TEXT_PRIMARY, Typeface.NORMAL)
         group.addView(scheduleDate, spacedParams(dp(7)))
         group.addView(scheduleWeek, matchWrapParams())
@@ -2456,6 +3001,7 @@ class MainActivity : android.app.Activity() {
             setPadding(dp(10), dp(10), dp(10), dp(10))
             setOnClickListener { togglePushNotifications() }
         }
+        if (viewingPublicSchedule) pushButton?.visibility = View.GONE
         row.addView(pushButton, LinearLayout.LayoutParams(dp(48), dp(44)))
         row.addView(ImageButton(this).apply {
             setImageResource(R.drawable.ic_schedule_mode)
@@ -2543,7 +3089,13 @@ class MainActivity : android.app.Activity() {
         }
     }
 
-    private fun createScheduleBitmap(term: String, week: Int, mode: ScheduleMode, courses: List<Course>): Bitmap {
+    private fun createScheduleBitmap(
+        term: String,
+        week: Int,
+        mode: ScheduleMode,
+        courses: List<Course>,
+        includeAllWeeks: Boolean = false
+    ): Bitmap {
         val width = 2048
         val height = 1152
         val padding = 40f
@@ -2636,12 +3188,14 @@ class MainActivity : android.app.Activity() {
         canvas.drawRect(gridLeft, gridTop, gridRight, gridTop + headerHeight, paint)
         canvas.restore()
 
-        // 标题和周次沿用示例图的宽屏留白比例，内容仍取当前项目的学期与周次。
+        // 标题和副标题沿用示例图的宽屏留白比例；全校模式导出班级完整课表，
+        // 因此副标题显示班级名而不是当前周次。
         setText(54f, primary, Typeface.NORMAL)
         paint.typeface = Typeface.create("sans-serif-black", Typeface.NORMAL)
         canvas.drawText("WeSDAU-课程表", padding, 96f, paint)
         drawText(
-            "$term    ${if (week > 0) "第${week}周" else "学期未开始"}",
+            if (includeAllWeeks) "$term    $publicScheduleClassName"
+            else "$term    ${if (week > 0) "第${week}周" else "学期未开始"}",
             padding,
             136f,
             30f,
@@ -2685,7 +3239,7 @@ class MainActivity : android.app.Activity() {
             )
         }
 
-        val visibleCourses = courses.filter { courseVisibleInWeek(it, week) }
+        val visibleCourses = if (includeAllWeeks) courses else courses.filter { courseVisibleInWeek(it, week) }
         visibleCourses.forEach { course ->
             if (course.day !in 0..6 || course.startSlot !in 0..9) return@forEach
             val start = course.startSlot / 2f
@@ -2712,15 +3266,12 @@ class MainActivity : android.app.Activity() {
 
             val textLeft = left + 11f
             val maxTextWidth = right - left - 22f
-            // 课程名保持示例图的醒目粗体；教室与教师之间保留一个空行，
-            // 让卡片信息层次与示例图一致。
+            // 课程名保持示例图的醒目粗体；教室和教师连续排列，避免导出图浪费空间。
             val titleLines = wrapText(course.name, maxTextWidth, 25f, Typeface.BOLD).take(2)
             val detailLines = buildList {
                 addAll(formatRoom(course.room).split('\n').filter { it.isNotBlank() })
-                if (course.teacher.isNotBlank()) {
-                    add("")
-                    add(course.teacher)
-                }
+                if (course.teacher.isNotBlank()) add(course.teacher)
+                if (includeAllWeeks && course.weeks.isNotBlank()) add("第${course.weeks}周")
             }.flatMap { line ->
                 if (line.isBlank()) listOf("") else wrapText(line, maxTextWidth, 19f, Typeface.NORMAL)
             }.take(6)
@@ -2748,13 +3299,15 @@ class MainActivity : android.app.Activity() {
             val directory = prepareShareCache()
             val pngFile = File(directory, "课程表.png")
             val csvFile = File(directory, "课程表.csv")
-            val bitmap = createScheduleBitmap(selectedTerm(), currentWeek, scheduleMode, loadCourseCache())
+            val bitmap = createScheduleBitmap(
+                activeScheduleTerm(), currentWeek, scheduleMode, activeScheduleCourses(), viewingPublicSchedule
+            )
             try {
                 FileOutputStream(pngFile).use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
             } finally {
                 bitmap.recycle()
             }
-            writeCourseCsv(csvFile, loadCourseCache())
+            writeCourseCsv(csvFile, activeScheduleCourses())
             return pngFile to csvFile
         } catch (error: Exception) {
             Toast.makeText(this, "导出失败：${error.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
@@ -2764,10 +3317,10 @@ class MainActivity : android.app.Activity() {
 
     private fun saveSchedulePng() {
         if (scheduleExporting) return
-        val term = selectedTerm()
+        val term = activeScheduleTerm()
         val week = currentWeek
         val mode = scheduleMode
-        val courses = loadCourseCache()
+        val courses = activeScheduleCourses()
         if (courses.isEmpty()) {
             Toast.makeText(this, "课表尚未准备好", Toast.LENGTH_SHORT).show()
             return
@@ -2777,9 +3330,14 @@ class MainActivity : android.app.Activity() {
         networkExecutor.execute {
             var bitmap: Bitmap? = null
             try {
-                bitmap = createScheduleBitmap(term, week, mode, courses)
-                val weekName = if (week > 0) "第${week}周" else "学期未开始"
-                saveScheduleBitmapToPictures(bitmap, "课表-$term-$weekName.png")
+                bitmap = createScheduleBitmap(term, week, mode, courses, viewingPublicSchedule)
+                val displayName = if (viewingPublicSchedule) {
+                    "专业课表-$term-$publicScheduleClassName.png"
+                } else {
+                    val weekName = if (week > 0) "第${week}周" else "学期未开始"
+                    "课表-$term-$weekName.png"
+                }
+                saveScheduleBitmapToPictures(bitmap, displayName)
                 runOnUiThread {
                     Toast.makeText(this, "课表图片已保存到 Pictures/WeSDAU", Toast.LENGTH_LONG).show()
                 }
@@ -3010,7 +3568,11 @@ class MainActivity : android.app.Activity() {
         }
         val body = verticalLayout().apply { setPadding(dp(20), dp(18), dp(20), dp(18)) }
         body.addView(text("分享", 20f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(12)))
-        body.addView(shareRow("导出本周课表为PNG", "", R.drawable.ic_share_image) { shareWeekPng() }, spacedParams(dp(8)))
+        body.addView(shareRow(
+            if (viewingPublicSchedule) "导出本专业课表为PNG" else "导出本周课表为PNG",
+            if (viewingPublicSchedule) "包含课程周数" else "",
+            R.drawable.ic_share_image
+        ) { shareWeekPng() }, spacedParams(dp(8)))
         body.addView(shareRow("分享CSV文件", "可直接导入WakeUp课程表", R.drawable.ic_share_spreadsheet) { shareCsv() }, spacedParams(dp(8)))
         body.addView(shareRow("分享 APP", "WeSDAU课程表安装包", R.drawable.ic_share_app) { shareApp() }, matchWrapParams())
         card.addView(body)
@@ -3203,6 +3765,14 @@ class MainActivity : android.app.Activity() {
                 setOnClickListener {
                     semesterInput.setText(semester, false)
                     hideSemesterPicker()
+                    if (loginMode == LoginMode.PUBLIC) {
+                        publicCollegeSelection = ""
+                        publicGradeSelection = ""
+                        publicMajorSelection = ""
+                        publicClassSelection = ""
+                        startPublicScheduleSyncIfNeeded(semester)
+                        swapPage(buildLoginPage(), false, false)
+                    }
                 }
             }
             row.addView(text(semester, 15f, TEXT_PRIMARY, Typeface.NORMAL).apply {
@@ -3532,6 +4102,97 @@ class MainActivity : android.app.Activity() {
         return getSharedPreferences(PREFS_NAME, MODE_PRIVATE).contains(KEY_COURSES)
     }
 
+    private fun publicScheduleFile(term: String): File {
+        val safeTerm = term.replace(Regex("[^A-Za-z0-9_-]"), "_")
+        return File(filesDir, "public_schedule_$safeTerm.json.gz")
+    }
+
+    private fun hasPublicScheduleCache(term: String): Boolean {
+        val file = publicScheduleFile(term)
+        return file.isFile && file.length() > 0L &&
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getString(KEY_PUBLIC_SCHEDULE_SYNCED_TERM, "") == term
+    }
+
+    private fun savePublicScheduleCache(term: String, records: List<RemotePublicCourse>) {
+        val array = JSONArray()
+        records.forEach { item ->
+            array.put(JSONObject().apply {
+                put("college", item.college)
+                put("grade", item.grade)
+                put("major", item.major)
+                put("className", item.className)
+                put("day", item.day)
+                put("startSlot", item.startSlot)
+                put("slotCount", item.slotCount)
+                put("name", item.name)
+                put("room", item.room)
+                put("teacher", item.teacher)
+                put("weeks", item.weeks)
+                put("courseCode", item.courseCode)
+            })
+        }
+        val target = publicScheduleFile(term)
+        val temporary = File(target.parentFile, "${target.name}.tmp")
+        GZIPOutputStream(FileOutputStream(temporary)).bufferedWriter(Charsets.UTF_8).use { it.write(array.toString()) }
+        if (!temporary.renameTo(target)) {
+            temporary.copyTo(target, overwrite = true)
+            temporary.delete()
+        }
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+            .putString(KEY_PUBLIC_SCHEDULE_SYNCED_TERM, term)
+            .apply()
+        publicScheduleMemoryCache[term] = records
+    }
+
+    private fun loadPublicScheduleCache(term: String): List<RemotePublicCourse> {
+        publicScheduleMemoryCache[term]?.let { return it }
+        val file = publicScheduleFile(term)
+        if (!file.isFile) return emptyList()
+        return runCatching {
+            val raw = GZIPInputStream(FileInputStream(file)).bufferedReader(Charsets.UTF_8).use { it.readText() }
+            val array = JSONArray(raw)
+            buildList {
+                for (index in 0 until array.length()) {
+                    val item = array.optJSONObject(index) ?: continue
+                    add(RemotePublicCourse(
+                        item.optString("college"), item.optString("grade"), item.optString("major"),
+                        item.optString("className"), item.optInt("day"), item.optInt("startSlot"),
+                        item.optInt("slotCount"), item.optString("name"), item.optString("room"),
+                        item.optString("teacher").replace(Regex("\\s*\\[[^]]*\\]"), ""),
+                        item.optString("weeks"), item.optString("courseCode")
+                    ))
+                }
+            }.also { publicScheduleMemoryCache[term] = it }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun startPublicScheduleSyncIfNeeded(term: String) {
+        if (term.isBlank()) return
+        if (hasPublicScheduleCache(term)) {
+            if (!publicScheduleMemoryCache.containsKey(term)) {
+                networkExecutor.execute { loadPublicScheduleCache(term) }
+            }
+            return
+        }
+        if (publicSyncRunning) return
+        publicSyncRunning = true
+        networkExecutor.execute {
+            try {
+                val records = SdauCourseRepository().queryPublicCoursesFromMirror(term)
+                savePublicScheduleCache(term, records)
+                runOnUiThread {
+                    publicSyncRunning = false
+                    if (onLoginPage && loginMode == LoginMode.PUBLIC) {
+                        swapPage(buildLoginPage(), false, false)
+                    }
+                }
+            } catch (_: Exception) {
+                runOnUiThread { publicSyncRunning = false }
+            }
+        }
+    }
+
     private fun saveCourseCache(courses: List<Course>) {
         val array = JSONArray()
         courses.forEach { course ->
@@ -3698,6 +4359,25 @@ class MainActivity : android.app.Activity() {
         setErrorTextColor(ColorStateList.valueOf(ERROR))
     }
 
+    private fun selectorInputBox(hint: String) = inputBox(hint).apply {
+        boxBackgroundMode = TextInputLayout.BOX_BACKGROUND_NONE
+        setBoxBackgroundColor(Color.TRANSPARENT)
+        setBoxCornerRadii(0f, 0f, 0f, 0f)
+        boxStrokeWidth = 0
+        boxStrokeWidthFocused = 0
+    }
+
+    private fun selectorFieldBackground(enabled: Boolean): LayerDrawable {
+        val layers = LayerDrawable(arrayOf(
+            ColorDrawable(Color.TRANSPARENT),
+            ColorDrawable(if (enabled) OUTLINE else Color.rgb(232, 234, 240))
+        ))
+        layers.setLayerGravity(1, Gravity.BOTTOM)
+        layers.setLayerWidth(1, -1)
+        layers.setLayerHeight(1, dp(1))
+        return layers
+    }
+
     private fun input(inputType: Int) = TextInputEditText(this).apply {
         setSingleLine(true); textSize = 16f; setTextColor(TEXT_PRIMARY); setHintTextColor(TEXT_SECONDARY)
         this.inputType = inputType; minHeight = dp(58); setPadding(dp(16), 0, dp(16), 0)
@@ -3743,6 +4423,16 @@ class MainActivity : android.app.Activity() {
         val focused = currentFocus ?: return
         (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(focused.windowToken, 0)
         focused.clearFocus()
+    }
+
+    @Deprecated("Use OnBackInvokedDispatcher on newer Android versions")
+    override fun onBackPressed() {
+        if (onLoginPage && loginMode == LoginMode.PUBLIC) {
+            loginMode = LoginMode.PERSONAL
+            swapPage(buildLoginPage(), false, true)
+            return
+        }
+        super.onBackPressed()
     }
 
     private fun verticalLayout() = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -4151,6 +4841,133 @@ class MainActivity : android.app.Activity() {
     private enum class ScheduleMode { SPRING, SUMMER }
 
     private data class Course(val day: Int, val startSlot: Int, val slotCount: Int, val name: String, val room: String, val teacher: String, val background: Int, val foreground: Int, val weeks: String = "")
+
+    private inner class LoginModeToggle(
+        context: Context,
+        initialMode: LoginMode,
+        private val onModeSelected: (LoginMode, LoginModeToggle) -> Unit
+    ) : FrameLayout(context) {
+        private var selectedMode = initialMode
+        private var animating = false
+        private var selectionPosition = if (initialMode == LoginMode.PUBLIC) 1f else 0f
+        private val trackBounds = RectF()
+        private val selectionBounds = RectF()
+        private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = PUBLIC_TOGGLE_BACKGROUND
+            style = Paint.Style.FILL
+        }
+        private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = PUBLIC_TOGGLE_BACKGROUND
+            style = Paint.Style.FILL
+            setShadowLayer(dp(5).toFloat(), 0f, 0f, Color.argb(115, 94, 181, 255))
+        }
+        private val outlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = PUBLIC_TOGGLE_OUTLINE
+            style = Paint.Style.STROKE
+            strokeWidth = dp(1).toFloat()
+        }
+        private val selectionPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.FILL
+            setShadowLayer(dp(3).toFloat(), 0f, dp(1).toFloat(), Color.argb(72, 32, 39, 53))
+        }
+        private val personalLabel = text("个人课表", 15f, TEXT_PRIMARY, Typeface.BOLD).apply {
+            gravity = Gravity.CENTER
+            includeFontPadding = false
+            isClickable = true
+            setOnClickListener { requestMode(LoginMode.PERSONAL) }
+        }
+        private val publicLabel = text("全校课表", 15f, TEXT_SECONDARY, Typeface.NORMAL).apply {
+            gravity = Gravity.CENTER
+            includeFontPadding = false
+            isClickable = true
+            setOnClickListener { requestMode(LoginMode.PUBLIC) }
+        }
+
+        init {
+            personalLabel.text = "个人课表"
+            personalLabel.textSize = 16f
+            publicLabel.textSize = 16f
+            setPadding(0, 0, 0, 0)
+            setWillNotDraw(false)
+            setLayerType(LAYER_TYPE_SOFTWARE, null)
+            setBackgroundColor(Color.TRANSPARENT)
+            val labels = horizontalLayout().apply {
+                gravity = Gravity.CENTER
+                setBackgroundColor(Color.TRANSPARENT)
+            }
+            labels.addView(personalLabel, LinearLayout.LayoutParams(0, -1, 1f))
+            labels.addView(publicLabel, LinearLayout.LayoutParams(0, -1, 1f))
+            addView(labels, FrameLayout.LayoutParams(-1, -1))
+            updateLabels()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val trackInset = dp(4).toFloat()
+            if (width <= trackInset * 2f || height <= trackInset * 2f) return
+
+            trackBounds.set(
+                trackInset,
+                trackInset,
+                width.toFloat() - trackInset,
+                height.toFloat() - trackInset
+            )
+            val trackRadius = trackBounds.height() / 2f
+            canvas.drawRoundRect(trackBounds, trackRadius, trackRadius, glowPaint)
+            canvas.drawRoundRect(trackBounds, trackRadius, trackRadius, trackPaint)
+            canvas.drawRoundRect(trackBounds, trackRadius, trackRadius, outlinePaint)
+
+            val selectionVerticalInset = dp(4).toFloat()
+            val selectionHorizontalInset = dp(4).toFloat()
+            val segmentWidth = trackBounds.width() / 2f
+            val selectionWidth = segmentWidth - selectionHorizontalInset * 2f
+            val selectionLeft = trackBounds.left + selectionHorizontalInset + segmentWidth * selectionPosition
+            selectionBounds.set(
+                selectionLeft,
+                trackBounds.top + selectionVerticalInset,
+                selectionLeft + selectionWidth,
+                trackBounds.bottom - selectionVerticalInset
+            )
+            val selectionRadius = selectionBounds.height() / 2f
+            canvas.drawRoundRect(selectionBounds, selectionRadius, selectionRadius, selectionPaint)
+        }
+
+        private fun requestMode(mode: LoginMode) {
+            if (animating || mode == selectedMode) return
+            selectedMode = mode
+            animating = true
+            updateLabels()
+            val target = if (mode == LoginMode.PUBLIC) 1f else 0f
+            // 表单过渡与胶囊滑动在同一帧启动，并共用相同时长与曲线。
+            onModeSelected(mode, this)
+            ValueAnimator.ofFloat(selectionPosition, target).apply {
+                duration = 380L
+                interpolator = PathInterpolator(.2f, .78f, .2f, 1f)
+                addUpdateListener { animator ->
+                    selectionPosition = animator.animatedValue as Float
+                    invalidate()
+                }
+                addListener(object : android.animation.AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: android.animation.Animator) {
+                        selectionPosition = target
+                        animating = false
+                    }
+                })
+                start()
+            }
+        }
+
+        private fun updateLabels() {
+            val personalSelected = selectedMode == LoginMode.PERSONAL
+            personalLabel.setTextColor(if (personalSelected) TEXT_PRIMARY else TEXT_SECONDARY)
+            personalLabel.setTypeface(Typeface.DEFAULT, if (personalSelected) Typeface.BOLD else Typeface.NORMAL)
+            publicLabel.setTextColor(if (personalSelected) TEXT_SECONDARY else TEXT_PRIMARY)
+            publicLabel.setTypeface(Typeface.DEFAULT, if (personalSelected) Typeface.NORMAL else Typeface.BOLD)
+            personalLabel.setBackgroundColor(Color.TRANSPARENT)
+            publicLabel.setBackgroundColor(Color.TRANSPARENT)
+        }
+    }
 
     /**
      * 轻量的液态玻璃底栏。它由半透明玻璃、双层高光和会流动的选中胶囊组成，
@@ -5291,13 +6108,15 @@ class MainActivity : android.app.Activity() {
         val body = verticalLayout().apply { setPadding(dp(22), dp(20), dp(22), dp(20)) }
         val titleRow = horizontalLayout().apply { gravity = Gravity.CENTER_VERTICAL }
         titleRow.addView(text(course.name, 21f, TEXT_PRIMARY, Typeface.BOLD), LinearLayout.LayoutParams(0, -2, 1f))
-        titleRow.addView(ImageButton(this).apply {
-            setImageResource(R.drawable.ic_edit)
-            contentDescription = "修改课程"
-            setBackgroundColor(Color.TRANSPARENT)
-            setPadding(dp(8), dp(8), dp(8), dp(8))
-            setOnClickListener { showCourseEditor(course) }
-        }, LinearLayout.LayoutParams(dp(42), dp(42)))
+        if (!viewingPublicSchedule) {
+            titleRow.addView(ImageButton(this).apply {
+                setImageResource(R.drawable.ic_edit)
+                contentDescription = "修改课程"
+                setBackgroundColor(Color.TRANSPARENT)
+                setPadding(dp(8), dp(8), dp(8), dp(8))
+                setOnClickListener { showCourseEditor(course) }
+            }, LinearLayout.LayoutParams(dp(42), dp(42)))
+        }
         titleRow.addView(text("×", 28f, TEXT_SECONDARY, Typeface.NORMAL).apply {
             gravity = Gravity.CENTER
             setOnClickListener { hideCourseDetails() }
@@ -5319,6 +6138,7 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun showCourseEditor(course: Course) {
+        if (viewingPublicSchedule) return
         detailOverlay?.let { pageHost.removeView(it); detailOverlay = null }
         if (editorOverlay != null) return
         val overlay = FrameLayout(this).apply {
@@ -5453,6 +6273,7 @@ class MainActivity : android.app.Activity() {
         private const val KEY_SCORE_TERM = "score_term"
         private const val KEY_SCHEDULE_MODE = "schedule_mode"
         private const val KEY_COURSES = "courses_cache"
+        private const val KEY_PUBLIC_SCHEDULE_SYNCED_TERM = "public_schedule_synced_term"
         private const val KEY_SCORES = "scores_cache"
         private const val SCORE_STATS_SCOPE = "all_terms_v2"
         private const val KEY_EXAMS = "exams_cache"
@@ -5480,6 +6301,12 @@ class MainActivity : android.app.Activity() {
             Color.rgb(132, 193, 184), Color.rgb(185, 153, 210)
         )
         private val PAGE_BACKGROUND = Color.rgb(244, 246, 252)
+        private val PUBLIC_PAGE_BACKGROUND = Color.rgb(241, 243, 249)
+        private val PUBLIC_SURFACE = Color.rgb(247, 248, 252)
+        private val PUBLIC_CARD_OUTLINE = Color.rgb(220, 223, 232)
+        private val PUBLIC_FIELD_DIVIDER = Color.rgb(194, 196, 204)
+        private val PUBLIC_TOGGLE_BACKGROUND = Color.rgb(239, 241, 243)
+        private val PUBLIC_TOGGLE_OUTLINE = Color.rgb(143, 199, 246)
         private val SCHEDULE_BACKGROUND = Color.rgb(238, 242, 250)
         private val GRADIENT_COLORS = intArrayOf(
             Color.rgb(243, 242, 249), // #F3F2F9

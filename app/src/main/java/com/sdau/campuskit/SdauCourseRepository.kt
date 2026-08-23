@@ -25,6 +25,21 @@ data class RemoteCourse(
     val courseCode: String = ""
 )
 
+data class RemotePublicCourse(
+    val college: String,
+    val grade: String,
+    val major: String,
+    val className: String,
+    val day: Int,
+    val startSlot: Int,
+    val slotCount: Int,
+    val name: String,
+    val room: String,
+    val teacher: String,
+    val weeks: String = "",
+    val courseCode: String = ""
+)
+
 data class RemoteScore(
     val courseCode: String,
     val courseName: String,
@@ -179,6 +194,73 @@ class SdauCourseRepository {
             val weeks = findPersonalWeeks(course, personal)
             if (weeks.isBlank()) course else course.copy(weeks = weeks)
         }
+    }
+
+    /**
+     * Reads the public timetable endpoint. This is deliberately separate from
+     * queryCourses(): the latter remains the source of the signed-in user's
+     * selected courses, while this method is only used to build the optional
+     * local university-wide timetable cache.
+     */
+    fun queryPublicCourses(
+        account: String,
+        password: String,
+        term: String,
+        onProgress: (Int, String) -> Unit = { _, _ -> }
+    ): List<RemotePublicCourse> {
+        onProgress(5, "正在登录教务系统")
+        login(account, password)
+        onProgress(20, "正在请求全校课程数据")
+        val path = "/kbcx/kbxx_xzb_ifr?pageNum=1&pageSize=10000000" +
+            "&xnxq01id=${URLEncoder.encode(term, "UTF-8")}" +
+            "&kbjcmsid=$PUBLIC_SCHEDULE_TOKEN&skyx=&ksnd=&skzy=&skbj=" +
+            "&zc1=&zc2=&skxq1=&skxq2=&jc1=&jc2="
+        val body = requestStage("读取全校课表") {
+            request(path, "GET", null, "$BASE_URL/kbcx/kbxx_xzb")
+        }
+        onProgress(78, "正在解析全校课程数据")
+        if (isLoginPage(body)) throw IllegalStateException("登录状态已失效，请重新登录")
+        val records = parsePublicCourses(body)
+        onProgress(95, "正在整理本地筛选数据")
+        return records
+    }
+
+    fun queryPublicCoursesFromMirror(
+        term: String,
+        onProgress: (Int, String) -> Unit = { _, _ -> }
+    ): List<RemotePublicCourse> {
+        val parts = term.split("-")
+        val startYear = parts.getOrNull(0)?.toIntOrNull()
+            ?: throw IllegalArgumentException("学期格式不正确")
+        val endYear = parts.getOrNull(1)?.toIntOrNull()
+            ?: throw IllegalArgumentException("学期格式不正确")
+        val semester = parts.getOrNull(2)?.takeIf { it == "1" || it == "2" }
+            ?: throw IllegalArgumentException("暂不支持该学期数据")
+        val fileName = "sc${String.format(Locale.US, "%02d", startYear % 100)}-" +
+            "${String.format(Locale.US, "%02d", endYear % 100)}-$semester.json"
+        val mirrorUrl = "$PUBLIC_SCHEDULE_MIRROR_BASE/$fileName"
+        onProgress(8, "正在连接课程数据镜像")
+        val connection = (URL(mirrorUrl).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 30000
+            readTimeout = 60000
+            requestMethod = "GET"
+            useCaches = false
+            setRequestProperty("Accept", "application/json,text/plain,*/*")
+            setRequestProperty("User-Agent", "SDAU-ClassSchedule-Android/2.0")
+            setRequestProperty("Accept-Encoding", "identity")
+        }
+        val status = connection.responseCode
+        val stream = if (status >= 400) connection.errorStream else connection.inputStream
+        if (stream == null) throw IllegalStateException("课程镜像无响应（HTTP $status）")
+        val bytes = stream.use { it.readBytes() }
+        val body = bytes.toString(responseCharset(connection.contentType))
+        connection.disconnect()
+        if (status !in 200..299) throw IllegalStateException("课程镜像返回 HTTP $status")
+        onProgress(78, "正在解析课程镜像")
+        val records = parsePublicCourses(body)
+        if (records.isEmpty()) throw IllegalStateException("课程镜像中没有可用课程")
+        onProgress(95, "正在整理本地筛选数据")
+        return records
     }
 
     fun queryScores(
@@ -705,6 +787,78 @@ class SdauCourseRepository {
         return result.distinct()
     }
 
+    private fun parsePublicCourses(body: String): List<RemotePublicCourse> {
+        val rows = normalizePublicRows(body)
+        val result = mutableListOf<RemotePublicCourse>()
+        for (index in 0 until rows.length()) {
+            val row = rows.optJSONObject(index) ?: continue
+            val name = clean(jsonText(row, "kcmc", "kc_mc", "courseName", "course"))
+            if (name.isBlank()) continue
+            val meetings = parsePublicMeetings(row)
+            if (meetings.isEmpty()) continue
+            val college = clean(jsonText(row, "dwmc", "college", "yxmc", "skyx"))
+            val grade = normalizeGrade(jsonText(row, "ksnd", "grade", "nj"))
+            val major = clean(jsonText(row, "zymc", "major", "zy"))
+            val className = clean(jsonText(row, "bj", "skbj", "className", "bjmc"))
+            val room = cleanLocation(jsonText(row, "skdd", "jxdd", "room", "location", "jsmc"))
+            val teacher = clean(jsonText(row, "xm", "jsxm", "teacher", "js"))
+                .replace(Regex("\\s*\\[[^]]*\\]"), "")
+            val code = clean(jsonText(row, "kch", "courseCode", "kcdm"))
+            meetings.forEach { meeting ->
+                result += RemotePublicCourse(
+                    college, grade, major, className,
+                    meeting.day, meeting.startSlot, meeting.slotCount,
+                    name, room, teacher, meeting.weeks, code
+                )
+            }
+        }
+        return result.distinct()
+    }
+
+    private fun normalizePublicRows(body: String): JSONArray {
+        val raw = body.trimStart('\uFEFF').trim()
+        runCatching { JSONArray(raw) }.getOrNull()?.let { return it }
+        val root = runCatching { JSONObject(raw) }.getOrElse {
+            throw IllegalStateException("全校课表接口返回格式异常")
+        }
+        listOf("rows", "data", "list", "result", "records").forEach { key ->
+            root.optJSONArray(key)?.let { return it }
+            val nested = root.optJSONObject(key)
+            listOf("rows", "data", "list", "result", "records").forEach { nestedKey ->
+                nested?.optJSONArray(nestedKey)?.let { return it }
+            }
+        }
+        return JSONArray()
+    }
+
+    private fun parsePublicMeetings(row: JSONObject): List<RemoteMeeting> {
+        val rawMeeting = jsonText(row, "sksj", "courseTime", "time", "schedule")
+        val parsed = parseMeetings(rawMeeting)
+        if (parsed.isNotEmpty()) return parsed
+
+        val dayText = jsonText(row, "zzdweek", "skxq", "xqj", "xq", "weekday", "weekDay")
+        val day = when {
+            dayText.contains("一") || dayText.contains("1") -> 0
+            dayText.contains("二") || dayText.contains("2") -> 1
+            dayText.contains("三") || dayText.contains("3") -> 2
+            dayText.contains("四") || dayText.contains("4") -> 3
+            dayText.contains("五") || dayText.contains("5") -> 4
+            dayText.contains("六") || dayText.contains("6") -> 5
+            dayText.contains("日") || dayText.contains("天") || dayText.contains("7") -> 6
+            else -> -1
+        }
+        val sectionText = jsonText(row, "jc", "jcs", "section", "sections", "skjc")
+        val sections = Regex("\\d+").findAll(sectionText).mapNotNull { it.value.toIntOrNull() }.toList()
+        if (day !in 0..6 || sections.isEmpty()) return emptyList()
+        val start = sections.first() - 1
+        val end = sections.last() - 1
+        if (start !in 0..9 || end !in start..9) return emptyList()
+        return listOf(RemoteMeeting(day, start, end - start + 1,
+            normalizeWeekText(jsonText(row, "kkzc", "zc", "zcmc", "weeks", "week", "weekRange"))))
+    }
+
+    private fun normalizeGrade(value: String): String = clean(value).removeSuffix("级")
+
     private fun parseStudentProfile(html: String, fallbackStudentId: String): RemoteStudentProfile? {
         val title = Regex(
             "<[^>]*class\\s*=\\s*[\\\"'][^\\\"']*\\binfoContentTitle\\b[^\\\"']*[\\\"'][^>]*>([\\s\\S]*?)</[^>]+>",
@@ -889,5 +1043,7 @@ class SdauCourseRepository {
 
     companion object {
         private const val BASE_URL = "https://jw.sdau.edu.cn"
+        private const val PUBLIC_SCHEDULE_TOKEN = "16FD8C2BE55E15F9E0630100007FF6B5"
+        private const val PUBLIC_SCHEDULE_MIRROR_BASE = "https://gitee.com/sleexy/onlinedata/raw/master"
     }
 }
