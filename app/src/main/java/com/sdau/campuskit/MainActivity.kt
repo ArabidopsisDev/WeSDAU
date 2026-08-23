@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.AlarmManager
 import android.app.DownloadManager
 import android.content.Context
+import android.content.ContentValues
 import android.content.ActivityNotFoundException
 import android.content.res.ColorStateList
 import android.content.Intent
@@ -40,6 +41,7 @@ import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.net.Uri
 import android.provider.Settings
+import android.provider.MediaStore
 import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.ImageView
@@ -67,6 +69,7 @@ import java.io.FileOutputStream
 import java.nio.charset.StandardCharsets
 import java.net.HttpURLConnection
 import java.net.URL
+import kotlin.math.min
 
 class MainActivity : android.app.Activity() {
     private class EmptyRoomPriorityScrollView(context: Context) : ScrollView(context) {
@@ -167,6 +170,8 @@ class MainActivity : android.app.Activity() {
     private var pushButton: ImageButton? = null
     private var bottomNavigation: LiquidGlassNavigationView? = null
     private var scoresLoading = false
+    private var scoreExporting = false
+    private var scheduleExporting = false
     private var scoreLoadError: String? = null
     private var examsLoading = false
     private var examLoadError: String? = null
@@ -713,6 +718,7 @@ class MainActivity : android.app.Activity() {
                 .putString(KEY_PASSWORD, pwd)
                 .putString(KEY_TERM, selectedSemester)
                 .putString(KEY_SCORE_TERM, selectedSemester)
+                .putString(KEY_STUDENT_NAME, "演示用户")
                 .remove(KEY_SCORES)
                 .remove(KEY_EXAMS)
                 .apply()
@@ -726,7 +732,11 @@ class MainActivity : android.app.Activity() {
         loginButton?.text = "正在查询课程…"
         networkExecutor.execute {
             try {
-                val remoteCourses = SdauCourseRepository().queryCourses(id, pwd, selectedSemester)
+                val repository = SdauCourseRepository()
+                val remoteCourses = repository.queryCourses(id, pwd, selectedSemester)
+                // 个人主页中的 infoContentTitle 是教务系统显示“姓名-学号”的来源。
+                // 姓名获取失败不影响课程登录，成绩导出会回退为仅显示学号。
+                val profile = runCatching { repository.queryStudentProfile(id, pwd) }.getOrNull()
                 val courses = recolorCourses(remoteCourses.map { remote ->
                     Course(remote.day, remote.startSlot, remote.slotCount, remote.name, remote.room, remote.teacher, COURSE_COLORS.first(), Color.WHITE, remote.weeks)
                 })
@@ -736,6 +746,7 @@ class MainActivity : android.app.Activity() {
                         .putString(KEY_PASSWORD, pwd)
                         .putString(KEY_TERM, selectedSemester)
                         .putString(KEY_SCORE_TERM, selectedSemester)
+                        .putString(KEY_STUDENT_NAME, profile?.name.orEmpty())
                         .remove(KEY_SCORES)
                         .remove(KEY_EXAMS)
                         .apply()
@@ -1082,6 +1093,9 @@ class MainActivity : android.app.Activity() {
         }
         if (account == "114514") {
             scoreLoadError = null
+            if (preferences.getString(KEY_STUDENT_NAME, "").orEmpty().isBlank()) {
+                preferences.edit().putString(KEY_STUDENT_NAME, "演示用户").apply()
+            }
             val result = sampleScoreResult(term)
             if (cached != result) {
                 saveScoreCache(result)
@@ -1094,7 +1108,14 @@ class MainActivity : android.app.Activity() {
         if (cached == null) refreshVisibleGrades()
         networkExecutor.execute {
             try {
-                val result = SdauCourseRepository().queryScores(account, password, term, allScoreTerms(account))
+                val repository = SdauCourseRepository()
+                val profile = if (preferences.getString(KEY_STUDENT_NAME, "").orEmpty().isBlank()) {
+                    runCatching { repository.queryStudentProfile(account, password) }.getOrNull()
+                } else {
+                    null
+                }
+                profile?.let { saveStudentName(it.name) }
+                val result = repository.queryScores(account, password, term, allScoreTerms(account))
                 val changed = cached != result
                 saveScoreCache(result)
                 runOnUiThread {
@@ -1890,6 +1911,217 @@ class MainActivity : android.app.Activity() {
         }
     }
 
+    private fun exportScoreImage(term: String) {
+        if (scoreExporting) return
+        val result = loadScoreCache()?.takeIf { it.term == term && it.records.isNotEmpty() }
+        if (result == null) {
+            Toast.makeText(this, "暂无可导出的成绩", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        scoreExporting = true
+        Toast.makeText(this, "正在生成成绩图片…", Toast.LENGTH_SHORT).show()
+        networkExecutor.execute {
+            var bitmap: Bitmap? = null
+            try {
+                bitmap = createScoreBitmap(result)
+                saveScoreBitmap(bitmap, result.term)
+                runOnUiThread {
+                    Toast.makeText(this, "成绩图片已保存到 Pictures/WeSDAU", Toast.LENGTH_LONG).show()
+                }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    Toast.makeText(this, "保存成绩图片失败：${error.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
+                }
+            } finally {
+                bitmap?.recycle()
+                scoreExporting = false
+            }
+        }
+    }
+
+    private fun createScoreBitmap(result: RemoteScoreResult): Bitmap {
+        val width = 1600
+        val padding = 44
+        val headerHeight = 170
+        val summaryHeight = 120
+        val tableTitleHeight = 48
+        val tableHeaderHeight = 56
+        val rowHeight = 68
+        val rows = result.records.ifEmpty {
+            listOf(RemoteScore("-", "当前开课时间暂无成绩记录", "-", "-", "-"))
+        }
+        val height = padding * 2 + headerHeight + 18 + summaryHeight + 18 +
+            tableTitleHeight + tableHeaderHeight + rows.size * rowHeight
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        // Bitmap 默认是透明的，深色图片查看器会将透明区域显示为黑色，
+        // 从而让深色标题和表格内容看起来像“丢失”。导出图使用固定浅色底，
+        // 保证在浅色/深色系统主题和不同图片查看器中都保持一致。
+        canvas.drawColor(Color.rgb(243, 249, 252))
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG)
+        val contentWidth = width - padding * 2
+
+        fun roundedRect(x: Float, y: Float, w: Float, h: Float, radius: Float, color: Int) {
+            paint.style = Paint.Style.FILL
+            paint.color = color
+            canvas.drawRoundRect(RectF(x, y, x + w, y + h), radius, radius, paint)
+        }
+
+        fun drawText(value: String, x: Float, baseline: Float, size: Float, color: Int, style: Int) {
+            paint.style = Paint.Style.FILL
+            paint.color = color
+            paint.textSize = size
+            paint.typeface = Typeface.create("sans-serif", style)
+            paint.textAlign = Paint.Align.LEFT
+            canvas.drawText(value, x, baseline, paint)
+        }
+
+        fun wrap(value: String, maxWidth: Float, size: Float, style: Int): List<String> {
+            val safe = value.ifBlank { "-" }
+            paint.textSize = size
+            paint.typeface = Typeface.create("sans-serif", style)
+            val lines = mutableListOf<String>()
+            var current = ""
+            safe.forEach { character ->
+                val next = current + character
+                if (current.isNotEmpty() && paint.measureText(next) > maxWidth) {
+                    lines += current
+                    current = character.toString()
+                } else {
+                    current = next
+                }
+            }
+            if (current.isNotEmpty()) lines += current
+            return lines.ifEmpty { listOf("-") }
+        }
+
+        paint.shader = LinearGradient(
+            padding.toFloat(), padding.toFloat(),
+            (padding + contentWidth).toFloat(), (padding + headerHeight).toFloat(),
+            Color.rgb(232, 248, 255), Color.rgb(245, 239, 255), Shader.TileMode.CLAMP
+        )
+        canvas.drawRoundRect(
+            RectF(padding.toFloat(), padding.toFloat(), (padding + contentWidth).toFloat(), (padding + headerHeight).toFloat()),
+            24f, 24f, paint
+        )
+        paint.shader = null
+
+        val preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val account = preferences.getString(KEY_ACCOUNT, "").orEmpty().ifBlank { "-" }
+        val studentName = preferences.getString(KEY_STUDENT_NAME, "").orEmpty().trim()
+        val displayName = if (studentName.isBlank() || account == "-") account else "$studentName-$account"
+        paint.style = Paint.Style.FILL
+        paint.shader = null
+        paint.textSize = 24f
+        paint.color = Color.rgb(79, 107, 121)
+        paint.textAlign = Paint.Align.LEFT
+        paint.typeface = Typeface.create("sans-serif-black", Typeface.NORMAL)
+        canvas.drawText("WeSDAU-成绩单", (padding + 24).toFloat(), (padding + 44).toFloat(), paint)
+        drawText(displayName, (padding + 24).toFloat(), (padding + 98).toFloat(), 40f, Color.rgb(23, 51, 63), Typeface.BOLD)
+        drawText("学期：${result.term.ifBlank { "-" }}", (padding + 24).toFloat(), (padding + 136).toFloat(), 24f, Color.rgb(87, 115, 130), Typeface.NORMAL)
+
+        var y = padding + headerHeight + 18
+        val summaryGap = 18
+        val summaryWidth = (contentWidth - summaryGap * 2) / 3f
+        roundedRect(padding.toFloat(), y.toFloat(), summaryWidth, summaryHeight.toFloat(), 18f, Color.rgb(255, 245, 248))
+        drawText("平均成绩", (padding + 20).toFloat(), (y + 38).toFloat(), 22f, Color.rgb(108, 128, 144), Typeface.NORMAL)
+        drawText(result.averageScore.ifBlank { "-" }, (padding + 20).toFloat(), (y + 92).toFloat(), 44f, Color.rgb(245, 108, 126), Typeface.BOLD)
+
+        val gpaX = padding + summaryWidth + summaryGap
+        roundedRect(gpaX, y.toFloat(), summaryWidth, summaryHeight.toFloat(), 18f, Color.rgb(245, 244, 255))
+        drawText("平均学分绩点", gpaX + 20, (y + 38).toFloat(), 22f, Color.rgb(108, 128, 144), Typeface.NORMAL)
+        drawText(result.averageCreditGpa.ifBlank { "-" }, gpaX + 20, (y + 92).toFloat(), 44f, Color.rgb(131, 140, 199), Typeface.BOLD)
+
+        val metaX = gpaX + summaryWidth + summaryGap
+        roundedRect(metaX, y.toFloat(), summaryWidth, summaryHeight.toFloat(), 18f, Color.rgb(247, 252, 255))
+        drawText("课程统计", metaX + 20, (y + 38).toFloat(), 22f, Color.rgb(95, 119, 131), Typeface.NORMAL)
+        val countText = "门数：${result.records.size}"
+        drawText(countText, metaX + 20, (y + 88).toFloat(), 28f, Color.rgb(31, 61, 75), Typeface.BOLD)
+        paint.textSize = 28f
+        paint.typeface = Typeface.create("sans-serif", Typeface.BOLD)
+        val countWidth = paint.measureText(countText)
+        drawText("总学分：${result.totalCredits.ifBlank { "-" }}", metaX + 20 + countWidth + 22, (y + 88).toFloat(), 20f, Color.rgb(31, 61, 75), Typeface.NORMAL)
+
+        y += summaryHeight + 18
+        drawText("课程成绩", (padding + 2).toFloat(), (y + 34).toFloat(), 30f, Color.rgb(36, 70, 86), Typeface.BOLD)
+        y += tableTitleHeight
+
+        val ratios = floatArrayOf(1.2f, 2.3f, .8f, .8f, .8f)
+        val ratioSum = ratios.sum()
+        val columnWidths = ratios.map { contentWidth * it / ratioSum }
+        val headers = listOf("课程代码", "课程名", "学分", "总成绩", "绩点")
+        roundedRect(padding.toFloat(), y.toFloat(), contentWidth.toFloat(), tableHeaderHeight.toFloat(), 14f, Color.rgb(234, 244, 250))
+        var x = padding.toFloat()
+        headers.forEachIndexed { index, header ->
+            drawText(header, x + 14, (y + 35).toFloat(), 21f, Color.rgb(80, 105, 119), Typeface.BOLD)
+            x += columnWidths[index]
+        }
+        y += tableHeaderHeight
+
+        rows.forEachIndexed { index, record ->
+            val rowY = y + index * rowHeight
+            roundedRect(padding.toFloat(), (rowY + 3).toFloat(), contentWidth.toFloat(), (rowHeight - 6).toFloat(), 12f, if (index % 2 == 0) Color.WHITE else Color.rgb(248, 252, 255))
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = 1f
+            paint.color = Color.rgb(230, 239, 244)
+            canvas.drawLine(padding.toFloat(), (rowY + rowHeight).toFloat(), (padding + contentWidth).toFloat(), (rowY + rowHeight).toFloat(), paint)
+
+            val values = listOf(record.courseCode, record.courseName, record.credit, record.score, record.gpa)
+            var cellX = padding.toFloat()
+            values.forEachIndexed { column, rawValue ->
+                val value = rawValue.ifBlank { "-" }
+                val columnWidth = columnWidths[column]
+                if (column == 1) {
+                    val lines = wrap(value, columnWidth - 28, 22f, Typeface.BOLD).take(2)
+                    val startY = rowY + if (lines.size == 2) 27 else 42
+                    lines.forEachIndexed { lineIndex, line ->
+                        drawText(line, cellX + 14, (startY + lineIndex * 24).toFloat(), 22f, Color.rgb(25, 55, 68), Typeface.BOLD)
+                    }
+                } else {
+                    val color = if (column == 3) scoreColor(value) else Color.rgb(31, 61, 75)
+                    val size = if (column == 0) 20f else 22f
+                    val line = wrap(value, columnWidth - 28, size, Typeface.BOLD).first()
+                    drawText(line, cellX + 14, (rowY + 42).toFloat(), size, color, Typeface.BOLD)
+                }
+                cellX += columnWidth
+            }
+        }
+        return bitmap
+    }
+
+    private fun saveScoreBitmap(bitmap: Bitmap, term: String) {
+        val safeTerm = term.replace(Regex("[^\\w\\u4e00-\\u9fa5-]"), "_")
+        val displayName = "课程成绩-$safeTerm.png"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
+                put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/WeSDAU")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                ?: error("无法创建图片文件")
+            try {
+                contentResolver.openOutputStream(uri)?.use { output ->
+                    check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) { "图片编码失败" }
+                } ?: error("无法写入图片文件")
+                contentResolver.update(uri, ContentValues().apply {
+                    put(MediaStore.Images.Media.IS_PENDING, 0)
+                }, null, null)
+            } catch (error: Exception) {
+                contentResolver.delete(uri, null, null)
+                throw error
+            }
+        } else {
+            val directory = getExternalFilesDir(Environment.DIRECTORY_PICTURES)?.apply { mkdirs() }
+                ?: error("无法访问图片目录")
+            File(directory, displayName).outputStream().use { output ->
+                check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) { "图片编码失败" }
+            }
+        }
+    }
+
     private fun showScoreDetail(record: RemoteScore) {
         if (scoreDetailOverlay != null) return
         val overlay = FrameLayout(this).apply {
@@ -2029,6 +2261,15 @@ class MainActivity : android.app.Activity() {
     private fun addGradeHeader(body: LinearLayout, term: String) {
         val header = horizontalLayout().apply { gravity = Gravity.CENTER_VERTICAL }
         header.addView(text("成绩", 28f, TEXT_PRIMARY, Typeface.BOLD), LinearLayout.LayoutParams(0, -2, 1f))
+        header.addView(ImageButton(this).apply {
+            setImageResource(R.drawable.ic_export)
+            imageTintList = ColorStateList.valueOf(PRIMARY_DARK)
+            setBackgroundColor(Color.TRANSPARENT)
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            contentDescription = "保存成绩图片"
+            isEnabled = !scoreExporting
+            setOnClickListener { exportScoreImage(term) }
+        }, LinearLayout.LayoutParams(dp(42), dp(42)).apply { rightMargin = dp(6) })
         val selector = MaterialCardView(this).apply {
             radius = dp(14f).toFloat()
             cardElevation = 0f
@@ -2302,19 +2543,213 @@ class MainActivity : android.app.Activity() {
         }
     }
 
-    private fun createCourseFiles(): Pair<File, File>? {
-        val grid = scheduleGrid
-        if (grid == null || grid.width <= 0 || grid.height <= 0) {
-            Toast.makeText(this, "课表尚未准备好", Toast.LENGTH_SHORT).show()
-            return null
+    private fun createScheduleBitmap(term: String, week: Int, mode: ScheduleMode, courses: List<Course>): Bitmap {
+        val width = 2048
+        val height = 1152
+        val padding = 40f
+        val gridTop = 150f
+        val gridHeight = 1000f
+        val gridWidth = width - padding * 2
+        val timeColumnWidth = 196f
+        val dayColumnWidth = (gridWidth - timeColumnWidth) / 7f
+        val headerHeight = 166f
+        val rowHeight = (gridHeight - headerHeight) / 5f
+        val background = Color.rgb(243, 249, 252)
+        val gridFill = Color.rgb(250, 253, 255)
+        val headerFill = Color.rgb(239, 248, 252)
+        val gridLine = Color.rgb(211, 229, 238)
+        val primary = Color.rgb(23, 51, 63)
+        val secondary = Color.rgb(87, 115, 130)
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG)
+        canvas.drawColor(background)
+
+        fun setText(size: Float, color: Int, style: Int, align: Paint.Align = Paint.Align.LEFT) {
+            paint.style = Paint.Style.FILL
+            paint.shader = null
+            paint.textSize = size
+            paint.color = color
+            paint.typeface = Typeface.create("sans-serif", style)
+            paint.textAlign = align
         }
+
+        fun drawText(value: String, x: Float, baseline: Float, size: Float, color: Int, style: Int) {
+            setText(size, color, style)
+            canvas.drawText(value, x, baseline, paint)
+        }
+
+        fun drawCenteredText(value: String, centerX: Float, centerY: Float, size: Float, color: Int, style: Int) {
+            setText(size, color, style, Paint.Align.CENTER)
+            val metrics = paint.fontMetrics
+            canvas.drawText(value, centerX, centerY - (metrics.ascent + metrics.descent) / 2f, paint)
+            paint.textAlign = Paint.Align.LEFT
+        }
+
+        fun roundedRect(left: Float, top: Float, right: Float, bottom: Float, radius: Float, color: Int) {
+            paint.style = Paint.Style.FILL
+            paint.shader = null
+            paint.color = color
+            canvas.drawRoundRect(RectF(left, top, right, bottom), radius, radius, paint)
+        }
+
+        fun wrapText(value: String, maxWidth: Float, size: Float, style: Int): List<String> {
+            setText(size, primary, style)
+            val result = mutableListOf<String>()
+            value.ifBlank { "-" }.split('\n').forEach { paragraph ->
+                var remaining = paragraph.ifBlank { "-" }
+                while (remaining.isNotEmpty()) {
+                    val count = paint.breakText(remaining, true, maxWidth, null)
+                    if (count <= 0) break
+                    result += remaining.substring(0, count)
+                    remaining = remaining.substring(count)
+                }
+            }
+            return result.ifEmpty { listOf("-") }
+        }
+
+        fun timeLabel(value: String): String = value.removePrefix("0")
+
+        fun lightCourseColor(color: Int): Int = Color.rgb(
+            (Color.red(color) + (255 - Color.red(color)) * .84f).toInt(),
+            (Color.green(color) + (255 - Color.green(color)) * .84f).toInt(),
+            (Color.blue(color) + (255 - Color.blue(color)) * .84f).toInt()
+        )
+
+        fun courseTextColor(color: Int): Int = Color.rgb(
+            (Color.red(color) * .42f).toInt().coerceIn(30, 110),
+            (Color.green(color) * .42f).toInt().coerceIn(30, 110),
+            (Color.blue(color) * .42f).toInt().coerceIn(30, 110)
+        )
+
+        val gridLeft = padding
+        val gridRight = padding + gridWidth
+        val gridBottom = gridTop + gridHeight
+        roundedRect(gridLeft, gridTop, gridRight, gridBottom, 16f, gridFill)
+        canvas.save()
+        val clipPath = Path().apply {
+            addRoundRect(RectF(gridLeft, gridTop, gridRight, gridBottom), 16f, 16f, Path.Direction.CW)
+        }
+        canvas.clipPath(clipPath)
+        paint.style = Paint.Style.FILL
+        paint.color = headerFill
+        canvas.drawRect(gridLeft, gridTop, gridRight, gridTop + headerHeight, paint)
+        canvas.restore()
+
+        // 标题和周次沿用示例图的宽屏留白比例，内容仍取当前项目的学期与周次。
+        setText(54f, primary, Typeface.NORMAL)
+        paint.typeface = Typeface.create("sans-serif-black", Typeface.NORMAL)
+        canvas.drawText("WeSDAU-课程表", padding, 96f, paint)
+        drawText(
+            "$term    ${if (week > 0) "第${week}周" else "学期未开始"}",
+            padding,
+            136f,
+            30f,
+            secondary,
+            Typeface.NORMAL
+        )
+
+        // 网格线
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = 2f
+        paint.color = gridLine
+        for (column in 0..7) {
+            val x = gridLeft + if (column == 0) 0f else timeColumnWidth + (column - 1) * dayColumnWidth
+            canvas.drawLine(x, gridTop, x, gridBottom, paint)
+        }
+        for (row in 0..5) {
+            val y = gridTop + if (row == 0) 0f else headerHeight + (row - 1) * rowHeight
+            canvas.drawLine(gridLeft, y, gridRight, y, paint)
+        }
+        canvas.drawRoundRect(RectF(gridLeft, gridTop, gridRight, gridBottom), 16f, 16f, paint)
+
+        val headerCenterY = gridTop + headerHeight / 2f
+        drawCenteredText("节次", gridLeft + timeColumnWidth / 2f, headerCenterY, 31f, Color.rgb(42, 77, 92), Typeface.BOLD)
+        arrayOf("周一", "周二", "周三", "周四", "周五", "周六", "周日").forEachIndexed { index, label ->
+            val centerX = gridLeft + timeColumnWidth + index * dayColumnWidth + dayColumnWidth / 2f
+            drawCenteredText(label, centerX, headerCenterY, 31f, Color.rgb(42, 77, 92), Typeface.BOLD)
+        }
+
+        val timeRanges = if (mode == ScheduleMode.SPRING) springTimeRanges() else summerTimeRanges()
+        for (row in 0 until 5) {
+            val top = gridTop + headerHeight + row * rowHeight
+            val centerX = gridLeft + timeColumnWidth / 2f
+            drawCenteredText("第${row + 1}大节", centerX, top + rowHeight * .42f, 32f, Color.rgb(48, 82, 96), Typeface.BOLD)
+            drawCenteredText(
+                "${timeLabel(timeRanges[row * 2].first)}-${timeLabel(timeRanges[row * 2 + 1].second)}",
+                centerX,
+                top + rowHeight * .66f,
+                22f,
+                secondary,
+                Typeface.NORMAL
+            )
+        }
+
+        val visibleCourses = courses.filter { courseVisibleInWeek(it, week) }
+        visibleCourses.forEach { course ->
+            if (course.day !in 0..6 || course.startSlot !in 0..9) return@forEach
+            val start = course.startSlot / 2f
+            val end = ((course.startSlot + course.slotCount).coerceAtMost(10)) / 2f
+            val left = gridLeft + timeColumnWidth + course.day * dayColumnWidth + 7f
+            val right = left + dayColumnWidth - 14f
+            val top = gridTop + headerHeight + start * rowHeight + 9f
+            val bottom = gridTop + headerHeight + end * rowHeight - 9f
+            if (bottom <= top) return@forEach
+
+            val fillColor = lightCourseColor(course.background)
+            val textColor = courseTextColor(course.background)
+            roundedRect(left, top, right, bottom, 14f, fillColor)
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = 2f
+            paint.color = lightCourseColor(course.background).let {
+                Color.rgb(
+                    (Color.red(it) * .92f).toInt(),
+                    (Color.green(it) * .92f).toInt(),
+                    (Color.blue(it) * .92f).toInt()
+                )
+            }
+            canvas.drawRoundRect(RectF(left, top, right, bottom), 14f, 14f, paint)
+
+            val textLeft = left + 11f
+            val maxTextWidth = right - left - 22f
+            // 课程名保持示例图的醒目粗体；教室与教师之间保留一个空行，
+            // 让卡片信息层次与示例图一致。
+            val titleLines = wrapText(course.name, maxTextWidth, 25f, Typeface.BOLD).take(2)
+            val detailLines = buildList {
+                addAll(formatRoom(course.room).split('\n').filter { it.isNotBlank() })
+                if (course.teacher.isNotBlank()) {
+                    add("")
+                    add(course.teacher)
+                }
+            }.flatMap { line ->
+                if (line.isBlank()) listOf("") else wrapText(line, maxTextWidth, 19f, Typeface.NORMAL)
+            }.take(6)
+            var baseline = top + 31f
+            titleLines.forEach { line ->
+                if (baseline <= bottom - 10f) {
+                    drawText(line, textLeft, baseline, 25f, textColor, Typeface.BOLD)
+                    baseline += 28f
+                }
+            }
+            detailLines.forEach { line ->
+                if (baseline <= bottom - 9f) {
+                    if (line.isNotBlank()) {
+                        drawText(line, textLeft, baseline, 19f, textColor, Typeface.NORMAL)
+                    }
+                    baseline += 24f
+                }
+            }
+        }
+        return bitmap
+    }
+
+    private fun createCourseFiles(): Pair<File, File>? {
         try {
             val directory = prepareShareCache()
             val pngFile = File(directory, "课程表.png")
             val csvFile = File(directory, "课程表.csv")
-            val bitmap = Bitmap.createBitmap(grid.width, grid.height, Bitmap.Config.ARGB_8888)
+            val bitmap = createScheduleBitmap(selectedTerm(), currentWeek, scheduleMode, loadCourseCache())
             try {
-                grid.draw(Canvas(bitmap))
                 FileOutputStream(pngFile).use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
             } finally {
                 bitmap.recycle()
@@ -2324,6 +2759,68 @@ class MainActivity : android.app.Activity() {
         } catch (error: Exception) {
             Toast.makeText(this, "导出失败：${error.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
             return null
+        }
+    }
+
+    private fun saveSchedulePng() {
+        if (scheduleExporting) return
+        val term = selectedTerm()
+        val week = currentWeek
+        val mode = scheduleMode
+        val courses = loadCourseCache()
+        if (courses.isEmpty()) {
+            Toast.makeText(this, "课表尚未准备好", Toast.LENGTH_SHORT).show()
+            return
+        }
+        scheduleExporting = true
+        Toast.makeText(this, "正在保存课表图片…", Toast.LENGTH_SHORT).show()
+        networkExecutor.execute {
+            var bitmap: Bitmap? = null
+            try {
+                bitmap = createScheduleBitmap(term, week, mode, courses)
+                val weekName = if (week > 0) "第${week}周" else "学期未开始"
+                saveScheduleBitmapToPictures(bitmap, "课表-$term-$weekName.png")
+                runOnUiThread {
+                    Toast.makeText(this, "课表图片已保存到 Pictures/WeSDAU", Toast.LENGTH_LONG).show()
+                }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    Toast.makeText(this, "保存课表图片失败：${error.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
+                }
+            } finally {
+                bitmap?.recycle()
+                scheduleExporting = false
+            }
+        }
+    }
+
+    private fun saveScheduleBitmapToPictures(bitmap: Bitmap, displayName: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
+                put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/WeSDAU")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                ?: error("无法创建图片文件")
+            try {
+                contentResolver.openOutputStream(uri)?.use { output ->
+                    check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) { "图片编码失败" }
+                } ?: error("无法写入图片文件")
+                contentResolver.update(uri, ContentValues().apply {
+                    put(MediaStore.Images.Media.IS_PENDING, 0)
+                }, null, null)
+            } catch (error: Exception) {
+                contentResolver.delete(uri, null, null)
+                throw error
+            }
+        } else {
+            val directory = getExternalFilesDir(Environment.DIRECTORY_PICTURES)?.apply { mkdirs() }
+                ?: error("无法访问图片目录")
+            File(directory, displayName).outputStream().use { output ->
+                check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) { "图片编码失败" }
+            }
         }
     }
 
@@ -2479,7 +2976,7 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun shareWeekPng() {
-        createCourseFiles()?.first?.let { shareSingleFile(it, "image/png", "分享本周课表") }
+        saveSchedulePng()
         hideSharePicker()
     }
 
@@ -3142,6 +3639,12 @@ class MainActivity : android.app.Activity() {
         }
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
             .putString(KEY_SCORES, payload.toString())
+            .apply()
+    }
+
+    private fun saveStudentName(name: String) {
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+            .putString(KEY_STUDENT_NAME, name.trim())
             .apply()
     }
 
@@ -4945,6 +5448,7 @@ class MainActivity : android.app.Activity() {
         private const val PREFS_NAME = "offline_login"
         private const val KEY_ACCOUNT = "account"
         private const val KEY_PASSWORD = "password"
+        private const val KEY_STUDENT_NAME = "student_name"
         private const val KEY_TERM = "term"
         private const val KEY_SCORE_TERM = "score_term"
         private const val KEY_SCHEDULE_MODE = "schedule_mode"

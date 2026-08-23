@@ -44,6 +44,12 @@ data class RemoteScoreResult(
     val totalCredits: String
 )
 
+data class RemoteStudentProfile(
+    val name: String,
+    val studentId: String,
+    val displayName: String = "$name-$studentId"
+)
+
 fun scoreToNumericValue(score: String): Double? {
     val normalized = score.trim().replace(Regex("\\s+"), "")
     return when (normalized) {
@@ -141,6 +147,20 @@ class SdauCourseRepository {
 
     init {
         CookieHandler.setDefault(cookies)
+    }
+
+    fun queryStudentProfile(account: String, password: String): RemoteStudentProfile {
+        login(account, password)
+        val candidates = listOf(
+            "/framework/xsMainV_new.htmlx?t1=1",
+            "/framework/xsMainV.jsp"
+        )
+        candidates.forEach { path ->
+            val body = requestStage("读取个人信息") { request(path, "GET", null) }
+            if (isLoginPage(body)) throw IllegalStateException("登录状态已失效，请重新登录")
+            parseStudentProfile(body, account)?.let { return it }
+        }
+        throw IllegalStateException("未能从教务系统主页面解析到个人信息")
     }
 
     fun queryCourses(account: String, password: String, term: String): List<RemoteCourse> {
@@ -658,6 +678,12 @@ class SdauCourseRepository {
         }
     }
 
+    private fun isLoginPage(body: String): Boolean {
+        return body.contains("请先登录系统") ||
+            body.contains("欢迎登录教务系统") ||
+            (body.contains("LoginToXk") && body.contains("userAccount"))
+    }
+
     private fun parseCourses(body: String): List<RemoteCourse> {
         val data = JSONObject(body).optJSONArray("data")
             ?: throw IllegalStateException("教务系统课程数据格式变化")
@@ -677,6 +703,29 @@ class SdauCourseRepository {
         // Keep alternating/short-term classes that share a time and room but
         // differ in their week ranges.
         return result.distinct()
+    }
+
+    private fun parseStudentProfile(html: String, fallbackStudentId: String): RemoteStudentProfile? {
+        val title = Regex(
+            "<[^>]*class\\s*=\\s*[\\\"'][^\\\"']*\\binfoContentTitle\\b[^\\\"']*[\\\"'][^>]*>([\\s\\S]*?)</[^>]+>",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        ).find(html)?.groupValues?.getOrNull(1)?.let(::stripTags).orEmpty()
+
+        val titleMatch = Regex("(.+?)-([0-9]{6,})$").find(title)
+        val nameFromTitle = titleMatch?.groupValues?.getOrNull(1).orEmpty().trim()
+        val idFromTitle = titleMatch?.groupValues?.getOrNull(2).orEmpty().trim()
+
+        val nameFromDetail = Regex(
+            "(?:姓名|名字)\\s*[：:]\\s*([^<\\r\\n]+)",
+            RegexOption.IGNORE_CASE
+        ).find(stripTags(html))?.groupValues?.getOrNull(1)?.trim().orEmpty()
+        val name = nameFromTitle.ifBlank { nameFromDetail }
+        val studentId = idFromTitle.ifBlank { fallbackStudentId.trim() }
+        return if (name.isNotBlank() && studentId.isNotBlank()) {
+            RemoteStudentProfile(name, studentId)
+        } else {
+            null
+        }
     }
 
     private fun parsePersonalTimetable(html: String): List<PersonalMeeting> {
