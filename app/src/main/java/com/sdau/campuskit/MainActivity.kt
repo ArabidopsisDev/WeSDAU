@@ -3089,6 +3089,55 @@ class MainActivity : android.app.Activity() {
         }
     }
 
+    private fun buildExportCoursePlacements(visibleCourses: List<Course>): List<CoursePlacement> {
+        val result = mutableListOf<CoursePlacement>()
+
+        fun overlaps(first: Course, second: Course): Boolean {
+            if (first.day != second.day) return false
+            val firstEnd = first.startSlot + first.slotCount
+            val secondEnd = second.startSlot + second.slotCount
+            return first.startSlot < secondEnd && second.startSlot < firstEnd
+        }
+
+        visibleCourses.filter { it.day in 0..6 && it.startSlot in 0..9 }
+            .groupBy { it.day }
+            .values
+            .forEach { dayCourses ->
+                val sorted = dayCourses.sortedWith(
+                    compareBy<Course> { it.startSlot }
+                        .thenByDescending { it.slotCount }
+                )
+                val component = mutableListOf<Course>()
+
+                fun flushComponent() {
+                    if (component.isEmpty()) return
+                    val columnEnds = mutableListOf<Int>()
+                    val assigned = mutableListOf<Pair<Course, Int>>()
+                    component.forEach { course ->
+                        val column = columnEnds.indexOfFirst { end -> end <= course.startSlot }
+                            .let { if (it >= 0) it else columnEnds.size }
+                        if (column == columnEnds.size) columnEnds += 0
+                        columnEnds[column] = course.startSlot + course.slotCount
+                        assigned += course to column
+                    }
+                    val columnCount = columnEnds.size
+                    assigned.forEach { (course, column) ->
+                        result += CoursePlacement(course, column, columnCount)
+                    }
+                    component.clear()
+                }
+
+                sorted.forEach { course ->
+                    if (component.isNotEmpty() && component.none { overlaps(it, course) }) {
+                        flushComponent()
+                    }
+                    component += course
+                }
+                flushComponent()
+            }
+        return result
+    }
+
     private fun createScheduleBitmap(
         term: String,
         week: Int,
@@ -3240,12 +3289,17 @@ class MainActivity : android.app.Activity() {
         }
 
         val visibleCourses = if (includeAllWeeks) courses else courses.filter { courseVisibleInWeek(it, week) }
-        visibleCourses.forEach { course ->
-            if (course.day !in 0..6 || course.startSlot !in 0..9) return@forEach
+        buildExportCoursePlacements(visibleCourses).forEach { placement ->
+            val course = placement.course
             val start = course.startSlot / 2f
             val end = ((course.startSlot + course.slotCount).coerceAtMost(10)) / 2f
-            val left = gridLeft + timeColumnWidth + course.day * dayColumnWidth + 7f
-            val right = left + dayColumnWidth - 14f
+            val baseLeft = gridLeft + timeColumnWidth + course.day * dayColumnWidth + 7f
+            val totalWidth = dayColumnWidth - 14f
+            val cardGap = if (placement.columnCount > 1) 4f else 0f
+            val cardWidth = (totalWidth - cardGap * (placement.columnCount - 1)) /
+                placement.columnCount.coerceAtLeast(1)
+            val left = baseLeft + placement.column * (cardWidth + cardGap)
+            val right = left + cardWidth
             val top = gridTop + headerHeight + start * rowHeight + 9f
             val bottom = gridTop + headerHeight + end * rowHeight - 9f
             if (bottom <= top) return@forEach
@@ -3269,9 +3323,10 @@ class MainActivity : android.app.Activity() {
             // 课程名保持示例图的醒目粗体；教室和教师连续排列，避免导出图浪费空间。
             val titleLines = wrapText(course.name, maxTextWidth, 25f, Typeface.BOLD).take(2)
             val detailLines = buildList {
-                addAll(formatRoom(course.room).split('\n').filter { it.isNotBlank() })
-                if (course.teacher.isNotBlank()) add(course.teacher)
+                addAll(formatExportRoom(course.room).split('\n').filter { it.isNotBlank() })
+                // 完整专业课表中，周数比教师名更重要；空间不足时 take(6) 会优先保留周数。
                 if (includeAllWeeks && course.weeks.isNotBlank()) add("第${course.weeks}周")
+                if (course.teacher.isNotBlank()) add(course.teacher)
             }.flatMap { line ->
                 if (line.isBlank()) listOf("") else wrapText(line, maxTextWidth, 19f, Typeface.NORMAL)
             }.take(6)
@@ -4842,6 +4897,12 @@ class MainActivity : android.app.Activity() {
 
     private data class Course(val day: Int, val startSlot: Int, val slotCount: Int, val name: String, val room: String, val teacher: String, val background: Int, val foreground: Int, val weeks: String = "")
 
+    private data class CoursePlacement(
+        val course: Course,
+        val column: Int,
+        val columnCount: Int
+    )
+
     private inner class LoginModeToggle(
         context: Context,
         initialMode: LoginMode,
@@ -5573,17 +5634,65 @@ class MainActivity : android.app.Activity() {
             }
         }
 
+        private fun buildCoursePlacements(visibleCourses: List<Course>): List<CoursePlacement> {
+            val result = mutableListOf<CoursePlacement>()
+
+            fun overlaps(first: Course, second: Course): Boolean {
+                if (first.day != second.day) return false
+                val firstEnd = first.startSlot + first.slotCount
+                val secondEnd = second.startSlot + second.slotCount
+                return first.startSlot < secondEnd && second.startSlot < firstEnd
+            }
+
+            visibleCourses.filter { it.day in 0..6 && it.startSlot in 0..9 }
+                .groupBy { it.day }
+                .values
+                .forEach { dayCourses ->
+                    val sorted = dayCourses.sortedWith(
+                        compareBy<Course> { it.startSlot }
+                            .thenByDescending { it.slotCount }
+                    )
+                    val component = mutableListOf<Course>()
+
+                    fun flushComponent() {
+                        if (component.isEmpty()) return
+                        val columnEnds = mutableListOf<Int>()
+                        val assigned = mutableListOf<Pair<Course, Int>>()
+                        component.forEach { course ->
+                            val column = columnEnds.indexOfFirst { end -> end <= course.startSlot }
+                                .let { if (it >= 0) it else columnEnds.size }
+                            if (column == columnEnds.size) columnEnds += 0
+                            columnEnds[column] = course.startSlot + course.slotCount
+                            assigned += course to column
+                        }
+                        val columnCount = columnEnds.size
+                        assigned.forEach { (course, column) ->
+                            result += CoursePlacement(course, column, columnCount)
+                        }
+                        component.clear()
+                    }
+
+                    sorted.forEach { course ->
+                        if (component.isNotEmpty() && component.none { overlaps(it, course) }) {
+                            flushComponent()
+                        }
+                        component += course
+                    }
+                    flushComponent()
+                }
+            return result
+        }
+
         private fun drawWeekPage(canvas: Canvas, week: Int, offset: Float) {
             val save = canvas.save()
             canvas.translate(offset, 0f)
             canvas.clipRect(0f, 0f, desiredWidth.toFloat(), desiredHeight.toFloat())
             drawHeaders(canvas, week); drawTimes(canvas)
-            var hasVisibleCourse = false
-            courses.forEach { course ->
-                if (courseVisibleInWeek(course, week)) {
-                    hasVisibleCourse = true
-                    drawCourse(canvas, course)
-                }
+            val visibleCourses = courses.filter { courseVisibleInWeek(it, week) }
+            val placements = buildCoursePlacements(visibleCourses)
+            val hasVisibleCourse = placements.isNotEmpty()
+            placements.forEach { placement ->
+                drawCourse(canvas, placement.course, placement.column, placement.columnCount)
             }
             if (!hasVisibleCourse) {
                 val centerX = timeColumnWidth + (desiredWidth - timeColumnWidth) / 2f
@@ -5990,10 +6099,15 @@ class MainActivity : android.app.Activity() {
             return if (measured > maxWidth && measured > 0f) desiredSize * maxWidth / measured else desiredSize
         }
 
-        private fun drawCourse(canvas: Canvas, course: Course) {
-            val left = timeColumnWidth + course.day * dayColumnWidth + dp(2f)
+        private fun drawCourse(canvas: Canvas, course: Course, column: Int = 0, columnCount: Int = 1) {
+            val dayLeft = timeColumnWidth + course.day * dayColumnWidth
+            val horizontalGap = if (columnCount > 1) dp(2f).toFloat() else 0f
+            val availableWidth = dayColumnWidth - dp(4f).toFloat()
+            val courseWidth = (availableWidth - horizontalGap * (columnCount - 1)) /
+                columnCount.coerceAtLeast(1)
+            val left = dayLeft + dp(2f) + column * (courseWidth + horizontalGap)
             val top = headerHeight + course.startSlot * slotHeight + dp(2f)
-            val right = left + dayColumnWidth - dp(4f)
+            val right = left + courseWidth
             val bottom = headerHeight + (course.startSlot + course.slotCount) * slotHeight - dp(2f)
             rect.set(left.toFloat(), top.toFloat(), right.toFloat(), bottom.toFloat())
             paint.style = Paint.Style.FILL; paint.color = course.background
@@ -6031,13 +6145,20 @@ class MainActivity : android.app.Activity() {
 
         private fun findCourseAt(x: Float, y: Float): Course? {
             if (y < headerHeight) return null
-            return courses.filter { courseVisibleInWeek(it, weekIndex) }.firstOrNull { course ->
-                val left = timeColumnWidth + course.day * dayColumnWidth + dp(2f)
+            return buildCoursePlacements(courses.filter { courseVisibleInWeek(it, weekIndex) })
+                .firstOrNull { placement ->
+                val course = placement.course
+                val dayLeft = timeColumnWidth + course.day * dayColumnWidth
+                val horizontalGap = if (placement.columnCount > 1) dp(2f).toFloat() else 0f
+                val availableWidth = dayColumnWidth - dp(4f).toFloat()
+                val courseWidth = (availableWidth - horizontalGap * (placement.columnCount - 1)) /
+                    placement.columnCount.coerceAtLeast(1)
+                val left = dayLeft + dp(2f) + placement.column * (courseWidth + horizontalGap)
                 val top = headerHeight + course.startSlot * slotHeight + dp(2f)
-                val right = left + dayColumnWidth - dp(4f)
+                val right = left + courseWidth
                 val bottom = headerHeight + (course.startSlot + course.slotCount) * slotHeight - dp(2f)
                 x in left.toFloat()..right.toFloat() && y in top.toFloat()..bottom.toFloat()
-            }
+            }?.course
         }
 
         private fun wrapCourseLines(course: Course, size: Float, maxWidth: Float): List<String> {
@@ -6081,6 +6202,11 @@ class MainActivity : android.app.Activity() {
 
         // 课程表网格尺寸固定，因此字号使用 density，不跟随系统 fontScale 放大。
         private fun sp(value: Float) = value * resources.displayMetrics.density
+    }
+
+    private fun formatExportRoom(room: String): String {
+        val normalized = room.replace(Regex("\\s+"), "")
+        return if (normalized.startsWith("图信")) "@$normalized" else formatRoom(room)
     }
 
     private fun formatRoom(room: String): String {

@@ -196,35 +196,6 @@ class SdauCourseRepository {
         }
     }
 
-    /**
-     * Reads the public timetable endpoint. This is deliberately separate from
-     * queryCourses(): the latter remains the source of the signed-in user's
-     * selected courses, while this method is only used to build the optional
-     * local university-wide timetable cache.
-     */
-    fun queryPublicCourses(
-        account: String,
-        password: String,
-        term: String,
-        onProgress: (Int, String) -> Unit = { _, _ -> }
-    ): List<RemotePublicCourse> {
-        onProgress(5, "正在登录教务系统")
-        login(account, password)
-        onProgress(20, "正在请求全校课程数据")
-        val path = "/kbcx/kbxx_xzb_ifr?pageNum=1&pageSize=10000000" +
-            "&xnxq01id=${URLEncoder.encode(term, "UTF-8")}" +
-            "&kbjcmsid=$PUBLIC_SCHEDULE_TOKEN&skyx=&ksnd=&skzy=&skbj=" +
-            "&zc1=&zc2=&skxq1=&skxq2=&jc1=&jc2="
-        val body = requestStage("读取全校课表") {
-            request(path, "GET", null, "$BASE_URL/kbcx/kbxx_xzb")
-        }
-        onProgress(78, "正在解析全校课程数据")
-        if (isLoginPage(body)) throw IllegalStateException("登录状态已失效，请重新登录")
-        val records = parsePublicCourses(body)
-        onProgress(95, "正在整理本地筛选数据")
-        return records
-    }
-
     fun queryPublicCoursesFromMirror(
         term: String,
         onProgress: (Int, String) -> Unit = { _, _ -> }
@@ -1043,7 +1014,6 @@ class SdauCourseRepository {
 
     companion object {
         private const val BASE_URL = "https://jw.sdau.edu.cn"
-        private const val PUBLIC_SCHEDULE_TOKEN = "16FD8C2BE55E15F9E0630100007FF6B5"
         private const val PUBLIC_SCHEDULE_MIRROR_BASE = "https://gitee.com/sleexy/onlinedata/raw/master"
     }
 }
