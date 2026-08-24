@@ -6,8 +6,10 @@ import android.app.DownloadManager
 import android.content.Context
 import android.content.ContentValues
 import android.content.ActivityNotFoundException
+import android.content.BroadcastReceiver
 import android.content.res.ColorStateList
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Canvas
 import android.graphics.Color
@@ -188,6 +190,39 @@ class MainActivity : android.app.Activity() {
     private var publicOptionOverlay: View? = null
     private var shareOverlay: View? = null
     private var updateOverlay: View? = null
+    private var forceUpdateActive = false
+    private var updateActionButton: MaterialButton? = null
+    private var updateDownloadId: Long? = null
+    private var updateDownloadReceiverRegistered = false
+    private val updateDownloadReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val downloadId = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
+            if (downloadId <= 0L || downloadId != updateDownloadId) return
+            val manager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+            var successful = false
+            manager.query(DownloadManager.Query().setFilterById(downloadId)).use { cursor ->
+                if (cursor.moveToFirst()) {
+                    successful = cursor.getInt(
+                        cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS)
+                    ) == DownloadManager.STATUS_SUCCESSFUL
+                }
+            }
+            val uri = if (successful) manager.getUriForDownloadedFile(downloadId) else null
+            clearUpdateDownloadReceiver()
+            runOnUiThread {
+                updateDownloadId = null
+                if (uri != null) {
+                    installDownloadedApk(uri)
+                } else {
+                    updateActionButton?.apply {
+                        isEnabled = true
+                        text = "立即更新"
+                    }
+                    Toast.makeText(this@MainActivity, "更新包下载失败，请重试", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
     private var pendingTestNotification = false
     private var pendingPushEnable = false
     private var pushButton: ImageButton? = null
@@ -216,6 +251,7 @@ class MainActivity : android.app.Activity() {
     private var currentWeek = 1
     private var pendingApkUrl = APK_URL
     private val networkExecutor = Executors.newSingleThreadExecutor()
+    private val publicSyncExecutor = Executors.newSingleThreadExecutor()
     private val updateExecutor = Executors.newSingleThreadExecutor()
     @Suppress("DEPRECATION")
     private val currentVersionCode: Int by lazy {
@@ -231,7 +267,13 @@ class MainActivity : android.app.Activity() {
         }
         if (installedName.startsWith("V", ignoreCase = true)) installedName else "V$installedName"
     }
-    private data class RemoteUpdate(val code: Int, val name: String, val changelog: String, val url: String)
+    private data class RemoteUpdate(
+        val code: Int,
+        val name: String,
+        val changelog: String,
+        val url: String,
+        val forceUpdate: Boolean = false
+    )
     private data class ExamCache(val term: String, val records: List<RemoteExam>)
     private data class EmptyRoomGroup(val title: String, val accent: Int, val rooms: List<String>)
     private enum class LoginMode { PERSONAL, PUBLIC }
@@ -256,7 +298,7 @@ class MainActivity : android.app.Activity() {
                 val update = readRemoteUpdate() ?: return@execute
                 if (update.code <= currentVersionCode) return@execute
                 val preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                if (preferences.getInt(KEY_UPDATE_STARTED_CODE, 0) >= update.code) return@execute
+                if (!update.forceUpdate && preferences.getInt(KEY_UPDATE_STARTED_CODE, 0) >= update.code) return@execute
                 pendingApkUrl = update.url
                 runOnUiThread {
                     showUpdateDialog(update)
@@ -278,6 +320,10 @@ class MainActivity : android.app.Activity() {
         val code = json.optInt("latestVersionCode", json.optInt("versionCode", json.optInt("version", 0)))
         val name = json.optString("latestVersionName", json.optString("versionName", ""))
         val url = json.optString("downloadUrl", APK_URL).ifBlank { APK_URL }
+        val forceUpdate = json.optInt(
+            "forceupdate",
+            json.optInt("forcedupdate", json.optInt("forceUpdate", 0))
+        ) != 0
         val changelog = when {
             json.optJSONArray("changelog") != null -> {
                 val items = json.optJSONArray("changelog")!!
@@ -285,7 +331,7 @@ class MainActivity : android.app.Activity() {
             }
             else -> json.optString("changelog", "")
         }
-        return RemoteUpdate(code, name, changelog, url)
+        return RemoteUpdate(code, name, changelog, url, forceUpdate)
     }
 
     private fun downloadLatestApk(
@@ -312,7 +358,8 @@ class MainActivity : android.app.Activity() {
                 setAllowedOverMetered(true)
                 setAllowedOverRoaming(true)
             }
-            (getSystemService(DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
+            registerUpdateDownloadReceiver()
+            updateDownloadId = (getSystemService(DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
             getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
                 .putInt(KEY_UPDATE_STARTED_CODE, remoteVersion).apply()
             if (notifyStarted) {
@@ -323,36 +370,64 @@ class MainActivity : android.app.Activity() {
         }
     }
 
-    private fun requestInstallPermissionIfNeeded() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-        if (packageManager.canRequestPackageInstalls()) return
+    private fun registerUpdateDownloadReceiver() {
+        if (updateDownloadReceiverRegistered) return
+        val filter = IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(updateDownloadReceiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(updateDownloadReceiver, filter)
+        }
+        updateDownloadReceiverRegistered = true
+    }
+
+    private fun clearUpdateDownloadReceiver() {
+        if (!updateDownloadReceiverRegistered) return
+        runCatching { unregisterReceiver(updateDownloadReceiver) }
+        updateDownloadReceiverRegistered = false
+    }
+
+    private fun requestInstallPermissionIfNeeded(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return true
+        if (packageManager.canRequestPackageInstalls()) return true
         try {
             startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
             Toast.makeText(this, "请允许安装应用，返回后再次点击检查更新", Toast.LENGTH_LONG).show()
         } catch (_: Exception) {
             Toast.makeText(this, "请在系统设置中允许安装应用", Toast.LENGTH_LONG).show()
         }
+        return false
     }
 
     private fun installDownloadedApk(file: File) {
         try {
             val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+            installDownloadedApk(uri)
+        } catch (error: Exception) {
+            Toast.makeText(this, "无法打开安装包：${error.message ?: "请手动在下载目录安装"}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun installDownloadedApk(uri: Uri) {
+        try {
             startActivity(Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(uri, "application/vnd.android.package-archive")
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
             })
         } catch (error: Exception) {
-            Toast.makeText(this, "无法打开安装包：${error.message ?: "请手动在下载目录安装"}", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "无法打开安装包：${error.message ?: "请手动安装"}", Toast.LENGTH_LONG).show()
         }
     }
 
     private fun showUpdateDialog(update: RemoteUpdate) {
         if (updateOverlay != null) return
         pendingApkUrl = update.url
+        forceUpdateActive = update.forceUpdate
         val overlay = FrameLayout(this).apply {
             setBackgroundColor(Color.argb(142, 15, 21, 36))
             isClickable = true
-            setOnClickListener { hideUpdateDialog() }
+            if (!update.forceUpdate) setOnClickListener { hideUpdateDialog() }
         }
         val card = surfaceCard(dp(26f).toFloat()).apply {
             cardElevation = dp(5).toFloat()
@@ -400,7 +475,7 @@ class MainActivity : android.app.Activity() {
         })
 
         val actions = horizontalLayout().apply { gravity = Gravity.CENTER_VERTICAL }
-        actions.addView(MaterialButton(this).apply {
+        if (!update.forceUpdate) actions.addView(MaterialButton(this).apply {
             text = "稍后"
             textSize = 14f
             isAllCaps = false
@@ -411,7 +486,7 @@ class MainActivity : android.app.Activity() {
             backgroundTintList = ColorStateList.valueOf(Color.rgb(238, 242, 249))
             setOnClickListener { hideUpdateDialog() }
         }, LinearLayout.LayoutParams(0, dp(48), 1f).apply { rightMargin = dp(6) })
-        actions.addView(MaterialButton(this).apply {
+        val updateButton = MaterialButton(this).apply {
             text = "立即更新"
             textSize = 14f
             isAllCaps = false
@@ -421,11 +496,19 @@ class MainActivity : android.app.Activity() {
             setTextColor(Color.WHITE)
             backgroundTintList = ColorStateList.valueOf(PRIMARY_DARK)
             setOnClickListener {
-                requestInstallPermissionIfNeeded()
-                downloadLatestApk(update.url, update.code, installExisting = true)
-                hideUpdateDialog()
+                if (!requestInstallPermissionIfNeeded()) return@setOnClickListener
+                updateActionButton?.apply {
+                    isEnabled = false
+                    text = "正在下载…"
+                }
+                downloadLatestApk(update.url, update.code, installExisting = !update.forceUpdate)
+                if (!update.forceUpdate) hideUpdateDialog()
             }
-        }, LinearLayout.LayoutParams(0, dp(48), 1f).apply { leftMargin = dp(6) })
+        }
+        actions.addView(updateButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply {
+            if (!update.forceUpdate) leftMargin = dp(6)
+        })
+        updateActionButton = updateButton
         body.addView(actions, matchWrapParams())
         card.addView(body)
         overlay.addView(card, FrameLayout.LayoutParams(dialogWidth, -2, Gravity.CENTER))
@@ -443,6 +526,8 @@ class MainActivity : android.app.Activity() {
         overlay.animate().alpha(0f).setDuration(140).withEndAction {
             pageHost.removeView(overlay)
             updateOverlay = null
+            forceUpdateActive = false
+            updateActionButton = null
         }.start()
     }
 
@@ -1264,11 +1349,7 @@ class MainActivity : android.app.Activity() {
             loginStatus?.visibility = View.VISIBLE
             return
         }
-        val colors = selected.map { it.name }.distinct().withIndex().associate { it.value to COURSE_COLORS[it.index % COURSE_COLORS.size] }
-        publicScheduleCourses = selected.map {
-            Course(it.day, it.startSlot, it.slotCount, it.name, it.room, it.teacher,
-                colors[it.name] ?: COURSE_COLORS.first(), Color.WHITE, it.weeks)
-        }
+        publicScheduleCourses = buildPublicScheduleCourses(selected)
         publicScheduleTerm = term
         publicScheduleLabel = "$publicCollegeSelection · $publicGradeSelection · $publicMajorSelection · $publicClassSelection"
         publicScheduleClassName = publicClassSelection
@@ -1689,7 +1770,7 @@ class MainActivity : android.app.Activity() {
             setBackgroundColor(Color.TRANSPARENT)
         }
         val body = verticalLayout().apply { setPadding(dp(20), dp(18), dp(20), dp(28)) }
-        body.addView(text("教室使用情况", 28f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(18)))
+        body.addView(text("空教室查询", 28f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(18)))
         body.addView(buildEmptyRoomQueryPanel(), spacedParams(dp(26)))
 
         val resultHeader = horizontalLayout().apply {
@@ -4222,24 +4303,45 @@ class MainActivity : android.app.Activity() {
         }.getOrDefault(emptyList())
     }
 
+    private fun buildPublicScheduleCourses(records: List<RemotePublicCourse>): List<Course> {
+        val colors = records.map { it.name }.distinct().withIndex()
+            .associate { it.value to COURSE_COLORS[it.index % COURSE_COLORS.size] }
+        return records.map {
+            Course(it.day, it.startSlot, it.slotCount, it.name, it.room, it.teacher,
+                colors[it.name] ?: COURSE_COLORS.first(), Color.WHITE, it.weeks)
+        }
+    }
+
     private fun startPublicScheduleSyncIfNeeded(term: String) {
         if (term.isBlank()) return
-        if (hasPublicScheduleCache(term)) {
-            if (!publicScheduleMemoryCache.containsKey(term)) {
-                networkExecutor.execute { loadPublicScheduleCache(term) }
-            }
-            return
-        }
         if (publicSyncRunning) return
         publicSyncRunning = true
-        networkExecutor.execute {
+        publicSyncExecutor.execute {
             try {
+                val cached = loadPublicScheduleCache(term)
+                val cacheReady = hasPublicScheduleCache(term)
                 val records = SdauCourseRepository().queryPublicCoursesFromMirror(term)
-                savePublicScheduleCache(term, records)
+                val changed = !cacheReady || records != cached
+                if (changed) savePublicScheduleCache(term, records)
                 runOnUiThread {
                     publicSyncRunning = false
-                    if (onLoginPage && loginMode == LoginMode.PUBLIC) {
-                        swapPage(buildLoginPage(), false, false)
+                    if (!changed) return@runOnUiThread
+                    when {
+                        onLoginPage && loginMode == LoginMode.PUBLIC -> {
+                            swapPage(buildLoginPage(), false, false)
+                        }
+                        viewingPublicSchedule && publicScheduleTerm == term -> {
+                            val selected = records.filter {
+                                it.college == publicCollegeSelection &&
+                                    publicGradeLabel(it.grade) == publicGradeSelection &&
+                                    it.major == publicMajorSelection &&
+                                    it.className == publicClassSelection
+                            }
+                            if (selected.isNotEmpty()) {
+                                publicScheduleCourses = buildPublicScheduleCourses(selected)
+                                scheduleGrid?.setCourses(publicScheduleCourses)
+                            }
+                        }
                     }
                 }
             } catch (_: Exception) {
@@ -4482,6 +4584,7 @@ class MainActivity : android.app.Activity() {
 
     @Deprecated("Use OnBackInvokedDispatcher on newer Android versions")
     override fun onBackPressed() {
+        if (forceUpdateActive) return
         if (onLoginPage && loginMode == LoginMode.PUBLIC) {
             loginMode = LoginMode.PERSONAL
             swapPage(buildLoginPage(), false, true)
@@ -5035,7 +5138,7 @@ class MainActivity : android.app.Activity() {
      * 不依赖额外图片资源，也不会改变上方课程表的七列网格模型。
      */
     private inner class LiquidGlassNavigationView(context: Context) : View(context) {
-        private val labels = arrayOf("课程表", "考试安排", "成绩", "教室使用情况")
+        private val labels = arrayOf("课程表", "考试安排", "成绩", "空教室查询")
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val bounds = RectF()
         private val indicatorBounds = RectF()
@@ -6373,7 +6476,9 @@ class MainActivity : android.app.Activity() {
 
     override fun onDestroy() {
         scheduleGrid?.releaseTransientCaches()
+        clearUpdateDownloadReceiver()
         networkExecutor.shutdownNow()
+        publicSyncExecutor.shutdownNow()
         updateExecutor.shutdownNow()
         super.onDestroy()
     }
