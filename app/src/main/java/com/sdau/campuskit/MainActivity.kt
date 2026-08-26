@@ -10,6 +10,7 @@ import android.content.res.ColorStateList
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.database.sqlite.SQLiteDatabase
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -171,6 +172,7 @@ class MainActivity : android.app.Activity() {
     private var publicSyncRunning = false
     private val publicScheduleIndexCache =
         java.util.concurrent.ConcurrentHashMap<String, PublicScheduleIndex>()
+    private val publicScheduleLookupLock = Any()
     private var onLoginPage = false
     private lateinit var publicCollegeInput: MaterialAutoCompleteTextView
     private lateinit var publicGradeInput: MaterialAutoCompleteTextView
@@ -282,7 +284,8 @@ class MainActivity : android.app.Activity() {
     private data class EmptyRoomGroup(val title: String, val accent: Int, val rooms: List<String>)
     private data class PublicScheduleIndex(
         val hierarchy: Map<String, Map<String, Map<String, Set<String>>>>,
-        val recordCount: Int
+        val recordCount: Int,
+        val sourceSha256: String
     )
     private enum class LoginMode { PERSONAL, PUBLIC }
 
@@ -877,7 +880,11 @@ class MainActivity : android.app.Activity() {
                 if (mode == LoginMode.PERSONAL) attemptLogin() else attemptPublicScheduleLookup()
             }
         }
-        if (mode == LoginMode.PUBLIC && !hasPublicScheduleCache(semesterInput.text?.toString().orEmpty())) {
+        if (mode == LoginMode.PUBLIC &&
+            (!hasPublicScheduleCache(semesterInput.text?.toString().orEmpty()) ||
+                loadStoredPublicScheduleIndex(semesterInput.text?.toString().orEmpty()) == null ||
+                !hasPublicScheduleLookup(semesterInput.text?.toString().orEmpty()))
+        ) {
             login.isEnabled = false
             login.text = "正在准备全校课表…"
         }
@@ -1006,7 +1013,10 @@ class MainActivity : android.app.Activity() {
             backgroundTintList = buttonColors()
             setOnClickListener { attemptPublicScheduleLookup() }
         }
-        if (!hasPublicScheduleCache(selectedTerm)) {
+        if (!hasPublicScheduleCache(selectedTerm) ||
+            loadStoredPublicScheduleIndex(selectedTerm) == null ||
+            !hasPublicScheduleLookup(selectedTerm)
+        ) {
             login.isEnabled = false
             login.text = "正在准备全校课表…"
         }
@@ -1235,7 +1245,19 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun buildPublicFilterFields(body: LinearLayout, term: String) {
-        val index = loadPublicScheduleIndex(term)
+        val index = loadStoredPublicScheduleIndex(term)
+        if (index == null) {
+            body.addView(text(
+                "正在后台准备全校课表筛选，完成后会自动显示",
+                13f,
+                TEXT_SECONDARY,
+                Typeface.NORMAL
+            ).apply {
+                setLineSpacing(dp(3).toFloat(), 1f)
+            }, spacedParams(dp(8)))
+            startPublicScheduleSyncIfNeeded(term)
+            return
+        }
         val colleges = index.hierarchy.keys.sorted()
         val college = choosePublicOption(publicCollegeSelection, colleges, listOf("农学院"))
         val gradeMap = index.hierarchy[college].orEmpty()
@@ -1335,6 +1357,12 @@ class MainActivity : android.app.Activity() {
         if (!hasPublicScheduleCache(term)) {
             loginStatus?.text = "暂无本地全校课表缓存，请先使用个人账号登录"
             loginStatus?.visibility = View.VISIBLE
+            return
+        }
+        if (!hasPublicScheduleLookup(term)) {
+            loginStatus?.text = "正在准备班级课表查询，请稍候"
+            loginStatus?.visibility = View.VISIBLE
+            startPublicScheduleSyncIfNeeded(term)
             return
         }
         if (publicCollegeSelection.isBlank() || publicGradeSelection.isBlank() ||
@@ -4227,6 +4255,16 @@ class MainActivity : android.app.Activity() {
         return File(filesDir, "public_schedule_$safeTerm.json.gz")
     }
 
+    private fun publicScheduleIndexFile(term: String): File {
+        val safeTerm = term.replace(Regex("[^A-Za-z0-9_-]"), "_")
+        return File(filesDir, "public_schedule_index_$safeTerm.json.gz")
+    }
+
+    private fun publicScheduleLookupFile(term: String): File {
+        val safeTerm = term.replace(Regex("[^A-Za-z0-9_-]"), "_")
+        return File(filesDir, "public_schedule_lookup_$safeTerm.db")
+    }
+
     private fun hasPublicScheduleCache(term: String): Boolean {
         val file = publicScheduleFile(term)
         return file.isFile && file.length() > 0L
@@ -4237,15 +4275,33 @@ class MainActivity : android.app.Activity() {
         return "${KEY_PUBLIC_SCHEDULE_HASH_PREFIX}$safeTerm"
     }
 
+    private fun publicScheduleLookupHashKey(term: String): String {
+        return "${publicScheduleHashKey(term)}_lookup"
+    }
+
+    private fun hasPublicScheduleLookup(term: String): Boolean {
+        if (term.isBlank()) return false
+        val file = publicScheduleLookupFile(term)
+        if (!file.isFile || file.length() == 0L) return false
+        val preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        if (!preferences.contains(publicScheduleLookupHashKey(term))) return false
+        return preferences.getString(publicScheduleLookupHashKey(term), null).orEmpty()
+            .equals(
+                preferences.getString(publicScheduleHashKey(term), null).orEmpty(),
+                ignoreCase = true
+            )
+    }
+
     private fun savePublicScheduleCacheFromDownload(
         term: String,
         source: File,
         charsetName: String,
         sha256: String,
         repository: SdauCourseRepository
-    ) {
+    ): PublicScheduleIndex {
         val target = publicScheduleFile(term)
         val temporary = File(target.parentFile, "${target.name}.tmp")
+        val hierarchy = linkedMapOf<String, MutableMap<String, MutableMap<String, MutableSet<String>>>>()
         var recordCount = 0
         try {
             JsonWriter(OutputStreamWriter(
@@ -4255,6 +4311,7 @@ class MainActivity : android.app.Activity() {
                 writer.beginArray()
                 InputStreamReader(FileInputStream(source), Charset.forName(charsetName)).use { input ->
                     recordCount = repository.streamPublicCourses(input) { course ->
+                        addPublicScheduleIndexEntry(hierarchy, course)
                         writer.beginObject()
                         writer.name("college").value(course.college)
                         writer.name("grade").value(course.grade)
@@ -4282,10 +4339,16 @@ class MainActivity : android.app.Activity() {
             temporary.delete()
             throw error
         }
+        val index = immutablePublicScheduleIndex(hierarchy, recordCount, sha256)
+        savePublicScheduleIndex(term, index)
+        buildPublicScheduleLookupDatabase(term, sha256)
+        publicScheduleIndexCache.clear()
+        publicScheduleIndexCache[term] = index
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
             .putString(KEY_PUBLIC_SCHEDULE_SYNCED_TERM, term)
             .putString(publicScheduleHashKey(term), sha256)
             .apply()
+        return index
     }
 
     private fun streamCachedPublicSchedule(
@@ -4302,44 +4365,258 @@ class MainActivity : android.app.Activity() {
         }
     }
 
-    private fun loadPublicScheduleIndex(term: String): PublicScheduleIndex {
-        publicScheduleIndexCache[term]?.let { return it }
-        return runCatching {
-            val hierarchy = linkedMapOf<String, MutableMap<String, MutableMap<String, MutableSet<String>>>>()
+    private fun addPublicScheduleIndexEntry(
+        hierarchy: MutableMap<String, MutableMap<String, MutableMap<String, MutableSet<String>>>>,
+        course: RemotePublicCourse
+    ) {
+        val grade = publicGradeLabel(course.grade)
+        if (course.college.isBlank() || grade.isBlank() ||
+            course.major.isBlank() || course.className.isBlank()
+        ) return
+        hierarchy.getOrPut(course.college) { linkedMapOf() }
+            .getOrPut(grade) { linkedMapOf() }
+            .getOrPut(course.major) { linkedSetOf() }
+            .add(course.className)
+    }
+
+    private fun immutablePublicScheduleIndex(
+        hierarchy: Map<String, Map<String, Map<String, Set<String>>>>,
+        recordCount: Int,
+        sourceSha256: String
+    ): PublicScheduleIndex {
+        val immutableHierarchy = hierarchy.mapValues { (_, grades) ->
+            grades.mapValues { (_, majors) ->
+                majors.mapValues { (_, classes) -> classes.toSet() }
+            }
+        }
+        return PublicScheduleIndex(immutableHierarchy, recordCount, sourceSha256)
+    }
+
+    private fun buildPublicScheduleIndex(term: String, sourceSha256: String): PublicScheduleIndex {
+        val hierarchy = linkedMapOf<String, MutableMap<String, MutableMap<String, MutableSet<String>>>>()
+        val recordCount = streamCachedPublicSchedule(term) { course ->
+            addPublicScheduleIndexEntry(hierarchy, course)
+        }
+        return immutablePublicScheduleIndex(hierarchy, recordCount, sourceSha256)
+    }
+
+    private fun deletePublicScheduleLookupArtifacts(file: File) {
+        file.delete()
+        File("${file.path}-journal").delete()
+        File("${file.path}-wal").delete()
+        File("${file.path}-shm").delete()
+    }
+
+    private fun buildPublicScheduleLookupDatabase(term: String, sourceSha256: String) {
+        val target = publicScheduleLookupFile(term)
+        val temporary = File(target.parentFile, "${target.name}.tmp")
+        deletePublicScheduleLookupArtifacts(temporary)
+        val database = SQLiteDatabase.openOrCreateDatabase(temporary, null)
+        try {
+            database.rawQuery("PRAGMA journal_mode=DELETE", null).use { cursor ->
+                cursor.moveToFirst()
+            }
+            database.execSQL("PRAGMA synchronous=OFF")
+            database.execSQL(
+                """CREATE TABLE courses (
+                    college TEXT NOT NULL,
+                    grade TEXT NOT NULL,
+                    major TEXT NOT NULL,
+                    class_name TEXT NOT NULL,
+                    day INTEGER NOT NULL,
+                    start_slot INTEGER NOT NULL,
+                    slot_count INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    room TEXT NOT NULL,
+                    teacher TEXT NOT NULL,
+                    weeks TEXT NOT NULL,
+                    course_code TEXT NOT NULL
+                )""".trimIndent()
+            )
+            val insert = database.compileStatement(
+                "INSERT INTO courses VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            )
+            database.beginTransaction()
             val recordCount = streamCachedPublicSchedule(term) { course ->
-                val grade = publicGradeLabel(course.grade)
-                if (course.college.isNotBlank() && grade.isNotBlank() &&
-                    course.major.isNotBlank() && course.className.isNotBlank()) {
-                    hierarchy.getOrPut(course.college) { linkedMapOf() }
-                        .getOrPut(grade) { linkedMapOf() }
-                        .getOrPut(course.major) { linkedSetOf() }
-                        .add(course.className)
+                insert.clearBindings()
+                insert.bindString(1, course.college)
+                insert.bindString(2, publicGradeLabel(course.grade))
+                insert.bindString(3, course.major)
+                insert.bindString(4, course.className)
+                insert.bindLong(5, course.day.toLong())
+                insert.bindLong(6, course.startSlot.toLong())
+                insert.bindLong(7, course.slotCount.toLong())
+                insert.bindString(8, course.name)
+                insert.bindString(9, course.room)
+                insert.bindString(10, course.teacher)
+                insert.bindString(11, course.weeks)
+                insert.bindString(12, course.courseCode)
+                insert.executeInsert()
+            }
+            check(recordCount > 0) { "本地全校课表中没有可用课程" }
+            database.setTransactionSuccessful()
+            database.endTransaction()
+            insert.close()
+            database.execSQL(
+                "CREATE INDEX class_lookup ON courses (college, grade, major, class_name)"
+            )
+            database.close()
+            synchronized(publicScheduleLookupLock) {
+                deletePublicScheduleLookupArtifacts(target)
+                if (!temporary.renameTo(target)) {
+                    temporary.copyTo(target, overwrite = true)
+                    temporary.delete()
                 }
             }
-            val immutableHierarchy = hierarchy.mapValues { (_, grades) ->
-                grades.mapValues { (_, majors) ->
-                    majors.mapValues { (_, classes) -> classes.toSet() }
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putString(publicScheduleLookupHashKey(term), sourceSha256)
+                .apply()
+        } catch (error: Exception) {
+            if (database.inTransaction()) database.endTransaction()
+            if (database.isOpen) database.close()
+            deletePublicScheduleLookupArtifacts(temporary)
+            throw error
+        }
+    }
+
+    private fun savePublicScheduleIndex(term: String, index: PublicScheduleIndex) {
+        val target = publicScheduleIndexFile(term)
+        val temporary = File(target.parentFile, "${target.name}.tmp")
+        try {
+            JsonWriter(OutputStreamWriter(
+                GZIPOutputStream(FileOutputStream(temporary)),
+                StandardCharsets.UTF_8
+            )).use { writer ->
+                writer.beginObject()
+                writer.name("sourceSha256").value(index.sourceSha256)
+                writer.name("recordCount").value(index.recordCount.toLong())
+                writer.name("colleges").beginObject()
+                index.hierarchy.toSortedMap().forEach { (college, grades) ->
+                    writer.name(college).beginObject()
+                    grades.toSortedMap().forEach { (grade, majors) ->
+                        writer.name(grade).beginObject()
+                        majors.toSortedMap().forEach { (major, classes) ->
+                            writer.name(major).beginArray()
+                            classes.sorted().forEach(writer::value)
+                            writer.endArray()
+                        }
+                        writer.endObject()
+                    }
+                    writer.endObject()
                 }
+                writer.endObject()
+                writer.endObject()
             }
-            PublicScheduleIndex(immutableHierarchy, recordCount).also {
-                publicScheduleIndexCache.clear()
-                publicScheduleIndexCache[term] = it
+            if (!temporary.renameTo(target)) {
+                temporary.copyTo(target, overwrite = true)
+                temporary.delete()
             }
-        }.getOrDefault(PublicScheduleIndex(emptyMap(), 0))
+        } catch (error: Exception) {
+            temporary.delete()
+            throw error
+        }
+    }
+
+    private fun loadStoredPublicScheduleIndex(term: String): PublicScheduleIndex? {
+        publicScheduleIndexCache[term]?.let { return it }
+        if (term.isBlank()) return null
+        val expectedSha256 = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .getString(publicScheduleHashKey(term), null)
+            .orEmpty()
+        val file = publicScheduleIndexFile(term)
+        if (!file.isFile || file.length() == 0L) return null
+        return runCatching {
+            val root = InputStreamReader(
+                GZIPInputStream(FileInputStream(file)),
+                StandardCharsets.UTF_8
+            ).use { JSONObject(it.readText()) }
+            val sourceSha256 = root.optString("sourceSha256")
+            if (expectedSha256.isNotBlank() &&
+                !sourceSha256.equals(expectedSha256, ignoreCase = true)
+            ) return@runCatching null
+            val hierarchy = linkedMapOf<String, Map<String, Map<String, Set<String>>>>()
+            val colleges = root.optJSONObject("colleges") ?: JSONObject()
+            val collegeNames = colleges.keys()
+            while (collegeNames.hasNext()) {
+                val college = collegeNames.next()
+                val gradeObject = colleges.optJSONObject(college) ?: continue
+                val grades = linkedMapOf<String, Map<String, Set<String>>>()
+                val gradeNames = gradeObject.keys()
+                while (gradeNames.hasNext()) {
+                    val grade = gradeNames.next()
+                    val majorObject = gradeObject.optJSONObject(grade) ?: continue
+                    val majors = linkedMapOf<String, Set<String>>()
+                    val majorNames = majorObject.keys()
+                    while (majorNames.hasNext()) {
+                        val major = majorNames.next()
+                        val classes = majorObject.optJSONArray(major) ?: JSONArray()
+                        majors[major] = buildSet {
+                            for (index in 0 until classes.length()) {
+                                classes.optString(index).takeIf(String::isNotBlank)?.let(::add)
+                            }
+                        }
+                    }
+                    grades[grade] = majors
+                }
+                hierarchy[college] = grades
+            }
+            PublicScheduleIndex(
+                hierarchy,
+                root.optInt("recordCount"),
+                sourceSha256
+            ).takeIf { it.recordCount > 0 && it.hierarchy.isNotEmpty() }
+        }.getOrNull()?.also {
+            publicScheduleIndexCache.clear()
+            publicScheduleIndexCache[term] = it
+        }
     }
 
     private fun loadSelectedPublicScheduleCourses(term: String): List<RemotePublicCourse> {
         return runCatching {
-            buildList {
-                streamCachedPublicSchedule(term) { course ->
-                    if (course.college == publicCollegeSelection &&
-                        publicGradeLabel(course.grade) == publicGradeSelection &&
-                        course.major == publicMajorSelection &&
-                        course.className == publicClassSelection) {
-                        add(course)
+            synchronized(publicScheduleLookupLock) {
+                SQLiteDatabase.openDatabase(
+                    publicScheduleLookupFile(term).path,
+                    null,
+                    SQLiteDatabase.OPEN_READONLY
+                ).use { database ->
+                    database.query(
+                        "courses",
+                        arrayOf(
+                            "day", "start_slot", "slot_count", "name",
+                            "room", "teacher", "weeks", "course_code"
+                        ),
+                        "college = ? AND grade = ? AND major = ? AND class_name = ?",
+                        arrayOf(
+                            publicCollegeSelection,
+                            publicGradeSelection,
+                            publicMajorSelection,
+                            publicClassSelection
+                        ),
+                        null,
+                        null,
+                        null
+                    ).use { cursor ->
+                        buildList {
+                            while (cursor.moveToNext()) {
+                                add(RemotePublicCourse(
+                                    publicCollegeSelection,
+                                    publicGradeSelection,
+                                    publicMajorSelection,
+                                    publicClassSelection,
+                                    cursor.getInt(0),
+                                    cursor.getInt(1),
+                                    cursor.getInt(2),
+                                    cursor.getString(3),
+                                    cursor.getString(4),
+                                    cursor.getString(5),
+                                    cursor.getString(6),
+                                    cursor.getString(7)
+                                ))
+                            }
+                        }.distinct()
                     }
                 }
-            }.distinct()
+            }
         }.getOrDefault(emptyList())
     }
 
@@ -4367,6 +4644,29 @@ class MainActivity : android.app.Activity() {
                 } else {
                     null
                 }
+                var localArtifactsPrepared = false
+                if (cacheReady) {
+                    if (loadStoredPublicScheduleIndex(term) == null) {
+                        val localIndex = buildPublicScheduleIndex(term, knownSha256.orEmpty())
+                        if (localIndex.recordCount > 0 && localIndex.hierarchy.isNotEmpty()) {
+                            savePublicScheduleIndex(term, localIndex)
+                            publicScheduleIndexCache.clear()
+                            publicScheduleIndexCache[term] = localIndex
+                            localArtifactsPrepared = true
+                        }
+                    }
+                    if (!hasPublicScheduleLookup(term)) {
+                        buildPublicScheduleLookupDatabase(term, knownSha256.orEmpty())
+                        localArtifactsPrepared = true
+                    }
+                    if (localArtifactsPrepared) {
+                        runOnUiThread {
+                            if (onLoginPage && loginMode == LoginMode.PUBLIC) {
+                                swapPage(buildLoginPage(), false, false)
+                            }
+                        }
+                    }
+                }
                 val repository = SdauCourseRepository()
                 val download = repository.downloadPublicScheduleMirror(term, downloadFile)
                 val changed = knownSha256.isNullOrBlank() ||
@@ -4379,7 +4679,6 @@ class MainActivity : android.app.Activity() {
                         download.sha256,
                         repository
                     )
-                    publicScheduleIndexCache.remove(term)
                 }
                 runOnUiThread {
                     publicSyncRunning = false
