@@ -1,7 +1,6 @@
 package com.sdau.campuskit
 
 import android.Manifest
-import android.app.AlarmManager
 import android.app.DownloadManager
 import android.content.Context
 import android.content.ContentValues
@@ -31,6 +30,7 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.PowerManager
 import android.text.InputType
+import android.util.JsonWriter
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
@@ -55,6 +55,7 @@ import android.widget.TextView
 import android.widget.Toast
 import android.widget.PopupWindow
 import android.widget.ProgressBar
+import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
@@ -69,6 +70,9 @@ import java.util.Locale
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.InputStreamReader
+import java.io.OutputStreamWriter
+import java.nio.charset.Charset
 import java.util.zip.GZIPInputStream
 import java.util.zip.GZIPOutputStream
 import java.util.concurrent.Executors
@@ -165,8 +169,8 @@ class MainActivity : android.app.Activity() {
     private var publicScheduleLabel = ""
     private var publicScheduleClassName = ""
     private var publicSyncRunning = false
-    private val publicScheduleMemoryCache =
-        java.util.concurrent.ConcurrentHashMap<String, List<RemotePublicCourse>>()
+    private val publicScheduleIndexCache =
+        java.util.concurrent.ConcurrentHashMap<String, PublicScheduleIndex>()
     private var onLoginPage = false
     private lateinit var publicCollegeInput: MaterialAutoCompleteTextView
     private lateinit var publicGradeInput: MaterialAutoCompleteTextView
@@ -276,6 +280,10 @@ class MainActivity : android.app.Activity() {
     )
     private data class ExamCache(val term: String, val records: List<RemoteExam>)
     private data class EmptyRoomGroup(val title: String, val accent: Int, val rooms: List<String>)
+    private data class PublicScheduleIndex(
+        val hierarchy: Map<String, Map<String, Map<String, Set<String>>>>,
+        val recordCount: Int
+    )
     private enum class LoginMode { PERSONAL, PUBLIC }
 
     override fun onCreate(state: Bundle?) {
@@ -373,12 +381,12 @@ class MainActivity : android.app.Activity() {
     private fun registerUpdateDownloadReceiver() {
         if (updateDownloadReceiverRegistered) return
         val filter = IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(updateDownloadReceiver, filter, Context.RECEIVER_EXPORTED)
-        } else {
-            @Suppress("DEPRECATION")
-            registerReceiver(updateDownloadReceiver, filter)
-        }
+        ContextCompat.registerReceiver(
+            this,
+            updateDownloadReceiver,
+            filter,
+            ContextCompat.RECEIVER_EXPORTED
+        )
         updateDownloadReceiverRegistered = true
     }
 
@@ -1227,21 +1235,20 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun buildPublicFilterFields(body: LinearLayout, term: String) {
-        val records = loadPublicScheduleCache(term)
-        val colleges = records.map { it.college }.filter { it.isNotBlank() }.distinct().sorted()
+        val index = loadPublicScheduleIndex(term)
+        val colleges = index.hierarchy.keys.sorted()
         val college = choosePublicOption(publicCollegeSelection, colleges, listOf("农学院"))
-        val gradeRecords = records.filter { college.isBlank() || it.college == college }
-        val grades = gradeRecords.map { publicGradeLabel(it.grade) }.distinct().sorted()
+        val gradeMap = index.hierarchy[college].orEmpty()
+        val grades = gradeMap.keys.sorted()
         val grade = choosePublicOption(publicGradeSelection, grades, listOf("2026级"))
-        val majorRecords = gradeRecords.filter { grade.isBlank() || publicGradeLabel(it.grade) == grade }
-        val majors = majorRecords.map { it.major }.filter { it.isNotBlank() }.distinct().sorted()
+        val majorMap = gradeMap[grade].orEmpty()
+        val majors = majorMap.keys.sorted()
         val major = choosePublicOption(
             publicMajorSelection,
             majors,
             listOf("农业（拔尖基地班）", "农学（拔尖基地班）")
         )
-        val classRecords = majorRecords.filter { major.isBlank() || it.major == major }
-        val classes = classRecords.map { it.className }.filter { it.isNotBlank() }.distinct().sorted()
+        val classes = majorMap[major].orEmpty().sorted()
         val className = choosePublicOption(publicClassSelection, classes, listOf("农基2601"))
 
         publicCollegeSelection = college
@@ -1275,7 +1282,7 @@ class MainActivity : android.app.Activity() {
             publicClassSelection = it
             swapPage(buildLoginPage(), false, false)
         }, spacedParams(dp(14)))
-        if (records.isEmpty()) {
+        if (index.recordCount == 0) {
             body.addView(text("全校课表正在准备，准备完成后可筛选查询", 13f, TEXT_SECONDARY, Typeface.NORMAL).apply {
                 setLineSpacing(dp(3).toFloat(), 1f)
             }, spacedParams(dp(8)))
@@ -1325,8 +1332,7 @@ class MainActivity : android.app.Activity() {
 
     private fun attemptPublicScheduleLookup() {
         val term = semesterInput.text?.toString()?.trim().orEmpty()
-        val records = loadPublicScheduleCache(term)
-        if (records.isEmpty()) {
+        if (!hasPublicScheduleCache(term)) {
             loginStatus?.text = "暂无本地全校课表缓存，请先使用个人账号登录"
             loginStatus?.visibility = View.VISIBLE
             return
@@ -1338,12 +1344,7 @@ class MainActivity : android.app.Activity() {
             loginStatus?.visibility = View.VISIBLE
             return
         }
-        val selected = records.filter {
-            it.college == publicCollegeSelection &&
-                publicGradeLabel(it.grade) == publicGradeSelection &&
-                it.major == publicMajorSelection &&
-                it.className == publicClassSelection
-        }
+        val selected = loadSelectedPublicScheduleCourses(term)
         if (selected.isEmpty()) {
             loginStatus?.text = "未找到该班级的课程信息"
             loginStatus?.visibility = View.VISIBLE
@@ -2445,11 +2446,50 @@ class MainActivity : android.app.Activity() {
     private fun syncEmptyRoomDefaultsToNow() {
         val now = Calendar.getInstance()
         val termWeek = weekForTerm(selectedTerm())
+        emptyRoomCampus = defaultEmptyRoomCampus()
         emptyRoomWeek = if (termWeek <= 0) 1 else termWeek
         emptyRoomWeekday = now.get(Calendar.DAY_OF_WEEK).let { day ->
             if (day == Calendar.SUNDAY) 7 else day - 1
         }
         emptyRoomSectionCode = defaultEmptyRoomSection(now)
+    }
+
+    private fun defaultEmptyRoomCampus(): String {
+        val campusCounts = linkedMapOf(
+            "泮河校区" to 0,
+            "西北片区" to 0,
+            "岱宗校区" to 0
+        )
+        activeScheduleCourses().forEach { course ->
+            emptyRoomCampusForRoom(course.room)?.let { campus ->
+                campusCounts[campus] = campusCounts.getValue(campus) + 1
+            }
+        }
+
+        val highestCount = campusCounts.values.maxOrNull() ?: 0
+        if (highestCount == 0) return "泮河校区"
+        val mostLikelyCampuses = campusCounts.filterValues { it == highestCount }.keys
+        return mostLikelyCampuses.singleOrNull() ?: "泮河校区"
+    }
+
+    private fun emptyRoomCampusForRoom(room: String): String? {
+        val normalizedRoom = room
+            .filterNot { it.isWhitespace() }
+            .uppercase(Locale.ROOT)
+        return when {
+            normalizedRoom.startsWith("22#") -> "西北片区"
+            normalizedRoom.startsWith("北校12号楼") ||
+                normalizedRoom.startsWith("5N") ||
+                normalizedRoom.startsWith("5S") ||
+                normalizedRoom.startsWith("文理大楼") ||
+                normalizedRoom.startsWith("北校文理大楼") -> "岱宗校区"
+            normalizedRoom.startsWith("19#") ||
+                normalizedRoom.startsWith("S") ||
+                normalizedRoom.startsWith("N") ||
+                normalizedRoom.startsWith("W") ||
+                normalizedRoom.startsWith("E") -> "泮河校区"
+            else -> null
+        }
     }
 
     private fun buildScoreResultSection(result: RemoteScoreResult): View {
@@ -4011,43 +4051,7 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun schedulePushNotifications() {
-        if (!pushEnabled) return
-        cancelPushAlarmsOnly()
-        val courses = loadCourseCache().filter { courseVisibleInWeek(it, currentWeek) }
-        if (courses.isEmpty()) return
-        val now = Calendar.getInstance()
-        val today = (now.get(Calendar.DAY_OF_WEEK) + 5) % 7
-        val todayCourses = courses.filter { it.day == today }
-        val alarm = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        courses.groupBy { it.day }.forEach { (day, dayCourses) ->
-            val dayDelta = (day - today + 7) % 7
-            dayCourses.sortedBy { it.startSlot }.forEachIndexed { index, course ->
-                val start = courseStartTime(course, dayDelta)
-                var trigger = start.timeInMillis - if (index == 0) 30 * 60_000L else 20 * 60_000L
-                if (dayDelta == 1 && todayCourses.isEmpty() && index == 0) {
-                    trigger = (start.clone() as Calendar).apply { add(Calendar.DAY_OF_MONTH, -1); set(Calendar.HOUR_OF_DAY, 22); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0) }.timeInMillis
-                }
-                if (trigger <= System.currentTimeMillis() + 5_000L) return@forEachIndexed
-                val intent = Intent(this, CourseReminderReceiver::class.java).apply {
-                    putExtra(CourseReminderReceiver.EXTRA_NAME, course.name)
-                    putExtra(CourseReminderReceiver.EXTRA_ROOM, course.room)
-                    putExtra(CourseReminderReceiver.EXTRA_TIME, courseTimeLabel(course))
-                }
-                val requestCode = REMINDER_REQUEST_CODE + day * 20 + course.startSlot
-                val pending = android.app.PendingIntent.getBroadcast(this, requestCode, intent, android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE)
-                alarm.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, trigger, pending)
-            }
-        }
-    }
-
-    private fun courseStartTime(course: Course, dayDelta: Int): Calendar {
-        val starts = currentStartMinutes()
-        return Calendar.getInstance().apply {
-            add(Calendar.DAY_OF_MONTH, dayDelta)
-            set(Calendar.HOUR_OF_DAY, starts[course.startSlot] / 60)
-            set(Calendar.MINUTE, starts[course.startSlot] % 60)
-            set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
-        }
+        CourseReminderScheduler.scheduleNext(this)
     }
 
     private fun courseTimeLabel(course: Course): String {
@@ -4065,21 +4069,6 @@ class MainActivity : android.app.Activity() {
         "15:25" to "16:10", "16:30" to "17:15", "17:25" to "18:10", "19:30" to "20:15", "20:25" to "21:10"
     )
 
-    private fun courseReminderTime(course: Course): Long {
-        val starts = currentStartMinutes()
-        val now = Calendar.getInstance()
-        val today = (now.get(Calendar.DAY_OF_WEEK) + 5) % 7
-        val dayDelta = (course.day - today + 7) % 7
-        val target = (now.clone() as Calendar).apply {
-            add(Calendar.DAY_OF_MONTH, dayDelta)
-            set(Calendar.HOUR_OF_DAY, starts[course.startSlot] / 60)
-            set(Calendar.MINUTE, starts[course.startSlot] % 60)
-            set(Calendar.SECOND, 0)
-            set(Calendar.MILLISECOND, 0)
-        }
-        return target.timeInMillis - 10 * 60 * 1000L
-    }
-
     private fun cancelSystemCourseReminder() {
         if (!::pageHost.isInitialized) return
         cancelPushAlarmsOnly()
@@ -4087,12 +4076,7 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun cancelPushAlarmsOnly() {
-        val intent = Intent(this, CourseReminderReceiver::class.java)
-        val alarm = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        for (requestCode in REMINDER_REQUEST_CODE until REMINDER_REQUEST_CODE + 200) {
-            val pending = android.app.PendingIntent.getBroadcast(this, requestCode, intent, android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE)
-            alarm.cancel(pending)
-        }
+        CourseReminderScheduler.cancel(this)
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
@@ -4245,61 +4229,117 @@ class MainActivity : android.app.Activity() {
 
     private fun hasPublicScheduleCache(term: String): Boolean {
         val file = publicScheduleFile(term)
-        return file.isFile && file.length() > 0L &&
-            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                .getString(KEY_PUBLIC_SCHEDULE_SYNCED_TERM, "") == term
+        return file.isFile && file.length() > 0L
     }
 
-    private fun savePublicScheduleCache(term: String, records: List<RemotePublicCourse>) {
-        val array = JSONArray()
-        records.forEach { item ->
-            array.put(JSONObject().apply {
-                put("college", item.college)
-                put("grade", item.grade)
-                put("major", item.major)
-                put("className", item.className)
-                put("day", item.day)
-                put("startSlot", item.startSlot)
-                put("slotCount", item.slotCount)
-                put("name", item.name)
-                put("room", item.room)
-                put("teacher", item.teacher)
-                put("weeks", item.weeks)
-                put("courseCode", item.courseCode)
-            })
-        }
+    private fun publicScheduleHashKey(term: String): String {
+        val safeTerm = term.replace(Regex("[^A-Za-z0-9_-]"), "_")
+        return "${KEY_PUBLIC_SCHEDULE_HASH_PREFIX}$safeTerm"
+    }
+
+    private fun savePublicScheduleCacheFromDownload(
+        term: String,
+        source: File,
+        charsetName: String,
+        sha256: String,
+        repository: SdauCourseRepository
+    ) {
         val target = publicScheduleFile(term)
         val temporary = File(target.parentFile, "${target.name}.tmp")
-        GZIPOutputStream(FileOutputStream(temporary)).bufferedWriter(Charsets.UTF_8).use { it.write(array.toString()) }
-        if (!temporary.renameTo(target)) {
-            temporary.copyTo(target, overwrite = true)
+        var recordCount = 0
+        try {
+            JsonWriter(OutputStreamWriter(
+                GZIPOutputStream(FileOutputStream(temporary)),
+                StandardCharsets.UTF_8
+            )).use { writer ->
+                writer.beginArray()
+                InputStreamReader(FileInputStream(source), Charset.forName(charsetName)).use { input ->
+                    recordCount = repository.streamPublicCourses(input) { course ->
+                        writer.beginObject()
+                        writer.name("college").value(course.college)
+                        writer.name("grade").value(course.grade)
+                        writer.name("major").value(course.major)
+                        writer.name("className").value(course.className)
+                        writer.name("day").value(course.day.toLong())
+                        writer.name("startSlot").value(course.startSlot.toLong())
+                        writer.name("slotCount").value(course.slotCount.toLong())
+                        writer.name("name").value(course.name)
+                        writer.name("room").value(course.room)
+                        writer.name("teacher").value(course.teacher)
+                        writer.name("weeks").value(course.weeks)
+                        writer.name("courseCode").value(course.courseCode)
+                        writer.endObject()
+                    }
+                }
+                writer.endArray()
+            }
+            check(recordCount > 0) { "课程镜像中没有可用课程" }
+            if (!temporary.renameTo(target)) {
+                temporary.copyTo(target, overwrite = true)
+                temporary.delete()
+            }
+        } catch (error: Exception) {
             temporary.delete()
+            throw error
         }
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
             .putString(KEY_PUBLIC_SCHEDULE_SYNCED_TERM, term)
+            .putString(publicScheduleHashKey(term), sha256)
             .apply()
-        publicScheduleMemoryCache[term] = records
     }
 
-    private fun loadPublicScheduleCache(term: String): List<RemotePublicCourse> {
-        publicScheduleMemoryCache[term]?.let { return it }
+    private fun streamCachedPublicSchedule(
+        term: String,
+        onCourse: (RemotePublicCourse) -> Unit
+    ): Int {
         val file = publicScheduleFile(term)
-        if (!file.isFile) return emptyList()
+        if (!file.isFile) return 0
+        return InputStreamReader(
+            GZIPInputStream(FileInputStream(file)),
+            StandardCharsets.UTF_8
+        ).use { input ->
+            SdauCourseRepository().streamPublicCourses(input, onCourse)
+        }
+    }
+
+    private fun loadPublicScheduleIndex(term: String): PublicScheduleIndex {
+        publicScheduleIndexCache[term]?.let { return it }
         return runCatching {
-            val raw = GZIPInputStream(FileInputStream(file)).bufferedReader(Charsets.UTF_8).use { it.readText() }
-            val array = JSONArray(raw)
-            buildList {
-                for (index in 0 until array.length()) {
-                    val item = array.optJSONObject(index) ?: continue
-                    add(RemotePublicCourse(
-                        item.optString("college"), item.optString("grade"), item.optString("major"),
-                        item.optString("className"), item.optInt("day"), item.optInt("startSlot"),
-                        item.optInt("slotCount"), item.optString("name"), item.optString("room"),
-                        item.optString("teacher").replace(Regex("\\s*\\[[^]]*\\]"), ""),
-                        item.optString("weeks"), item.optString("courseCode")
-                    ))
+            val hierarchy = linkedMapOf<String, MutableMap<String, MutableMap<String, MutableSet<String>>>>()
+            val recordCount = streamCachedPublicSchedule(term) { course ->
+                val grade = publicGradeLabel(course.grade)
+                if (course.college.isNotBlank() && grade.isNotBlank() &&
+                    course.major.isNotBlank() && course.className.isNotBlank()) {
+                    hierarchy.getOrPut(course.college) { linkedMapOf() }
+                        .getOrPut(grade) { linkedMapOf() }
+                        .getOrPut(course.major) { linkedSetOf() }
+                        .add(course.className)
                 }
-            }.also { publicScheduleMemoryCache[term] = it }
+            }
+            val immutableHierarchy = hierarchy.mapValues { (_, grades) ->
+                grades.mapValues { (_, majors) ->
+                    majors.mapValues { (_, classes) -> classes.toSet() }
+                }
+            }
+            PublicScheduleIndex(immutableHierarchy, recordCount).also {
+                publicScheduleIndexCache.clear()
+                publicScheduleIndexCache[term] = it
+            }
+        }.getOrDefault(PublicScheduleIndex(emptyMap(), 0))
+    }
+
+    private fun loadSelectedPublicScheduleCourses(term: String): List<RemotePublicCourse> {
+        return runCatching {
+            buildList {
+                streamCachedPublicSchedule(term) { course ->
+                    if (course.college == publicCollegeSelection &&
+                        publicGradeLabel(course.grade) == publicGradeSelection &&
+                        course.major == publicMajorSelection &&
+                        course.className == publicClassSelection) {
+                        add(course)
+                    }
+                }
+            }.distinct()
         }.getOrDefault(emptyList())
     }
 
@@ -4317,12 +4357,30 @@ class MainActivity : android.app.Activity() {
         if (publicSyncRunning) return
         publicSyncRunning = true
         publicSyncExecutor.execute {
+            val safeTerm = term.replace(Regex("[^A-Za-z0-9_-]"), "_")
+            val downloadFile = File(cacheDir, "public_schedule_$safeTerm.download")
             try {
-                val cached = loadPublicScheduleCache(term)
                 val cacheReady = hasPublicScheduleCache(term)
-                val records = SdauCourseRepository().queryPublicCoursesFromMirror(term)
-                val changed = !cacheReady || records != cached
-                if (changed) savePublicScheduleCache(term, records)
+                val knownSha256 = if (cacheReady) {
+                    getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                        .getString(publicScheduleHashKey(term), null)
+                } else {
+                    null
+                }
+                val repository = SdauCourseRepository()
+                val download = repository.downloadPublicScheduleMirror(term, downloadFile)
+                val changed = knownSha256.isNullOrBlank() ||
+                    !download.sha256.equals(knownSha256, ignoreCase = true)
+                if (changed) {
+                    savePublicScheduleCacheFromDownload(
+                        term,
+                        downloadFile,
+                        download.charsetName,
+                        download.sha256,
+                        repository
+                    )
+                    publicScheduleIndexCache.remove(term)
+                }
                 runOnUiThread {
                     publicSyncRunning = false
                     if (!changed) return@runOnUiThread
@@ -4331,12 +4389,7 @@ class MainActivity : android.app.Activity() {
                             swapPage(buildLoginPage(), false, false)
                         }
                         viewingPublicSchedule && publicScheduleTerm == term -> {
-                            val selected = records.filter {
-                                it.college == publicCollegeSelection &&
-                                    publicGradeLabel(it.grade) == publicGradeSelection &&
-                                    it.major == publicMajorSelection &&
-                                    it.className == publicClassSelection
-                            }
+                            val selected = loadSelectedPublicScheduleCourses(term)
                             if (selected.isNotEmpty()) {
                                 publicScheduleCourses = buildPublicScheduleCourses(selected)
                                 scheduleGrid?.setCourses(publicScheduleCourses)
@@ -4346,6 +4399,8 @@ class MainActivity : android.app.Activity() {
                 }
             } catch (_: Exception) {
                 runOnUiThread { publicSyncRunning = false }
+            } finally {
+                downloadFile.delete()
             }
         }
     }
@@ -4369,6 +4424,7 @@ class MainActivity : android.app.Activity() {
             .putString(KEY_COURSES, array.toString())
             .apply()
         CourseWidgetProvider.updateAll(this)
+        CourseReminderScheduler.scheduleNext(this)
     }
 
     private fun loadCourseCache(): List<Course> {
@@ -6476,6 +6532,7 @@ class MainActivity : android.app.Activity() {
 
     override fun onDestroy() {
         scheduleGrid?.releaseTransientCaches()
+        publicScheduleIndexCache.clear()
         clearUpdateDownloadReceiver()
         networkExecutor.shutdownNow()
         publicSyncExecutor.shutdownNow()
@@ -6486,6 +6543,7 @@ class MainActivity : android.app.Activity() {
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
         if (level >= TRIM_MEMORY_RUNNING_LOW) scheduleGrid?.releaseTransientCaches()
+        if (level >= TRIM_MEMORY_UI_HIDDEN) publicScheduleIndexCache.clear()
     }
 
     override fun onLowMemory() {
@@ -6495,7 +6553,6 @@ class MainActivity : android.app.Activity() {
 
     companion object {
         private const val NOTIFICATION_PERMISSION_REQUEST = 3001
-        private const val REMINDER_REQUEST_CODE = 3002
         private const val PREFS_NAME = "offline_login"
         private const val KEY_ACCOUNT = "account"
         private const val KEY_PASSWORD = "password"
@@ -6505,6 +6562,7 @@ class MainActivity : android.app.Activity() {
         private const val KEY_SCHEDULE_MODE = "schedule_mode"
         private const val KEY_COURSES = "courses_cache"
         private const val KEY_PUBLIC_SCHEDULE_SYNCED_TERM = "public_schedule_synced_term"
+        private const val KEY_PUBLIC_SCHEDULE_HASH_PREFIX = "public_schedule_sha256_"
         private const val KEY_SCORES = "scores_cache"
         private const val SCORE_STATS_SCOPE = "all_terms_v2"
         private const val KEY_EXAMS = "exams_cache"

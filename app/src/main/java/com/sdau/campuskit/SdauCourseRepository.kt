@@ -1,8 +1,14 @@
 package com.sdau.campuskit
 
+import android.util.JsonReader
+import android.util.JsonToken
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
 import java.io.OutputStreamWriter
+import java.io.Reader
 import java.net.CookieHandler
 import java.net.CookieManager
 import java.net.CookiePolicy
@@ -11,6 +17,8 @@ import java.net.URL
 import java.net.URLEncoder
 import java.nio.charset.Charset
 import java.nio.charset.StandardCharsets
+import java.security.DigestInputStream
+import java.security.MessageDigest
 import java.util.Base64
 import java.util.Locale
 
@@ -38,6 +46,11 @@ data class RemotePublicCourse(
     val teacher: String,
     val weeks: String = "",
     val courseCode: String = ""
+)
+
+data class RemotePublicScheduleDownload(
+    val sha256: String,
+    val charsetName: String
 )
 
 data class RemoteScore(
@@ -160,10 +173,6 @@ private data class EmptyRoomSectionPlan(val selectCode: String, val targetToken:
 class SdauCourseRepository {
     private val cookies = CookieManager(null, CookiePolicy.ACCEPT_ALL)
 
-    init {
-        CookieHandler.setDefault(cookies)
-    }
-
     fun queryStudentProfile(account: String, password: String): RemoteStudentProfile {
         login(account, password)
         val candidates = listOf(
@@ -196,10 +205,11 @@ class SdauCourseRepository {
         }
     }
 
-    fun queryPublicCoursesFromMirror(
+    fun downloadPublicScheduleMirror(
         term: String,
+        destination: File,
         onProgress: (Int, String) -> Unit = { _, _ -> }
-    ): List<RemotePublicCourse> {
+    ): RemotePublicScheduleDownload {
         val parts = term.split("-")
         val startYear = parts.getOrNull(0)?.toIntOrNull()
             ?: throw IllegalArgumentException("学期格式不正确")
@@ -220,18 +230,52 @@ class SdauCourseRepository {
             setRequestProperty("User-Agent", "SDAU-ClassSchedule-Android/2.0")
             setRequestProperty("Accept-Encoding", "identity")
         }
-        val status = connection.responseCode
-        val stream = if (status >= 400) connection.errorStream else connection.inputStream
-        if (stream == null) throw IllegalStateException("课程镜像无响应（HTTP $status）")
-        val bytes = stream.use { it.readBytes() }
-        val body = bytes.toString(responseCharset(connection.contentType))
-        connection.disconnect()
-        if (status !in 200..299) throw IllegalStateException("课程镜像返回 HTTP $status")
-        onProgress(78, "正在解析课程镜像")
-        val records = parsePublicCourses(body)
-        if (records.isEmpty()) throw IllegalStateException("课程镜像中没有可用课程")
-        onProgress(95, "正在整理本地筛选数据")
-        return records
+        val contentType: String?
+        val status: Int
+        try {
+            status = connection.responseCode
+            contentType = connection.contentType
+            if (status !in 200..299) {
+                connection.errorStream?.close()
+                throw IllegalStateException("课程镜像返回 HTTP $status")
+            }
+            val contentLength = connection.contentLengthLong
+            val digest = MessageDigest.getInstance("SHA-256")
+            DigestInputStream(connection.inputStream, digest).use { input ->
+                FileOutputStream(destination).buffered().use { output ->
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    var copied = 0L
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        output.write(buffer, 0, read)
+                        copied += read
+                        if (contentLength > 0L) {
+                            val progress = (8L + copied * 62L / contentLength).toInt().coerceIn(8, 70)
+                            onProgress(progress, "正在下载课程镜像")
+                        }
+                    }
+                }
+            }
+            val sha256 = digest.digest()
+                .joinToString("") { "%02x".format(Locale.ROOT, it.toInt() and 0xff) }
+            return RemotePublicScheduleDownload(
+                sha256 = sha256,
+                charsetName = responseCharset(contentType).name()
+            )
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    fun streamPublicCourses(input: Reader, onCourse: (RemotePublicCourse) -> Unit): Int {
+        val buffered = input.buffered()
+        buffered.mark(1)
+        if (buffered.read() != '\uFEFF'.code) buffered.reset()
+        return JsonReader(buffered).use { reader ->
+            reader.isLenient = true
+            streamPublicValue(reader, 0, onCourse)
+        }
     }
 
     fun queryScores(
@@ -410,6 +454,7 @@ class SdauCourseRepository {
     }
 
     private fun login(account: String, password: String) {
+        cookies.cookieStore.removeAll()
         val loginPage = requestStage("读取登录页") { request("/", "GET", null) }
         val scode = capture(loginPage, "var\\s+scode\\s*=\\s*['\"](.*?)['\"]")
         val sxh = capture(loginPage, "var\\s+sxh\\s*=\\s*['\"](.*?)['\"]")
@@ -423,8 +468,15 @@ class SdauCourseRepository {
             "encoded" to buildCredential(account, password, scode, sxh)
         )
         val loginResponse = requestStage("提交登录") { request("/xk/LoginToXk", "POST", form) }
-        if (loginResponse.contains("请先登录系统") || loginResponse.contains("欢迎登录教务系统")) {
-            throw IllegalArgumentException("学号或密码错误")
+        val loginMessage = capture(
+            loginResponse,
+            "id\\s*=\\s*['\"]showMsg['\"][^>]*>(.*?)</[^>]+>"
+        ).let(::clean)
+        if (loginMessage.isNotBlank() && !loginMessage.contains("请先登录系统")) {
+            throw IllegalArgumentException(loginMessage)
+        }
+        if (isLoginPage(loginResponse)) {
+            throw IllegalArgumentException("学号或密码错误，或教务系统未建立登录会话")
         }
     }
 
@@ -758,51 +810,97 @@ class SdauCourseRepository {
         return result.distinct()
     }
 
-    private fun parsePublicCourses(body: String): List<RemotePublicCourse> {
-        val rows = normalizePublicRows(body)
-        val result = mutableListOf<RemotePublicCourse>()
-        for (index in 0 until rows.length()) {
-            val row = rows.optJSONObject(index) ?: continue
-            val name = clean(jsonText(row, "kcmc", "kc_mc", "courseName", "course"))
-            if (name.isBlank()) continue
-            val meetings = parsePublicMeetings(row)
-            if (meetings.isEmpty()) continue
-            val college = clean(jsonText(row, "dwmc", "college", "yxmc", "skyx"))
-            val grade = normalizeGrade(jsonText(row, "ksnd", "grade", "nj"))
-            val major = clean(jsonText(row, "zymc", "major", "zy"))
-            val className = clean(jsonText(row, "bj", "skbj", "className", "bjmc"))
-            val room = cleanLocation(jsonText(row, "skdd", "jxdd", "room", "location", "jsmc"))
-            val teacher = clean(jsonText(row, "xm", "jsxm", "teacher", "js"))
-                .replace(Regex("\\s*\\[[^]]*\\]"), "")
-            val code = clean(jsonText(row, "kch", "courseCode", "kcdm"))
-            meetings.forEach { meeting ->
-                result += RemotePublicCourse(
-                    college, grade, major, className,
-                    meeting.day, meeting.startSlot, meeting.slotCount,
-                    name, room, teacher, meeting.weeks, code
-                )
+    private fun streamPublicValue(
+        reader: JsonReader,
+        depth: Int,
+        onCourse: (RemotePublicCourse) -> Unit
+    ): Int {
+        if (depth > 4) {
+            reader.skipValue()
+            return 0
+        }
+        return when (reader.peek()) {
+            JsonToken.BEGIN_ARRAY -> {
+                var count = 0
+                reader.beginArray()
+                while (reader.hasNext()) count += streamPublicValue(reader, depth + 1, onCourse)
+                reader.endArray()
+                count
+            }
+            JsonToken.BEGIN_OBJECT -> streamPublicObject(reader, depth, onCourse)
+            else -> {
+                reader.skipValue()
+                0
             }
         }
-        return result.distinct()
     }
 
-    private fun normalizePublicRows(body: String): JSONArray {
-        val raw = body.trimStart('\uFEFF').trim()
-        runCatching { JSONArray(raw) }.getOrNull()?.let { return it }
-        val root = runCatching { JSONObject(raw) }.getOrElse {
-            throw IllegalStateException("全校课表接口返回格式异常")
-        }
-        listOf("rows", "data", "list", "result", "records").forEach { key ->
-            root.optJSONArray(key)?.let { return it }
-            val nested = root.optJSONObject(key)
-            listOf("rows", "data", "list", "result", "records").forEach { nestedKey ->
-                nested?.optJSONArray(nestedKey)?.let { return it }
+    private fun streamPublicObject(
+        reader: JsonReader,
+        depth: Int,
+        onCourse: (RemotePublicCourse) -> Unit
+    ): Int {
+        val row = JSONObject()
+        var nestedCount = 0
+        reader.beginObject()
+        while (reader.hasNext()) {
+            val name = reader.nextName()
+            val token = reader.peek()
+            if (name in PUBLIC_SCHEDULE_CONTAINER_KEYS &&
+                (token == JsonToken.BEGIN_ARRAY || token == JsonToken.BEGIN_OBJECT)) {
+                nestedCount += streamPublicValue(reader, depth + 1, onCourse)
+                continue
+            }
+            when (token) {
+                JsonToken.STRING, JsonToken.NUMBER -> row.put(name, reader.nextString())
+                JsonToken.BOOLEAN -> row.put(name, reader.nextBoolean())
+                JsonToken.NULL -> reader.nextNull()
+                else -> reader.skipValue()
             }
         }
-        return JSONArray()
+        reader.endObject()
+        val records = parsePublicCourseRow(row)
+        records.forEach(onCourse)
+        return nestedCount + records.size
+    }
+
+    private fun parsePublicCourseRow(row: JSONObject): List<RemotePublicCourse> {
+        val name = clean(jsonText(row, "kcmc", "kc_mc", "courseName", "course", "name"))
+        if (name.isBlank()) return emptyList()
+        val meetings = parsePublicMeetings(row)
+        if (meetings.isEmpty()) return emptyList()
+        val college = clean(jsonText(row, "dwmc", "college", "yxmc", "skyx"))
+        val grade = normalizeGrade(jsonText(row, "ksnd", "grade", "nj"))
+        val major = clean(jsonText(row, "zymc", "major", "zy"))
+        val className = clean(jsonText(row, "bj", "skbj", "className", "bjmc"))
+        val room = cleanLocation(jsonText(row, "skdd", "jxdd", "room", "location", "jsmc"))
+        val teacher = clean(jsonText(row, "xm", "jsxm", "teacher", "js"))
+            .replace(Regex("\\s*\\[[^]]*\\]"), "")
+        val code = clean(jsonText(row, "kch", "courseCode", "kcdm"))
+        return meetings.map { meeting ->
+            RemotePublicCourse(
+                college, grade, major, className,
+                meeting.day, meeting.startSlot, meeting.slotCount,
+                name, room, teacher, meeting.weeks, code
+            )
+        }
     }
 
     private fun parsePublicMeetings(row: JSONObject): List<RemoteMeeting> {
+        val normalizedDay = jsonText(row, "day").toIntOrNull()
+        val normalizedStart = jsonText(row, "startSlot").toIntOrNull()
+        val normalizedCount = jsonText(row, "slotCount").toIntOrNull()
+        if (normalizedDay != null && normalizedDay in 0..6 &&
+            normalizedStart != null && normalizedStart in 0..9 &&
+            normalizedCount != null && normalizedCount > 0 &&
+            normalizedStart + normalizedCount <= 10) {
+            return listOf(RemoteMeeting(
+                normalizedDay,
+                normalizedStart,
+                normalizedCount,
+                normalizeWeekText(jsonText(row, "weeks", "week", "weekRange"))
+            ))
+        }
         val rawMeeting = jsonText(row, "sksj", "courseTime", "time", "schedule")
         val parsed = parseMeetings(rawMeeting)
         if (parsed.isNotEmpty()) return parsed
@@ -942,6 +1040,35 @@ class SdauCourseRepository {
         referer: String? = null,
         extraHeaders: Map<String, String> = emptyMap()
     ): String {
+        var lastError: IOException? = null
+        repeat(REQUEST_ATTEMPTS) { attempt ->
+            try {
+                return synchronized(COOKIE_HANDLER_LOCK) {
+                    CookieHandler.setDefault(cookies)
+                    executeRequest(path, method, form, referer, extraHeaders)
+                }
+            } catch (error: IOException) {
+                lastError = error
+                if (attempt + 1 < REQUEST_ATTEMPTS) {
+                    try {
+                        Thread.sleep(250L * (attempt + 1))
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        throw error
+                    }
+                }
+            }
+        }
+        throw lastError ?: IOException("教务系统请求失败")
+    }
+
+    private fun executeRequest(
+        path: String,
+        method: String,
+        form: Map<String, String>?,
+        referer: String?,
+        extraHeaders: Map<String, String>
+    ): String {
         val connection = (URL(BASE_URL + path).openConnection() as HttpURLConnection).apply {
             connectTimeout = 30000
             readTimeout = 30000
@@ -963,22 +1090,29 @@ class SdauCourseRepository {
                 setRequestProperty("Referer", "$BASE_URL/")
             }
         }
-        if (form != null) {
-            connection.doOutput = true
-            connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-            val encoded = form.entries.joinToString("&") {
-                URLEncoder.encode(it.key, "UTF-8") + "=" + URLEncoder.encode(it.value, "UTF-8")
+        try {
+            if (form != null) {
+                connection.doOutput = true
+                connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+                val encoded = form.entries.joinToString("&") {
+                    URLEncoder.encode(it.key, "UTF-8") + "=" + URLEncoder.encode(it.value, "UTF-8")
+                }
+                OutputStreamWriter(connection.outputStream, StandardCharsets.UTF_8).use { it.write(encoded) }
             }
-            OutputStreamWriter(connection.outputStream, StandardCharsets.UTF_8).use { it.write(encoded) }
+            val status = connection.responseCode
+            val stream = (if (status >= 400) connection.errorStream else connection.inputStream)
+                ?: throw IOException("教务系统无响应（HTTP $status）")
+            val bytes = stream.use { it.readBytes() }
+            val charset = responseCharset(connection.contentType)
+            val body = bytes.toString(charset)
+            if (status in RETRYABLE_HTTP_STATUSES) {
+                throw IOException("教务系统暂时不可用（HTTP $status）")
+            }
+            if (status !in 200..299) throw IllegalStateException("教务系统返回 HTTP $status")
+            return body
+        } finally {
+            connection.disconnect()
         }
-        val status = connection.responseCode
-        val stream = if (status >= 400) connection.errorStream else connection.inputStream
-        if (stream == null) throw IllegalStateException("教务系统无响应（HTTP $status）")
-        val bytes = stream.use { it.readBytes() }
-        val charset = responseCharset(connection.contentType)
-        val body = bytes.toString(charset)
-        if (status !in 200..299) throw IllegalStateException("教务系统返回 HTTP $status")
-        return body
     }
 
     private fun responseCharset(contentType: String?): Charset {
@@ -1013,6 +1147,10 @@ class SdauCourseRepository {
     private fun splitLines(value: String) = value.replace(Regex("(?i)<br\\s*/?>"), "\n").split('\n').map { clean(it) }.filter { it.isNotEmpty() }
 
     companion object {
+        private val COOKIE_HANDLER_LOCK = Any()
+        private const val REQUEST_ATTEMPTS = 3
+        private val RETRYABLE_HTTP_STATUSES = setOf(408, 425, 429, 500, 502, 503, 504)
+        private val PUBLIC_SCHEDULE_CONTAINER_KEYS = setOf("rows", "data", "list", "result", "records")
         private const val BASE_URL = "https://jw.sdau.edu.cn"
         private const val PUBLIC_SCHEDULE_MIRROR_BASE = "https://gitee.com/sleexy/onlinedata/raw/master"
     }

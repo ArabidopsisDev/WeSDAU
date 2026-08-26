@@ -68,6 +68,8 @@ class CourseWidgetProvider : AppWidgetProvider() {
         private const val KEY_TERM = "term"
         private const val KEY_SCHEDULE_MODE = "schedule_mode"
         private const val KEY_COURSES = "courses_cache"
+        private const val KEY_WIDGET_LAST_NETWORK_REFRESH = "widget_last_network_refresh"
+        private const val WIDGET_NETWORK_REFRESH_INTERVAL = 24L * 60L * 60L * 1000L
         private const val OFFICIAL_TERM = "2026-2027-1"
         private const val OFFICIAL_TERM_START_YEAR = 2026
         private const val OFFICIAL_TERM_START_MONTH = Calendar.SEPTEMBER
@@ -175,6 +177,7 @@ class CourseWidgetProvider : AppWidgetProvider() {
                 })
             }
             preferences.edit().putString(KEY_COURSES, rows.toString()).apply()
+            CourseReminderScheduler.scheduleNext(context)
             return true
         }
 
@@ -390,11 +393,23 @@ class CourseWidgetProvider : AppWidgetProvider() {
 
         internal fun scheduleNetworkRefresh(context: Context) {
             val scheduler = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
+            val preferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val lastRefresh = preferences.getLong(KEY_WIDGET_LAST_NETWORK_REFRESH, 0L)
+            val refreshAge = System.currentTimeMillis() - lastRefresh
+            if (refreshAge in 0 until WIDGET_NETWORK_REFRESH_INTERVAL) return
+            if (scheduler.getPendingJob(WIDGET_REFRESH_JOB_ID) != null) return
             val job = JobInfo.Builder(WIDGET_REFRESH_JOB_ID, ComponentName(context, CourseWidgetRefreshJobService::class.java))
                 .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
                 .setOverrideDeadline(0L)
+                .setBackoffCriteria(60L * 60L * 1000L, JobInfo.BACKOFF_POLICY_EXPONENTIAL)
                 .build()
             scheduler.schedule(job)
+        }
+
+        internal fun recordNetworkRefreshAttempt(context: Context) {
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                .putLong(KEY_WIDGET_LAST_NETWORK_REFRESH, System.currentTimeMillis())
+                .apply()
         }
     }
 }
@@ -432,14 +447,57 @@ class CompactCourseWidgetProvider : AppWidgetProvider() {
 }
 
 class CourseWidgetRefreshJobService : JobService() {
+    private val workerLock = Any()
+    private var worker: Thread? = null
+    private var activeParams: JobParameters? = null
+
     override fun onStartJob(params: JobParameters): Boolean {
-        thread(name = "course-widget-refresh") {
-            runCatching { CourseWidgetProvider.refreshCourseCache(applicationContext) }
-            CourseWidgetProvider.updateAll(applicationContext)
-            jobFinished(params, false)
+        val refreshThread = thread(name = "course-widget-refresh", start = false) {
+            val result = runCatching { CourseWidgetProvider.refreshCourseCache(applicationContext) }
+            val isStillActive = synchronized(workerLock) {
+                activeParams === params && worker === Thread.currentThread()
+            }
+            if (isStillActive && !Thread.currentThread().isInterrupted && result.isSuccess) {
+                CourseWidgetProvider.recordNetworkRefreshAttempt(applicationContext)
+                CourseWidgetProvider.updateAll(applicationContext)
+            }
+            val shouldFinish = synchronized(workerLock) {
+                if (activeParams === params && worker === Thread.currentThread()) {
+                    activeParams = null
+                    worker = null
+                    true
+                } else {
+                    false
+                }
+            }
+            if (shouldFinish) jobFinished(params, result.isFailure)
+        }
+        synchronized(workerLock) {
+            worker?.interrupt()
+            activeParams = params
+            worker = refreshThread
+        }
+        refreshThread.start()
+        return true
+    }
+
+    override fun onStopJob(params: JobParameters): Boolean {
+        synchronized(workerLock) {
+            if (activeParams === params) {
+                activeParams = null
+                worker?.interrupt()
+                worker = null
+            }
         }
         return true
     }
 
-    override fun onStopJob(params: JobParameters): Boolean = true
+    override fun onDestroy() {
+        synchronized(workerLock) {
+            activeParams = null
+            worker?.interrupt()
+            worker = null
+        }
+        super.onDestroy()
+    }
 }

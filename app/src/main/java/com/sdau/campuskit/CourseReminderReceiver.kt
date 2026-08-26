@@ -1,5 +1,6 @@
 package com.sdau.campuskit
 
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -8,6 +9,8 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import org.json.JSONArray
+import java.util.Calendar
 
 object CourseNotification {
     const val CHANNEL_ID = "course_reminders"
@@ -74,7 +77,11 @@ class CourseReminderReceiver : BroadcastReceiver() {
         val name = intent.getStringExtra(EXTRA_NAME) ?: return
         val room = intent.getStringExtra(EXTRA_ROOM) ?: ""
         val time = intent.getStringExtra(EXTRA_TIME) ?: ""
-        CourseNotification.show(context, name, room, time)
+        try {
+            CourseNotification.show(context, name, room, time)
+        } finally {
+            CourseReminderScheduler.scheduleNext(context)
+        }
     }
 
     companion object {
@@ -82,4 +89,203 @@ class CourseReminderReceiver : BroadcastReceiver() {
         const val EXTRA_ROOM = "course_room"
         const val EXTRA_TIME = "course_time"
     }
+}
+
+class CourseReminderRestoreReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        CourseReminderScheduler.scheduleNext(context)
+    }
+}
+
+private data class ReminderCourse(
+    val day: Int,
+    val startSlot: Int,
+    val slotCount: Int,
+    val name: String,
+    val room: String,
+    val weeks: String
+)
+
+object CourseReminderScheduler {
+    private const val PREFS_NAME = "offline_login"
+    private const val KEY_COURSES = "courses_cache"
+    private const val KEY_PUSH_ENABLED = "push_enabled"
+    private const val KEY_TERM = "term"
+    private const val KEY_SCHEDULE_MODE = "schedule_mode"
+    private const val REMINDER_REQUEST_CODE = 3002
+    private const val OFFICIAL_TERM = "2026-2027-1"
+    private const val OFFICIAL_TERM_START_YEAR = 2026
+    private const val OFFICIAL_TERM_START_MONTH = Calendar.SEPTEMBER
+    private const val OFFICIAL_TERM_START_DAY = 7
+    private const val MINIMUM_LEAD_TIME = 5_000L
+
+    fun scheduleNext(context: Context) {
+        val applicationContext = context.applicationContext
+        val preferences = applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        if (!preferences.getBoolean(KEY_PUSH_ENABLED, false)) {
+            cancel(applicationContext)
+            return
+        }
+        val courses = loadCourses(preferences.getString(KEY_COURSES, null))
+        val term = preferences.getString(KEY_TERM, OFFICIAL_TERM).orEmpty().ifBlank { OFFICIAL_TERM }
+        val scheduleMode = preferences.getString(KEY_SCHEDULE_MODE, "SPRING").orEmpty()
+        val next = findNextReminder(courses, term, scheduleMode, Calendar.getInstance())
+        cancel(applicationContext)
+        if (next == null) return
+
+        val pending = PendingIntent.getBroadcast(
+            applicationContext,
+            REMINDER_REQUEST_CODE,
+            Intent(applicationContext, CourseReminderReceiver::class.java).apply {
+                putExtra(CourseReminderReceiver.EXTRA_NAME, next.course.name)
+                putExtra(CourseReminderReceiver.EXTRA_ROOM, next.course.room)
+                putExtra(CourseReminderReceiver.EXTRA_TIME, next.timeLabel)
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val alarm = applicationContext.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        alarm.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, next.triggerAt, pending)
+    }
+
+    fun cancel(context: Context) {
+        val applicationContext = context.applicationContext
+        val pending = PendingIntent.getBroadcast(
+            applicationContext,
+            REMINDER_REQUEST_CODE,
+            Intent(applicationContext, CourseReminderReceiver::class.java),
+            PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE
+        ) ?: return
+        val alarm = applicationContext.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        alarm.cancel(pending)
+        pending.cancel()
+    }
+
+    private data class NextReminder(
+        val course: ReminderCourse,
+        val triggerAt: Long,
+        val timeLabel: String
+    )
+
+    private fun findNextReminder(
+        courses: List<ReminderCourse>,
+        term: String,
+        scheduleMode: String,
+        now: Calendar
+    ): NextReminder? {
+        if (courses.isEmpty()) return null
+        val termStart = termStartDate(term)
+        val today = dayStart(now)
+        val currentWeek = weekForDate(today, termStart)
+        val todayIndex = weekdayIndex(today)
+        val todayHasCourses = courses.any {
+            it.day == todayIndex && courseVisibleInWeek(it, currentWeek)
+        }
+        val starts = if (scheduleMode == "SUMMER") SUMMER_START_MINUTES else SPRING_START_MINUTES
+
+        for (dayOffset in 0..147) {
+            val date = (today.clone() as Calendar).apply { add(Calendar.DAY_OF_MONTH, dayOffset) }
+            val week = weekForDate(date, termStart)
+            if (week !in 1..20) continue
+            val dayCourses = courses
+                .filter { it.day == weekdayIndex(date) && courseVisibleInWeek(it, week) }
+                .sortedBy { it.startSlot }
+            dayCourses.forEachIndexed { index, course ->
+                if (course.startSlot !in starts.indices || course.slotCount <= 0) return@forEachIndexed
+                val start = (date.clone() as Calendar).apply {
+                    set(Calendar.HOUR_OF_DAY, starts[course.startSlot] / 60)
+                    set(Calendar.MINUTE, starts[course.startSlot] % 60)
+                    set(Calendar.SECOND, 0)
+                    set(Calendar.MILLISECOND, 0)
+                }
+                var triggerAt = start.timeInMillis - if (index == 0) 30L * 60_000L else 20L * 60_000L
+                if (dayOffset == 1 && !todayHasCourses && index == 0) {
+                    val previousNight = (start.clone() as Calendar).apply {
+                        add(Calendar.DAY_OF_MONTH, -1)
+                        set(Calendar.HOUR_OF_DAY, 22)
+                        set(Calendar.MINUTE, 0)
+                        set(Calendar.SECOND, 0)
+                        set(Calendar.MILLISECOND, 0)
+                    }.timeInMillis
+                    triggerAt = previousNight
+                }
+                if (triggerAt > now.timeInMillis + MINIMUM_LEAD_TIME) {
+                    val lastSlot = (course.startSlot + course.slotCount - 1).coerceIn(course.startSlot, starts.lastIndex)
+                    return NextReminder(
+                        course,
+                        triggerAt,
+                        "${formatMinutes(starts[course.startSlot])}-${formatMinutes(starts[lastSlot] + 45)}"
+                    )
+                }
+            }
+        }
+        return null
+    }
+
+    private fun loadCourses(raw: String?): List<ReminderCourse> = runCatching {
+        val rows = JSONArray(raw ?: return emptyList())
+        buildList {
+            for (index in 0 until rows.length()) {
+                val row = rows.optJSONObject(index) ?: continue
+                add(ReminderCourse(
+                    day = row.optInt("day", -1),
+                    startSlot = row.optInt("startSlot", -1),
+                    slotCount = row.optInt("slotCount", 0),
+                    name = row.optString("name"),
+                    room = row.optString("room"),
+                    weeks = row.optString("weeks")
+                ))
+            }
+        }.filter { it.day in 0..6 && it.name.isNotBlank() }
+    }.getOrDefault(emptyList())
+
+    private fun courseVisibleInWeek(course: ReminderCourse, week: Int): Boolean {
+        if (week <= 0) return false
+        val normalized = course.weeks.replace("周", "").replace("—", "-").replace("至", "-")
+        val ranges = Regex("(\\d+)(?:\\s*-\\s*(\\d+))?").findAll(normalized).toList()
+        if (ranges.isEmpty()) return true
+        return ranges.any { match ->
+            val first = match.groupValues[1].toIntOrNull() ?: return@any false
+            val last = match.groupValues[2].toIntOrNull() ?: first
+            week in first.coerceAtLeast(1)..last
+        }
+    }
+
+    private fun termStartDate(term: String): Calendar = Calendar.getInstance().apply {
+        when (term) {
+            OFFICIAL_TERM -> set(
+                OFFICIAL_TERM_START_YEAR,
+                OFFICIAL_TERM_START_MONTH,
+                OFFICIAL_TERM_START_DAY,
+                0, 0, 0
+            )
+            "2026-2027-2" -> set(2027, Calendar.FEBRUARY, 22, 0, 0, 0)
+            else -> {
+                val parts = term.split("-")
+                val year = parts.firstOrNull()?.toIntOrNull() ?: get(Calendar.YEAR)
+                if (parts.getOrNull(2) == "2") set(year + 1, Calendar.FEBRUARY, 1, 0, 0, 0)
+                else set(year, Calendar.SEPTEMBER, 1, 0, 0, 0)
+                while (get(Calendar.DAY_OF_WEEK) != Calendar.MONDAY) add(Calendar.DAY_OF_MONTH, 1)
+            }
+        }
+        set(Calendar.MILLISECOND, 0)
+    }
+
+    private fun weekForDate(date: Calendar, start: Calendar): Int {
+        val days = ((dayStart(date).timeInMillis - dayStart(start).timeInMillis) / 86_400_000L).toInt()
+        return if (days < 0) 0 else days / 7 + 1
+    }
+
+    private fun dayStart(value: Calendar): Calendar = (value.clone() as Calendar).apply {
+        set(Calendar.HOUR_OF_DAY, 0)
+        set(Calendar.MINUTE, 0)
+        set(Calendar.SECOND, 0)
+        set(Calendar.MILLISECOND, 0)
+    }
+
+    private fun weekdayIndex(value: Calendar): Int = (value.get(Calendar.DAY_OF_WEEK) + 5) % 7
+
+    private fun formatMinutes(minutes: Int): String = "%d:%02d".format(minutes / 60, minutes % 60)
+
+    private val SPRING_START_MINUTES = intArrayOf(480, 535, 600, 655, 840, 895, 960, 1015, 1140, 1195)
+    private val SUMMER_START_MINUTES = intArrayOf(480, 535, 600, 655, 870, 925, 990, 1045, 1170, 1225)
 }
