@@ -348,24 +348,28 @@ class MainActivity : android.app.Activity() {
     private fun downloadLatestApk(
         apkUrl: String,
         remoteVersion: Int,
-        installExisting: Boolean = false,
+        remoteVersionName: String = "",
         notifyStarted: Boolean = false
     ) {
         try {
-            val existing = File(
-                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-                UPDATE_FILE_NAME
-            )
-            if (installExisting && existing.isFile && existing.length() > 0L) {
-                installDownloadedApk(existing)
+            val fileName = updateApkFileName(remoteVersion, remoteVersionName)
+            val existing = findDownloadedUpdateApk(remoteVersion, fileName)
+            if (existing != null && installDownloadedApk(existing)) {
                 return
+            }
+            val destination = File(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                fileName
+            )
+            if (destination.exists() && !isExpectedUpdateApk(destination, remoteVersion)) {
+                destination.delete()
             }
             val request = DownloadManager.Request(Uri.parse(apkUrl)).apply {
                 setTitle("WeSDAU课程表更新")
                 setDescription("正在下载最新安装包")
                 setMimeType("application/vnd.android.package-archive")
                 setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, UPDATE_FILE_NAME)
+                setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
                 setAllowedOverMetered(true)
                 setAllowedOverRoaming(true)
             }
@@ -379,6 +383,59 @@ class MainActivity : android.app.Activity() {
         } catch (error: Exception) {
             // 下次启动时继续检查并重试。
         }
+    }
+
+    private fun updateApkFileName(remoteVersion: Int, remoteVersionName: String): String {
+        val versionLabel = remoteVersionName.trim()
+            .removePrefix("V")
+            .removePrefix("v")
+            .replace(Regex("[^A-Za-z0-9._-]"), "_")
+            .ifBlank { remoteVersion.toString() }
+        return "WeSDAU课程表_V$versionLabel.apk"
+    }
+
+    private fun findDownloadedUpdateApk(remoteVersion: Int, expectedFileName: String): File? {
+        val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        return listOf(
+            File(downloads, expectedFileName),
+            File(downloads, UPDATE_FILE_NAME)
+        ).distinctBy(File::getAbsolutePath).firstOrNull { candidate ->
+            candidate.isFile && candidate.length() > 0L &&
+                isExpectedUpdateApk(candidate, remoteVersion)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun isExpectedUpdateApk(file: File, remoteVersion: Int): Boolean {
+        return runCatching {
+            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                PackageManager.GET_SIGNING_CERTIFICATES
+            } else {
+                PackageManager.GET_SIGNATURES
+            }
+            val archive = packageManager.getPackageArchiveInfo(file.absolutePath, flags)
+                ?: return@runCatching false
+            if (archive.packageName != packageName) return@runCatching false
+            val archiveVersion = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                archive.longVersionCode.toInt()
+            } else {
+                archive.versionCode
+            }
+            if (archiveVersion != remoteVersion) return@runCatching false
+
+            val installed = packageManager.getPackageInfo(packageName, flags)
+            val archiveSignatures = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                archive.signingInfo?.apkContentsSigners?.map { it.toCharsString() }.orEmpty()
+            } else {
+                archive.signatures?.map { it.toCharsString() }.orEmpty()
+            }
+            val installedSignatures = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                installed.signingInfo?.apkContentsSigners?.map { it.toCharsString() }.orEmpty()
+            } else {
+                installed.signatures?.map { it.toCharsString() }.orEmpty()
+            }
+            archiveSignatures.isNotEmpty() && archiveSignatures.toSet() == installedSignatures.toSet()
+        }.getOrDefault(false)
     }
 
     private fun registerUpdateDownloadReceiver() {
@@ -411,23 +468,26 @@ class MainActivity : android.app.Activity() {
         return false
     }
 
-    private fun installDownloadedApk(file: File) {
-        try {
+    private fun installDownloadedApk(file: File): Boolean {
+        return try {
             val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
             installDownloadedApk(uri)
         } catch (error: Exception) {
             Toast.makeText(this, "无法打开安装包：${error.message ?: "请手动在下载目录安装"}", Toast.LENGTH_LONG).show()
+            false
         }
     }
 
-    private fun installDownloadedApk(uri: Uri) {
-        try {
+    private fun installDownloadedApk(uri: Uri): Boolean {
+        return try {
             startActivity(Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(uri, "application/vnd.android.package-archive")
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
             })
+            true
         } catch (error: Exception) {
             Toast.makeText(this, "无法打开安装包：${error.message ?: "请手动安装"}", Toast.LENGTH_LONG).show()
+            false
         }
     }
 
@@ -512,7 +572,7 @@ class MainActivity : android.app.Activity() {
                     isEnabled = false
                     text = "正在下载…"
                 }
-                downloadLatestApk(update.url, update.code, installExisting = !update.forceUpdate)
+                downloadLatestApk(update.url, update.code, update.name)
                 if (!update.forceUpdate) hideUpdateDialog()
             }
         }
@@ -3437,7 +3497,9 @@ class MainActivity : android.app.Activity() {
             )
         }
 
-        val visibleCourses = if (includeAllWeeks) courses else courses.filter { courseVisibleInWeek(it, week) }
+        val visibleCourses = if (includeAllWeeks) courses else courses.filter {
+            courseVisibleOnScheduleDate(it, term, week)
+        }
         buildExportCoursePlacements(visibleCourses).forEach { placement ->
             val course = placement.course
             val start = course.startSlot / 2f
@@ -3820,8 +3882,12 @@ class MainActivity : android.app.Activity() {
         val minute = now.get(Calendar.HOUR_OF_DAY) * 60 + now.get(Calendar.MINUTE)
         val starts = currentStartMinutes()
         val next = courses.filter { courseVisibleInWeek(it, actualWeek) }
-            .map { course ->
+            .mapNotNull { course ->
                 val dayDelta = (course.day - today + 7) % 7
+                val courseDate = (now.clone() as Calendar).apply {
+                    add(Calendar.DAY_OF_MONTH, dayDelta)
+                }
+                if (CampusHolidayCalendar.isHoliday(courseDate)) return@mapNotNull null
                 Triple(dayDelta, starts[course.startSlot], course)
             }
             .filter { it.first > 0 || it.second > minute }
@@ -3848,6 +3914,14 @@ class MainActivity : android.app.Activity() {
             val end = match.groupValues[2].toIntOrNull() ?: start
             week in start.coerceAtLeast(1)..end
         }
+    }
+
+    private fun courseVisibleOnScheduleDate(course: Course, term: String, week: Int): Boolean {
+        if (!courseVisibleInWeek(course, week)) return false
+        val courseDate = termStartDate(term).apply {
+            add(Calendar.DAY_OF_MONTH, (week - 1) * 7 + course.day)
+        }
+        return !CampusHolidayCalendar.isHoliday(courseDate)
     }
 
     private fun changeWeek(delta: Int, swipeDirection: Int = 0) {
@@ -6146,7 +6220,9 @@ class MainActivity : android.app.Activity() {
             canvas.translate(offset, 0f)
             canvas.clipRect(0f, 0f, desiredWidth.toFloat(), desiredHeight.toFloat())
             drawHeaders(canvas, week); drawTimes(canvas)
-            val visibleCourses = courses.filter { courseVisibleInWeek(it, week) }
+            val visibleCourses = courses.filter {
+                courseVisibleOnScheduleDate(it, activeScheduleTerm(), week)
+            }
             val placements = buildCoursePlacements(visibleCourses)
             val hasVisibleCourse = placements.isNotEmpty()
             placements.forEach { placement ->
@@ -6603,7 +6679,9 @@ class MainActivity : android.app.Activity() {
 
         private fun findCourseAt(x: Float, y: Float): Course? {
             if (y < headerHeight) return null
-            return buildCoursePlacements(courses.filter { courseVisibleInWeek(it, weekIndex) })
+            return buildCoursePlacements(courses.filter {
+                courseVisibleOnScheduleDate(it, activeScheduleTerm(), weekIndex)
+            })
                 .firstOrNull { placement ->
                 val course = placement.course
                 val dayLeft = timeColumnWidth + course.day * dayColumnWidth

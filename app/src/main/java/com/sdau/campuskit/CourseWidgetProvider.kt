@@ -268,6 +268,7 @@ class CourseWidgetProvider : AppWidgetProvider() {
             val ranges = timeRanges(context)
             if (weekForDate(now, termStart) <= 0) {
                 val openingDay = dayStart(termStart)
+                if (CampusHolidayCalendar.isHoliday(openingDay)) return emptyList()
                 val weekday = (openingDay.get(Calendar.DAY_OF_WEEK) + 5) % 7
                 return courses.asSequence()
                     .filter { it.day == weekday && courseVisibleInWeek(it, 1) }
@@ -293,6 +294,7 @@ class CourseWidgetProvider : AppWidgetProvider() {
             val result = mutableListOf<CourseOccurrence>()
             for (dayOffset in 0..14) {
                 val date = (today.clone() as Calendar).apply { add(Calendar.DAY_OF_MONTH, dayOffset) }
+                if (CampusHolidayCalendar.isHoliday(date)) continue
                 val week = weekForDate(date, termStart)
                 if (week !in 1..20) continue
                 val weekday = (date.get(Calendar.DAY_OF_WEEK) + 5) % 7

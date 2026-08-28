@@ -177,13 +177,14 @@ object CourseReminderScheduler {
         val today = dayStart(now)
         val currentWeek = weekForDate(today, termStart)
         val todayIndex = weekdayIndex(today)
-        val todayHasCourses = courses.any {
+        val todayHasCourses = !CampusHolidayCalendar.isHoliday(today) && courses.any {
             it.day == todayIndex && courseVisibleInWeek(it, currentWeek)
         }
         val starts = if (scheduleMode == "SUMMER") SUMMER_START_MINUTES else SPRING_START_MINUTES
 
         for (dayOffset in 0..147) {
             val date = (today.clone() as Calendar).apply { add(Calendar.DAY_OF_MONTH, dayOffset) }
+            if (CampusHolidayCalendar.isHoliday(date)) continue
             val week = weekForDate(date, termStart)
             if (week !in 1..20) continue
             val dayCourses = courses
