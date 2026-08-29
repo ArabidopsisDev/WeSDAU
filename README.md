@@ -10,9 +10,9 @@
 
 <br />
 
-<img src="docs/images/readme-hero-liquidglass-v034.png" alt="SDAU CampusKit 新版界面艺术展示" width="100%" />
+<img src="docs/images/readme-hero-liquidglass-v034.png" alt="WeSDAU 新版界面艺术展示" width="100%" />
 
-<sub>画面中的应用界面均来自 WeSDAU 0.3.4 实机截图</sub>
+<sub>画面中的应用界面均来自 WeSDAU V0.3.4 实机截图</sub>
 
 </div>
 
@@ -20,7 +20,7 @@
 
 WeSDAU课程表 是一款面向山东农业大学学生的 Android 校园工具。登录教务系统后，可以集中查看个人课表、考试安排、成绩和空教室，也可以查询任意学院与班级的课表。
 
-应用支持本地缓存、课程提醒、桌面组件、课表与成绩单导出，并提供可跟随自定义背景实时取色、模糊与折射的 LiquidGlass 界面。
+应用支持本地缓存、课程提醒、桌面组件、课表与成绩单导出，并提供可跟随自定义背景实时取色、模糊与折射的 LiquidGlass（液态玻璃） 界面。
 
 ## 核心功能
 
@@ -82,8 +82,8 @@ WeSDAU课程表 是一款面向山东农业大学学生的 Android 校园工具�
 
 <table>
   <tr>
-    <td width="50%" align="center"><img src="docs/images/export-class-schedule.png" alt="班级课表 PNG" width="100%" /></td>
-    <td width="50%" align="center"><img src="docs/images/export-transcript.png" alt="成绩单 PNG" width="100%" /></td>
+    <td width="50%" align="center"><img src="docs/images/export-class-schedule.png" alt="班级课表" width="100%" /></td>
+    <td width="50%" align="center"><img src="docs/images/export-transcript.png" alt="成绩单" width="100%" /></td>
   </tr>
   <tr>
     <td align="center"><strong>班级课表</strong></td>
@@ -116,7 +116,6 @@ WeSDAU课程表 是一款面向山东农业大学学生的 Android 校园工具�
 | --- | --- |
 | 当前版本 | `0.3.4`（Version Code 8） |
 | 最低系统 | Android 8.0（API 26） |
-| 目标系统 | Android 14（API 34） |
 | 开发语言 | Kotlin |
 
 <details>
