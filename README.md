@@ -12,7 +12,7 @@
 
 <img src="docs/images/readme-hero-liquidglass-v034.png" alt="SDAU CampusKit 新版界面艺术展示" width="100%" />
 
-<sub>画面中的应用界面均来自 WeSDAU 0.3.4 实机比例截图</sub>
+<sub>画面中的应用界面均来自 WeSDAU 0.3.4 实机截图</sub>
 
 </div>
 
