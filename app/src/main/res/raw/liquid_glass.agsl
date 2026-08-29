@@ -1,0 +1,63 @@
+// Liquid Glass shader for navigation bar
+// Dramatic self-contained glass effect — no background image needed
+uniform float3 iResolution;      // viewport (w,h,_)
+uniform float4 iGesture;         // touch position (pixels)
+uniform float4 uSize;            // x: intensity multiplier
+
+float2 toUV(float2 frag) { return frag / iResolution.xy; }
+
+half4 main(vec2 fragCoord) {
+    float2 res = iResolution.xy;
+    float2 uv = toUV(fragCoord);
+    float2 m2 = uv - iGesture.xy / res;
+    float intensity = clamp(uSize.x, 0.1, 5.0);
+
+    // Normalised distance from gesture center
+    float aspect = res.x / res.y;
+    float2 scaled = float2(m2.x * aspect, m2.y);
+    float dist = length(scaled) / intensity;
+
+    // ---------- glass body gradient ----------
+    // Deep cool-blue at center → bright near edges
+    float g = exp(-dist * dist * 6.0);
+    float edge = 1.0 - exp(-dist * dist * 3.0);
+
+    // Core blue tint (substantial — clearly visible)
+    half3 base = half3(0.78, 0.84, 0.96);   // soft blue-gray
+    base = mix(base, half3(0.65, 0.74, 0.92), g * 0.4);  // deeper blue center
+    base = mix(base, half3(0.96, 0.97, 1.0), edge * 0.35);  // bright edges
+
+    // ---------- top-left highlight (light source) ----------
+    float2 lightDir = normalize(float2(-0.45, -0.6));
+    float light = clamp(dot(normalize(scaled), lightDir) * 0.5 + 0.5, 0.0, 1.0);
+    light = pow(light, 1.8) * edge;
+    base += half3(light * 0.35, light * 0.37, light * 0.42);
+
+    // ---------- bottom-right subtle shadow ----------
+    float2 shadowDir = normalize(float2(0.5, 0.7));
+    float shadow = clamp(dot(normalize(scaled), shadowDir) * 0.5 + 0.5, 0.0, 1.0);
+    shadow = pow(shadow, 2.0) * edge * 0.5;
+    base -= half3(shadow * 0.06, shadow * 0.04, shadow * 0.02);
+
+    // ---------- caustic ripples (light through glass) ----------
+    float caustic1 = sin(uv.x * 90.0 + uv.y * 55.0 + dist * 12.0) * 0.5 + 0.5;
+    float caustic2 = sin(uv.x * 70.0 - uv.y * 80.0 - dist * 10.0) * 0.5 + 0.5;
+    float caustic = (caustic1 * caustic2) * edge * 0.12;
+    base += half3(caustic * 0.6, caustic * 0.8, caustic);
+
+    // ---------- specular hot-spot ----------
+    float spec = exp(-dist * dist * 20.0) * 0.5;
+    base += half3(spec, spec, spec + 0.03);
+
+    // ---------- edge bright line (top) ----------
+    float topEdge = smoothstep(0.02, 0.0, uv.y) * 0.5;
+    base += half3(topEdge, topEdge, topEdge + 0.05);
+
+    // ---------- inner glow (center) ----------
+    float innerGlow = g * 0.15;
+    base += half3(innerGlow * 0.4, innerGlow * 0.5, innerGlow * 0.8);
+
+    // Final clamp to [0,1]
+    base = clamp(base, 0.0, 1.0);
+    return half4(base, 1.0);
+}

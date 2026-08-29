@@ -2,7 +2,7 @@ import java.util.Properties
 
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 val keystorePropertiesFile = rootProject.file("keystore.properties")
@@ -14,15 +14,16 @@ val keystoreProperties = Properties().apply {
 
 android {
     namespace = "com.sdau.campuskit"
-    compileSdk = 34
+    compileSdkPreview = "CANARY"
+    buildToolsVersion = "37.0.0"
 
     defaultConfig {
         applicationId = "com.sdau.campuskit"
         minSdk = 26
         targetSdk = 34
-        versionCode = 7
-        versionName = "0.3.3"
-        resourceConfigurations += setOf("zh", "en")
+        versionCode = 8
+        versionName = "0.3.4"
+        androidResources.localeFilters += arrayOf("zh", "en")
     }
 
     signingConfigs {
@@ -53,16 +54,32 @@ android {
     }
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
+        sourceCompatibility = JavaVersion.VERSION_11
+        targetCompatibility = JavaVersion.VERSION_11
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
+    buildFeatures {
+        compose = true
+    }
+
+}
+
+androidComponents {
+    onVariants(selector().withBuildType("release")) { variant ->
+        variant.outputs.forEach { output ->
+            output.outputFileName.set(
+                output.versionName.map { versionName -> "CampusKit_V$versionName.apk" }
+            )
+        }
     }
 }
 
 dependencies {
     implementation("com.google.android.material:material:1.12.0")
     implementation("androidx.core:core-ktx:1.13.0")
+    implementation("androidx.activity:activity-compose:1.13.0")
+    implementation("org.jetbrains.compose.foundation:foundation:1.12.0")
+    implementation("org.jetbrains.compose.ui:ui:1.12.0")
+    implementation("io.github.kyant0:backdrop:2.0.1")
+    implementation("io.github.kyant0:shapes:1.2.1")
 }

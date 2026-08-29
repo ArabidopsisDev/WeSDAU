@@ -15,6 +15,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
+import android.graphics.Rect
 import android.graphics.RenderNode
 import android.graphics.LinearGradient
 import android.graphics.Matrix
@@ -22,6 +23,9 @@ import android.graphics.Path
 import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.ImageDecoder
+import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.LayerDrawable
@@ -30,10 +34,13 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.PowerManager
+import android.os.Handler
+import android.os.Looper
 import android.text.InputType
 import android.util.JsonWriter
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.PixelCopy
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
@@ -54,10 +61,14 @@ import android.widget.ScrollView
 import android.widget.Space
 import android.widget.TextView
 import android.widget.Toast
-import android.widget.PopupWindow
 import android.widget.ProgressBar
+import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
 import com.google.android.material.textfield.TextInputEditText
@@ -80,9 +91,10 @@ import java.util.concurrent.Executors
 import java.nio.charset.StandardCharsets
 import java.net.HttpURLConnection
 import java.net.URL
+import kotlin.math.abs
 import kotlin.math.min
 
-class MainActivity : android.app.Activity() {
+class MainActivity : ComponentActivity() {
     private class EmptyRoomPriorityScrollView(context: Context) : ScrollView(context) {
         private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
         private val density = resources.displayMetrics.density
@@ -178,11 +190,12 @@ class MainActivity : android.app.Activity() {
     private lateinit var publicGradeInput: MaterialAutoCompleteTextView
     private lateinit var publicMajorInput: MaterialAutoCompleteTextView
     private lateinit var publicClassInput: MaterialAutoCompleteTextView
-    private var loginButton: MaterialButton? = null
+    private var loginButton: LiquidTintedActionButtonView? = null
     private var loginStatus: TextView? = null
     private var scheduleDate: TextView? = null
     private var scheduleWeek: TextView? = null
     private var scheduleGrid: ScheduleGridView? = null
+    private var currentPageBackgroundBitmap: Bitmap? = null
     private var mainSectionHost: FrameLayout? = null
     private var currentMainSection = 0
     private var mainSectionTransitionGeneration = 0
@@ -195,9 +208,13 @@ class MainActivity : android.app.Activity() {
     private var emptyRoomFilterOverlay: View? = null
     private var publicOptionOverlay: View? = null
     private var shareOverlay: View? = null
+    private var actionMenuOverlay: LiquidActionMenuView? = null
     private var updateOverlay: View? = null
     private var forceUpdateActive = false
-    private var updateActionButton: MaterialButton? = null
+    private var updateDialogView: LiquidUpdateDialogView? = null
+    private var updateDialogCapturePending = false
+    private var pickerDialogCapturePending = false
+    private var actionMenuCapturePending = false
     private var updateDownloadId: Long? = null
     private var updateDownloadReceiverRegistered = false
     private val updateDownloadReceiver = object : BroadcastReceiver() {
@@ -220,10 +237,7 @@ class MainActivity : android.app.Activity() {
                 if (uri != null) {
                     installDownloadedApk(uri)
                 } else {
-                    updateActionButton?.apply {
-                        isEnabled = true
-                        text = "立即更新"
-                    }
+                    updateDialogView?.setDownloading(false)
                     Toast.makeText(this@MainActivity, "更新包下载失败，请重试", Toast.LENGTH_LONG).show()
                 }
             }
@@ -232,7 +246,7 @@ class MainActivity : android.app.Activity() {
     private var pendingTestNotification = false
     private var pendingPushEnable = false
     private var pushButton: ImageButton? = null
-    private var bottomNavigation: LiquidGlassNavigationView? = null
+    private var bottomNavigation: View? = null
     private var scoresLoading = false
     private var scoreExporting = false
     private var scheduleExporting = false
@@ -259,6 +273,9 @@ class MainActivity : android.app.Activity() {
     private val networkExecutor = Executors.newSingleThreadExecutor()
     private val publicSyncExecutor = Executors.newSingleThreadExecutor()
     private val updateExecutor = Executors.newSingleThreadExecutor()
+    private val backgroundPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let(::saveCustomBackground)
+    }
     @Suppress("DEPRECATION")
     private val currentVersionCode: Int by lazy {
         packageManager.getPackageInfo(packageName, 0).let { info ->
@@ -492,117 +509,91 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun showUpdateDialog(update: RemoteUpdate) {
-        if (updateOverlay != null) return
+        if (updateOverlay != null || updateDialogCapturePending) return
         pendingApkUrl = update.url
         forceUpdateActive = update.forceUpdate
-        val overlay = FrameLayout(this).apply {
-            setBackgroundColor(Color.argb(142, 15, 21, 36))
-            isClickable = true
-            if (!update.forceUpdate) setOnClickListener { hideUpdateDialog() }
-        }
-        val card = surfaceCard(dp(26f).toFloat()).apply {
-            cardElevation = dp(5).toFloat()
-            strokeWidth = 0
-            setCardBackgroundColor(Color.rgb(249, 251, 255))
-            setOnClickListener { }
-        }
-        val body = verticalLayout().apply { setPadding(dp(21), dp(20), dp(21), dp(18)) }
         val versionName = update.name.ifBlank { "V${update.code}" }
         val changelogText = update.changelog.ifBlank { "本次更新包含体验优化与问题修复。" }
-        val measurePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            textSize = 15f * resources.displayMetrics.density * resources.configuration.fontScale
-            typeface = Typeface.DEFAULT
-        }
-        val longestTextWidth = (changelogText.lines() + versionName + "发现新版本")
-            .maxOfOrNull { measurePaint.measureText(it) }
-            ?: 0f
-        val maximumDialogWidth = minOf(dp(330), resources.displayMetrics.widthPixels - dp(32))
-        val minimumDialogWidth = minOf(dp(268), maximumDialogWidth)
-        val dialogWidth = (longestTextWidth + dp(50)).toInt().coerceIn(minimumDialogWidth, maximumDialogWidth)
-        val availableLogWidth = (dialogWidth - dp(48)).coerceAtLeast(dp(160))
-        val estimatedLogLines = changelogText.lines().sumOf { line ->
-            kotlin.math.ceil(measurePaint.measureText(line).coerceAtLeast(1f) / availableLogWidth).toInt().coerceAtLeast(1)
-        }
-        val changelogHeight = (estimatedLogLines * dp(27) + dp(8)).coerceIn(dp(82), dp(220))
-        body.addView(text("发现新版本", 23f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(7)))
-        body.addView(text(versionName, 13f, PRIMARY_DARK, Typeface.BOLD), spacedParams(dp(18)))
-        body.addView(text("更新内容", 13f, TEXT_SECONDARY, Typeface.BOLD), spacedParams(dp(9)))
-
-        val changelogScroll = ScrollView(this).apply {
-            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
-            isVerticalScrollBarEnabled = true
-            setBackgroundColor(Color.TRANSPARENT)
-        }
-        changelogScroll.addView(text(
-            changelogText,
-            15f, TEXT_PRIMARY, Typeface.NORMAL
-        ).apply {
-            setLineSpacing(dp(6).toFloat(), 1f)
-            setPadding(0, 0, dp(6), dp(4))
-        }, FrameLayout.LayoutParams(-1, -2))
-        body.addView(changelogScroll, LinearLayout.LayoutParams(-1, -2).apply {
-            height = changelogHeight
-            bottomMargin = dp(18)
-        })
-
-        val actions = horizontalLayout().apply { gravity = Gravity.CENTER_VERTICAL }
-        if (!update.forceUpdate) actions.addView(MaterialButton(this).apply {
-            text = "稍后"
-            textSize = 14f
-            isAllCaps = false
-            cornerRadius = dp(15)
-            insetTop = 0
-            insetBottom = 0
-            setTextColor(TEXT_SECONDARY)
-            backgroundTintList = ColorStateList.valueOf(Color.rgb(238, 242, 249))
-            setOnClickListener { hideUpdateDialog() }
-        }, LinearLayout.LayoutParams(0, dp(48), 1f).apply { rightMargin = dp(6) })
-        val updateButton = MaterialButton(this).apply {
-            text = "立即更新"
-            textSize = 14f
-            isAllCaps = false
-            cornerRadius = dp(15)
-            insetTop = 0
-            insetBottom = 0
-            setTextColor(Color.WHITE)
-            backgroundTintList = ColorStateList.valueOf(PRIMARY_DARK)
-            setOnClickListener {
-                if (!requestInstallPermissionIfNeeded()) return@setOnClickListener
-                updateActionButton?.apply {
-                    isEnabled = false
-                    text = "正在下载…"
-                }
-                downloadLatestApk(update.url, update.code, update.name)
-                if (!update.forceUpdate) hideUpdateDialog()
+        updateDialogCapturePending = true
+        captureUpdateBackdrop { pageSnapshot ->
+            updateDialogCapturePending = false
+            if (isFinishing || isDestroyed || updateOverlay != null) {
+                pageSnapshot?.takeUnless(Bitmap::isRecycled)?.recycle()
+                return@captureUpdateBackdrop
             }
+            lateinit var dialog: LiquidUpdateDialogView
+            dialog = LiquidUpdateDialogView(
+                context = this,
+                pageSnapshot = pageSnapshot,
+                versionName = versionName,
+                changelog = changelogText,
+                forced = update.forceUpdate,
+                onDismiss = { hideUpdateDialog() },
+                onUpdate = updateAction@{
+                    if (!requestInstallPermissionIfNeeded()) return@updateAction
+                    dialog.setDownloading(true)
+                    downloadLatestApk(update.url, update.code, update.name)
+                    if (!update.forceUpdate) hideUpdateDialog()
+                }
+            )
+            pageHost.addView(dialog, matchParentParams())
+            updateDialogView = dialog
+            updateOverlay = dialog
+            dialog.alpha = 0f
+            dialog.animate().alpha(1f).setDuration(180).start()
         }
-        actions.addView(updateButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply {
-            if (!update.forceUpdate) leftMargin = dp(6)
-        })
-        updateActionButton = updateButton
-        body.addView(actions, matchWrapParams())
-        card.addView(body)
-        overlay.addView(card, FrameLayout.LayoutParams(dialogWidth, -2, Gravity.CENTER))
-        pageHost.addView(overlay, matchParentParams())
-        updateOverlay = overlay
-        overlay.alpha = 0f
-        card.scaleX = .94f
-        card.scaleY = .94f
-        overlay.animate().alpha(1f).setDuration(150).start()
-        card.animate().scaleX(1f).scaleY(1f).setDuration(210).start()
+    }
+
+    private fun captureUpdateBackdrop(onCaptured: (Bitmap?) -> Unit) {
+        val width = pageHost.width
+        val height = pageHost.height
+        if (width <= 0 || height <= 0 || !pageHost.isAttachedToWindow) {
+            onCaptured(null)
+            return
+        }
+        val location = IntArray(2)
+        pageHost.getLocationInWindow(location)
+        val sourceRect = Rect(
+            location[0],
+            location[1],
+            location[0] + width,
+            location[1] + height
+        )
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        runCatching {
+            PixelCopy.request(
+                window,
+                sourceRect,
+                bitmap,
+                { result ->
+                    if (result == PixelCopy.SUCCESS) {
+                        onCaptured(bitmap)
+                    } else {
+                        bitmap.recycle()
+                        onCaptured(null)
+                    }
+                },
+                Handler(Looper.getMainLooper())
+            )
+        }.onFailure {
+            bitmap.recycle()
+            onCaptured(null)
+        }
     }
 
     private fun hideUpdateDialog() {
         val overlay = updateOverlay ?: return
         overlay.animate().alpha(0f).setDuration(140).withEndAction {
             pageHost.removeView(overlay)
+            updateDialogView?.releaseSnapshot()
             updateOverlay = null
+            updateDialogView = null
             forceUpdateActive = false
-            updateActionButton = null
         }.start()
     }
 
     private fun showLoginPage(animate: Boolean) {
+        WindowCompat.setDecorFitsSystemWindows(window, true)
         loginMode = LoginMode.PERSONAL
         viewingPublicSchedule = false
         publicScheduleCourses = emptyList()
@@ -637,6 +628,7 @@ class MainActivity : android.app.Activity() {
     private fun showSchedulePage() {
         onLoginPage = false
         hideKeyboard()
+        val immersiveBackground = hasCustomBackground()
         val account = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_ACCOUNT, "").orEmpty()
         if (account == "114514") {
             // 演示数据随版本代码更新，避免旧安装继续读取之前缓存的地点。
@@ -647,8 +639,9 @@ class MainActivity : android.app.Activity() {
         currentWeek = weekForTerm(if (viewingPublicSchedule) publicScheduleTerm else selectedTerm())
         if (emptyRoomResult == null) syncEmptyRoomDefaultsToNow()
         currentMainSection = 0
-        setSystemBars(GRADIENT_START)
+        setSystemBars(if (immersiveBackground) Color.TRANSPARENT else GRADIENT_START)
         window.navigationBarColor = GRADIENT_END
+        WindowCompat.setDecorFitsSystemWindows(window, !immersiveBackground)
         swapPage(buildSchedulePage(), true, true)
         updatePushButton()
     }
@@ -830,31 +823,38 @@ class MainActivity : android.app.Activity() {
             setStrokeColor(PUBLIC_CARD_OUTLINE)
             cardElevation = dp(2).toFloat()
         }
-        val body = verticalLayout().apply { setPadding(dp(24), dp(24), dp(24), dp(22)) }
-        body.addView(text("登录", 28f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(8)))
-
-        val formHost = FrameLayout(this)
-        val modeToggle = LoginModeToggle(this, loginMode) { nextMode, _ ->
-            if (nextMode != loginMode) {
+        lateinit var modeToggle: LoginModeToggle
+        val body = LoginSwipeLayout(
+            this,
+            loginMode,
+            onPositionChanged = { position -> modeToggle.setSelectionPosition(position) },
+            createModeForm = { nextMode ->
                 val currentTerm = semesterInput.text?.toString().orEmpty()
                 loginMode = nextMode
+                hideKeyboard()
                 if (nextMode == LoginMode.PUBLIC) {
                     startPublicScheduleSyncIfNeeded(currentTerm)
                 }
-                transitionLoginModeForm(
-                    formHost,
-                    buildLoginModeForm(nextMode),
-                    nextMode == LoginMode.PUBLIC
-                )
+                buildLoginModeForm(nextMode)
+            },
+            onModeSettled = { mode -> modeToggle.setSettledMode(mode) }
+        ).apply { setPadding(dp(24), dp(24), dp(24), dp(22)) }
+        body.addView(text("登录", 28f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(8)))
+
+        modeToggle = LoginModeToggle(
+            context = this,
+            initialMode = loginMode,
+            onDragPosition = { position -> body.updateFromModeToggle(position) },
+            onDragFinished = { position, velocityX ->
+                body.finishModeToggleDrag(position, velocityX)
             }
-        }
+        ) { nextMode, _ -> body.animateToMode(nextMode) }
         body.addView(modeToggle, LinearLayout.LayoutParams(-1, dp(60)).apply {
             leftMargin = dp(16)
             rightMargin = dp(16)
             bottomMargin = dp(20)
         })
-        formHost.addView(buildLoginModeForm(loginMode), FrameLayout.LayoutParams(-1, -2))
-        body.addView(formHost, matchWrapParams())
+        body.attachInitialForm(buildLoginModeForm(loginMode))
         card.addView(body)
         viewport.addView(card, matchWrapParams())
         viewport.addOnLayoutChangeListener { view, _, _, _, _, _, _, _, _ ->
@@ -925,31 +925,26 @@ class MainActivity : android.app.Activity() {
         }
         form.addView(loginStatus, spacedParams(dp(12)))
 
-        val login = MaterialButton(this).apply {
-            text = if (mode == LoginMode.PERSONAL) "进入个人课表" else "查询班级课表"
-            textSize = 16f
-            setTextColor(Color.WHITE)
-            setTypeface(Typeface.DEFAULT, Typeface.BOLD)
-            isAllCaps = false
-            cornerRadius = dp(if (mode == LoginMode.PERSONAL) 18 else 23)
-            insetTop = 0
-            insetBottom = 0
-            minimumHeight = dp(if (mode == LoginMode.PERSONAL) 56 else 46)
-            backgroundTintList = buttonColors()
-            setOnClickListener {
+        val loginHeight = if (mode == LoginMode.PERSONAL) 56 else 46
+        val login = createLiquidTintedActionButtonView(
+            context = this,
+            text = if (mode == LoginMode.PERSONAL) "进入个人课表" else "查询班级课表",
+            heightDp = loginHeight,
+            backdropColor = PUBLIC_SURFACE,
+            onClick = {
                 if (mode == LoginMode.PERSONAL) attemptLogin() else attemptPublicScheduleLookup()
             }
-        }
+        )
         if (mode == LoginMode.PUBLIC &&
             (!hasPublicScheduleCache(semesterInput.text?.toString().orEmpty()) ||
                 loadStoredPublicScheduleIndex(semesterInput.text?.toString().orEmpty()) == null ||
                 !hasPublicScheduleLookup(semesterInput.text?.toString().orEmpty()))
         ) {
-            login.isEnabled = false
+            login.setButtonEnabled(false)
             login.text = "正在准备全校课表…"
         }
         loginButton = login
-        form.addView(login, LinearLayout.LayoutParams(-1, -2).apply {
+        form.addView(login, LinearLayout.LayoutParams(-1, dp(loginHeight)).apply {
             if (mode == LoginMode.PUBLIC) topMargin = dp(6)
         })
         return form
@@ -963,6 +958,7 @@ class MainActivity : android.app.Activity() {
             return
         }
 
+        host.addView(next, FrameLayout.LayoutParams(-1, -2))
         next.measure(
             View.MeasureSpec.makeMeasureSpec(host.width, View.MeasureSpec.EXACTLY),
             View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
@@ -972,7 +968,6 @@ class MainActivity : android.app.Activity() {
         val distance = dp(24).toFloat() * if (forward) 1f else -1f
         next.alpha = 0f
         next.translationX = distance
-        host.addView(next, FrameLayout.LayoutParams(-1, -2))
         host.isEnabled = false
 
         ValueAnimator.ofFloat(0f, 1f).apply {
@@ -1060,28 +1055,22 @@ class MainActivity : android.app.Activity() {
         }
         body.addView(loginStatus, spacedParams(dp(12)))
 
-        val login = MaterialButton(this).apply {
-            text = "查询班级课表"
-            textSize = 16f
-            setTextColor(Color.WHITE)
-            setTypeface(Typeface.DEFAULT, Typeface.BOLD)
-            isAllCaps = false
-            cornerRadius = dp(23)
-            insetTop = 0
-            insetBottom = 0
-            minimumHeight = dp(46)
-            backgroundTintList = buttonColors()
-            setOnClickListener { attemptPublicScheduleLookup() }
-        }
+        val login = createLiquidTintedActionButtonView(
+            context = this,
+            text = "查询班级课表",
+            heightDp = 46,
+            backdropColor = PUBLIC_SURFACE,
+            onClick = { attemptPublicScheduleLookup() }
+        )
         if (!hasPublicScheduleCache(selectedTerm) ||
             loadStoredPublicScheduleIndex(selectedTerm) == null ||
             !hasPublicScheduleLookup(selectedTerm)
         ) {
-            login.isEnabled = false
+            login.setButtonEnabled(false)
             login.text = "正在准备全校课表…"
         }
         loginButton = login
-        body.addView(login, LinearLayout.LayoutParams(-1, -2).apply {
+        body.addView(login, LinearLayout.LayoutParams(-1, dp(46)).apply {
             topMargin = dp(6)
         })
 
@@ -1131,7 +1120,7 @@ class MainActivity : android.app.Activity() {
             showSchedulePage()
             return
         }
-        loginButton?.isEnabled = false
+        loginButton?.setButtonEnabled(false)
         loginButton?.text = "正在查询课程…"
         networkExecutor.execute {
             try {
@@ -1154,14 +1143,14 @@ class MainActivity : android.app.Activity() {
                         .remove(KEY_EXAMS)
                         .apply()
                     saveCourseCache(courses)
-                    loginButton?.isEnabled = true
+                    loginButton?.setButtonEnabled(true)
                     loginButton?.text = "进入课程表"
                     showSchedulePage()
                 }
             } catch (error: Exception) {
                 runOnUiThread {
                     showLoginError(error)
-                    loginButton?.isEnabled = true
+                    loginButton?.setButtonEnabled(true)
                     loginButton?.text = "进入课程表"
                 }
             }
@@ -1460,21 +1449,58 @@ class MainActivity : android.app.Activity() {
 
     private fun buildSchedulePage(): View {
         val page = FrameLayout(this).apply { background = SilkyGradientDrawable() }
-        val navigationHeight = dp(54)
+        val customBackground = loadCustomBackgroundBitmap()
+        currentPageBackgroundBitmap = customBackground
+        customBackground?.let { backgroundBitmap ->
+            page.addView(ImageView(this).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                setImageBitmap(backgroundBitmap)
+                contentDescription = null
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            }, FrameLayout.LayoutParams(-1, -1))
+            page.addView(View(this).apply {
+                setBackgroundColor(CUSTOM_BACKGROUND_SCRIM)
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            }, FrameLayout.LayoutParams(-1, -1))
+        }
+        val navigationVisibleHeight = dp(54)
+        val navigationHostHeight = dp(116)
         val navigationBottomMargin = dp(16)
-        mainSectionHost = FrameLayout(this).apply {
+        val sectionHost = FrameLayout(this).apply {
             setBackgroundColor(Color.TRANSPARENT)
             addView(buildScheduleSection(), FrameLayout.LayoutParams(-1, -1))
         }
-        page.addView(mainSectionHost, FrameLayout.LayoutParams(-1, -1).apply {
-            bottomMargin = navigationHeight + navigationBottomMargin + dp(4)
-        })
-        bottomNavigation = LiquidGlassNavigationView(this).apply {
-            onItemSelected = { index, _ -> showMainSection(index) }
+        mainSectionHost = sectionHost
+        val sectionBottomMargin = navigationVisibleHeight + navigationBottomMargin + dp(4)
+        val sectionLayoutParams = FrameLayout.LayoutParams(-1, -1).apply {
+            bottomMargin = sectionBottomMargin
         }
-        page.addView(bottomNavigation, FrameLayout.LayoutParams(dp(216), navigationHeight, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
-            bottomMargin = navigationBottomMargin
-        })
+        page.addView(sectionHost, sectionLayoutParams)
+        val navigation = createCampusLiquidBottomTabsView(
+            this,
+            currentMainSection,
+            customBackground,
+            CUSTOM_BACKGROUND_SCRIM
+        ) { index, _ -> showMainSection(index) }
+        bottomNavigation = navigation
+        val navigationLayoutParams = FrameLayout.LayoutParams(
+            dp(288), navigationHostHeight, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+        ).apply {
+            bottomMargin = 0
+        }
+        page.addView(navigation, navigationLayoutParams)
+        if (customBackground != null) {
+            ViewCompat.setOnApplyWindowInsetsListener(page) { _, insets ->
+                val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+                sectionHost.setPadding(0, systemBars.top, 0, 0)
+                sectionLayoutParams.bottomMargin = sectionBottomMargin + systemBars.bottom
+                sectionHost.layoutParams = sectionLayoutParams
+                navigationLayoutParams.bottomMargin = systemBars.bottom
+                navigation.layoutParams = navigationLayoutParams
+                insets
+            }
+            page.post { ViewCompat.requestApplyInsets(page) }
+        }
         return page
     }
 
@@ -1600,6 +1626,10 @@ class MainActivity : android.app.Activity() {
         return section
     }
 
+    /** Gray supporting copy needs extra contrast only when it is drawn over a custom image. */
+    private fun secondaryTextTypeface(): Int =
+        if (currentPageBackgroundBitmap != null) Typeface.BOLD else Typeface.NORMAL
+
     private fun refreshExams() {
         if (viewingPublicSchedule) return
         if (examsLoading) return
@@ -1669,7 +1699,7 @@ class MainActivity : android.app.Activity() {
         }
         val body = verticalLayout().apply { setPadding(dp(20), dp(18), dp(20), dp(28)) }
         body.addView(text("考试安排", 28f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(7)))
-        body.addView(text("$term 学期", 13f, TEXT_SECONDARY, Typeface.NORMAL), matchWrapParams())
+        body.addView(text("$term 学期", 13f, TEXT_SECONDARY, secondaryTextTypeface()), matchWrapParams())
         val stateView = when {
             examsLoading || (!hasLoaded && error.isNullOrBlank()) -> verticalLayout().apply {
                 gravity = Gravity.CENTER
@@ -1682,7 +1712,7 @@ class MainActivity : android.app.Activity() {
                 gravity = Gravity.CENTER
                 setPadding(dp(22), dp(20), dp(22), dp(20))
                 addView(text("!", 20f, ERROR, Typeface.BOLD).apply { gravity = Gravity.CENTER }, LinearLayout.LayoutParams(dp(48), dp(42)))
-                addView(text(error, 14f, TEXT_SECONDARY, Typeface.NORMAL).apply {
+                addView(text(error, 14f, TEXT_SECONDARY, secondaryTextTypeface()).apply {
                     gravity = Gravity.CENTER
                     setLineSpacing(dp(3).toFloat(), 1f)
                 }, matchWrapParams())
@@ -1714,52 +1744,20 @@ class MainActivity : android.app.Activity() {
         addView(text(title, 18f, TEXT_PRIMARY, Typeface.BOLD).apply {
             gravity = Gravity.CENTER
         }, spacedParams(dp(10)))
-        addView(text(description, 13f, TEXT_SECONDARY, Typeface.NORMAL).apply {
+        addView(text(description, 13f, TEXT_SECONDARY, secondaryTextTypeface()).apply {
             gravity = Gravity.CENTER
             setLineSpacing(dp(4).toFloat(), 1f)
         }, matchWrapParams())
     }
 
     private fun buildExamResultSection(term: String, records: List<RemoteExam>): View {
-        val scroll = ScrollView(this).apply {
-            clipToPadding = false
-            overScrollMode = View.OVER_SCROLL_NEVER
-            setBackgroundColor(Color.TRANSPARENT)
-        }
-        val body = verticalLayout().apply { setPadding(dp(20), dp(18), dp(20), dp(28)) }
-        body.addView(text("考试安排", 28f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(7)))
-        body.addView(text("$term 学期 · ${records.size} 门考试", 13f, TEXT_SECONDARY, Typeface.NORMAL), spacedParams(dp(18)))
-        records.sortedWith(compareBy<RemoteExam>(
-            { it.examWeek.toIntOrNull() ?: Int.MAX_VALUE },
-            { it.examWeekday.toIntOrNull() ?: Int.MAX_VALUE },
-            { Regex("\\d+").find(it.examSessions)?.value?.toIntOrNull() ?: Int.MAX_VALUE }
-        )).forEach { exam ->
-            val card = surfaceCard(dp(24f).toFloat()).apply {
-                cardElevation = 0f
-                strokeWidth = 0
-                // 半透明暖白玻璃：保留清晰的卡片层级，同时让部分页面渐变透出。
-                setCardBackgroundColor(Color.argb(154, 250, 252, 255))
-            }
-            val content = verticalLayout().apply { setPadding(dp(18), dp(17), dp(18), dp(17)) }
-            content.addView(text(exam.courseName, 18f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(15)))
-            val firstRow = horizontalLayout()
-            firstRow.addView(examDetail("考试周数", "第${exam.examWeek}周"), LinearLayout.LayoutParams(0, -2, 1f))
-            firstRow.addView(examDetail("考试星期", exam.examWeekday), LinearLayout.LayoutParams(0, -2, 1f))
-            content.addView(firstRow, spacedParams(dp(13)))
-            val secondRow = horizontalLayout()
-            secondRow.addView(examDetail("考试节次", "${exam.examSessions}节"), LinearLayout.LayoutParams(0, -2, 1f))
-            secondRow.addView(examDetail("考试教室", exam.classroom), LinearLayout.LayoutParams(0, -2, 1f))
-            content.addView(secondRow, matchWrapParams())
-            card.addView(content)
-            body.addView(card, spacedParams(dp(12)))
-        }
-        scroll.addView(body, FrameLayout.LayoutParams(-1, -2))
-        return scroll
-    }
-
-    private fun examDetail(label: String, value: String): View = verticalLayout().apply {
-        addView(text(label, 12f, TEXT_SECONDARY, Typeface.NORMAL), spacedParams(dp(5)))
-        addView(text(value.ifBlank { "-" }, 15f, TEXT_PRIMARY, Typeface.BOLD), matchWrapParams())
+        return createExamLiquidScrollPageView(
+            context = this,
+            term = term,
+            records = records,
+            pageBackgroundBitmap = currentPageBackgroundBitmap,
+            pageBackgroundScrim = CUSTOM_BACKGROUND_SCRIM
+        )
     }
 
     private fun buildGradesSection(refresh: Boolean = true): View {
@@ -1872,7 +1870,7 @@ class MainActivity : android.app.Activity() {
             "${emptyRoomCampus} · 第${emptyRoomWeek}周 · ${emptyRoomWeekdayLabel(emptyRoomWeekday)} · ${emptyRoomSectionLabel(emptyRoomSectionCode)}",
             12f,
             TEXT_SECONDARY,
-            Typeface.NORMAL
+            secondaryTextTypeface()
         ).apply { setPadding(dp(16), 0, dp(16), 0) }, spacedParams(dp(15)))
 
         val state = when {
@@ -1885,7 +1883,7 @@ class MainActivity : android.app.Activity() {
                         indeterminateTintList = ColorStateList.valueOf(PRIMARY)
                         contentDescription = "正在查询空教室"
                     }, LinearLayout.LayoutParams(dp(36), dp(36)))
-                    addView(text("正在整理空闲教室", 13f, TEXT_SECONDARY, Typeface.NORMAL).apply {
+                    addView(text("正在整理空闲教室", 13f, TEXT_SECONDARY, secondaryTextTypeface()).apply {
                         gravity = Gravity.CENTER
                     }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(14) })
                 }
@@ -1899,7 +1897,7 @@ class MainActivity : android.app.Activity() {
                     addView(text("!", 21f, ERROR, Typeface.BOLD).apply { gravity = Gravity.CENTER }, LinearLayout.LayoutParams(dp(50), dp(44)).apply {
                         bottomMargin = dp(8)
                     })
-                    addView(text(emptyRoomLoadError.orEmpty(), 14f, TEXT_SECONDARY, Typeface.NORMAL).apply {
+                    addView(text(emptyRoomLoadError.orEmpty(), 14f, TEXT_SECONDARY, secondaryTextTypeface()).apply {
                         gravity = Gravity.CENTER
                         setLineSpacing(dp(4).toFloat(), 1f)
                     }, matchWrapParams())
@@ -2161,87 +2159,23 @@ class MainActivity : android.app.Activity() {
         groups.forEachIndexed { groupIndex, group ->
             val groupStateKey = "${result.campus}:${group.title}"
             val groupExpanded = groupStateKey !in collapsedEmptyRoomGroups
-            val groupCard = MaterialCardView(this@MainActivity).apply {
-                radius = dp(21f).toFloat()
-                cardElevation = 0f
-                strokeWidth = dp(1)
-                strokeColor = Color.argb(118, 255, 255, 255)
-                setCardBackgroundColor(blendColors(Color.rgb(231, 236, 247), group.accent, .055f))
-            }
-            val groupBody = verticalLayout().apply { setPadding(dp(15), dp(14), dp(15), dp(15)) }
-            val header = horizontalLayout().apply { gravity = Gravity.CENTER_VERTICAL }
-            header.addView(View(this@MainActivity).apply {
-                background = android.graphics.drawable.GradientDrawable().apply {
-                    shape = android.graphics.drawable.GradientDrawable.RECTANGLE
-                    cornerRadius = dp(3f).toFloat()
-                    setColor(group.accent)
-                }
-            }, LinearLayout.LayoutParams(dp(5), dp(23)).apply { rightMargin = dp(10) })
-            header.addView(text(group.title, 16f, TEXT_PRIMARY, Typeface.BOLD), LinearLayout.LayoutParams(0, -2, 1f))
-            val groupToggle = emptyRoomCollapseButton(groupExpanded, "${group.title}教室")
-            header.addView(groupToggle, LinearLayout.LayoutParams(dp(32), dp(32)))
-            header.isClickable = true
-            header.isFocusable = true
-            header.contentDescription = if (groupExpanded) "折叠${group.title}教室" else "展开${group.title}教室"
-            groupBody.addView(header, matchWrapParams())
-
-            val roomRows = group.rooms.chunked(2)
-            val roomRowHeight = dp(44)
-            val roomRowGap = dp(4)
-            val roomContent = verticalLayout()
-            roomRows.forEachIndexed { rowIndex, pair ->
-                val row = horizontalLayout()
-                pair.forEachIndexed { index, room ->
-                    val roomLabel = text(room, 14f, TEXT_PRIMARY, Typeface.BOLD).apply {
-                        gravity = Gravity.CENTER_VERTICAL
-                        setPadding(dp(10), dp(6), dp(8), dp(6))
-                        maxLines = 2
-                    }
-                    row.addView(roomLabel, LinearLayout.LayoutParams(0, -1, 1f).apply {
-                        if (index == 0) rightMargin = dp(4) else leftMargin = dp(4)
-                    })
-                }
-                if (pair.size == 1) {
-                    row.addView(Space(this@MainActivity), LinearLayout.LayoutParams(0, 1, 1f).apply { leftMargin = dp(4) })
-                }
-                roomContent.addView(row, LinearLayout.LayoutParams(-1, roomRowHeight).apply {
-                    if (rowIndex < roomRows.lastIndex) bottomMargin = roomRowGap
-                })
-            }
-            val maxVisibleRows = 4
-            val roomViewport: View
-            val roomViewportHeight: Int
-            if (roomRows.size > maxVisibleRows) {
-                roomViewport = EmptyRoomPriorityScrollView(this@MainActivity).apply {
-                    addView(roomContent, FrameLayout.LayoutParams(-1, -2))
-                }
-                roomViewportHeight = roomRowHeight * maxVisibleRows + roomRowGap * (maxVisibleRows - 1)
-            } else {
-                roomViewport = roomContent
-                roomViewportHeight = ViewGroup.LayoutParams.WRAP_CONTENT
-            }
-            groupBody.addView(roomViewport, LinearLayout.LayoutParams(-1, roomViewportHeight).apply {
-                topMargin = dp(12)
-            })
-            if (!groupExpanded) roomViewport.visibility = View.GONE
-            val toggleGroup: () -> Unit = toggle@ {
-                if (!groupToggle.isClickable) return@toggle
-                val expanding = groupStateKey in collapsedEmptyRoomGroups
-                if (expanding) collapsedEmptyRoomGroups.remove(groupStateKey)
+            val groupCard = createEmptyRoomLiquidGroupCardView(
+                context = this@MainActivity,
+                groupKey = groupStateKey,
+                title = group.title,
+                accentColor = group.accent,
+                rooms = group.rooms,
+                initiallyExpanded = groupExpanded,
+                pageBackgroundBitmap = currentPageBackgroundBitmap,
+                pageBackgroundScrim = CUSTOM_BACKGROUND_SCRIM
+            ) { expanded ->
+                if (expanded) collapsedEmptyRoomGroups.remove(groupStateKey)
                 else collapsedEmptyRoomGroups.add(groupStateKey)
-                header.contentDescription = if (expanding) "折叠${group.title}教室" else "展开${group.title}教室"
-                animateEmptyRoomCollapsible(
-                    groupBody,
-                    roomViewport,
-                    groupToggle,
-                    expanding,
-                    "${group.title}教室"
-                )
             }
-            header.setOnClickListener { toggleGroup() }
-            groupToggle.setOnClickListener { toggleGroup() }
-            groupCard.addView(groupBody)
-            addView(groupCard, if (groupIndex == groups.lastIndex) matchWrapParams() else spacedParams(dp(11)))
+            addView(
+                groupCard,
+                if (groupIndex == groups.lastIndex) matchWrapParams() else spacedParams(dp(11))
+            )
         }
     }
 
@@ -2581,59 +2515,16 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun buildScoreResultSection(result: RemoteScoreResult): View {
-        val scroll = ScrollView(this).apply {
-            clipToPadding = false
-            overScrollMode = View.OVER_SCROLL_NEVER
-            setBackgroundColor(Color.TRANSPARENT)
-        }
-        val body = verticalLayout().apply { setPadding(dp(20), dp(18), dp(20), dp(28)) }
-        addGradeHeader(body, result.term)
-
-        val summaryCard = surfaceCard(dp(24f).toFloat()).apply {
-            cardElevation = 0f
-            strokeWidth = 0
-            setCardBackgroundColor(Color.argb(176, 250, 252, 255))
-        }
-        val metrics = horizontalLayout().apply {
-            gravity = Gravity.CENTER
-            setPadding(dp(12), dp(18), dp(12), dp(18))
-        }
-        metrics.addView(scoreMetric("平均成绩", result.averageScore, Color.rgb(245, 108, 126)), LinearLayout.LayoutParams(0, -2, 1f))
-        metrics.addView(scoreMetric("平均绩点", result.averageCreditGpa, Color.rgb(131, 140, 199)), LinearLayout.LayoutParams(0, -2, 1f))
-        metrics.addView(scoreMetric("总学分", result.totalCredits, PRIMARY_DARK), LinearLayout.LayoutParams(0, -2, 1f))
-        summaryCard.addView(metrics)
-        body.addView(summaryCard, spacedParams(dp(18)))
-
-        result.records.forEach { record ->
-            val card = surfaceCard(dp(20f).toFloat()).apply {
-                cardElevation = 0f
-                strokeWidth = 0
-                setCardBackgroundColor(Color.argb(164, 250, 252, 255))
-            }
-            val row = horizontalLayout().apply {
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(17), dp(15), dp(17), dp(15))
-            }
-            val course = verticalLayout()
-            course.addView(text(record.courseName.ifBlank { "未命名课程" }, 16f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(7)))
-            val details = buildList {
-                if (record.courseCode.isNotBlank()) add(record.courseCode)
-                if (record.credit.isNotBlank()) add("${record.credit} 学分")
-            }.joinToString("  ·  ")
-            course.addView(text(details.ifBlank { "课程成绩" }, 12f, TEXT_SECONDARY, Typeface.NORMAL), matchWrapParams())
-            row.addView(course, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(12) })
-            row.addView(text(record.score.ifBlank { "-" }, 22f, scoreColor(record.score), Typeface.BOLD).apply {
-                gravity = Gravity.CENTER
-                isClickable = true
-                isFocusable = true
-                contentDescription = "查看${record.courseName}成绩构成"
-                setOnClickListener { showScoreDetail(record) }
-            }, LinearLayout.LayoutParams(dp(58), dp(48)))
-            card.addView(row)
-            body.addView(card, spacedParams(dp(10)))
-        }
-        scroll.addView(body, FrameLayout.LayoutParams(-1, -2))
-        return scroll
+        return createScoreLiquidScrollPageView(
+            context = this,
+            result = result,
+            scoreColors = result.records.map { scoreColor(it.score) },
+            pageBackgroundBitmap = currentPageBackgroundBitmap,
+            pageBackgroundScrim = CUSTOM_BACKGROUND_SCRIM,
+            onTermClick = ::showScoreTermPicker,
+            onScoreClick = ::showScoreDetail,
+            onExport = { exportScoreImage(result.term) }
+        )
     }
 
     private fun scoreMetric(label: String, value: String, valueColor: Int): View = verticalLayout().apply {
@@ -3001,22 +2892,25 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun addGradeHeader(body: LinearLayout, term: String) {
+        val hasCustomBackground = currentPageBackgroundBitmap != null
         val header = horizontalLayout().apply { gravity = Gravity.CENTER_VERTICAL }
         header.addView(text("成绩", 28f, TEXT_PRIMARY, Typeface.BOLD), LinearLayout.LayoutParams(0, -2, 1f))
-        header.addView(ImageButton(this).apply {
-            setImageResource(R.drawable.ic_export)
-            imageTintList = ColorStateList.valueOf(PRIMARY_DARK)
-            setBackgroundColor(Color.TRANSPARENT)
-            setPadding(dp(8), dp(8), dp(8), dp(8))
-            contentDescription = "保存成绩图片"
-            isEnabled = !scoreExporting
-            setOnClickListener { exportScoreImage(term) }
-        }, LinearLayout.LayoutParams(dp(42), dp(42)).apply { rightMargin = dp(6) })
         val selector = MaterialCardView(this).apply {
             radius = dp(14f).toFloat()
             cardElevation = 0f
-            strokeWidth = 0
-            setCardBackgroundColor(Color.rgb(246, 248, 252))
+            strokeWidth = if (hasCustomBackground) dp(1) else 0
+            strokeColor = if (hasCustomBackground) {
+                Color.argb(118, 255, 255, 255)
+            } else {
+                Color.TRANSPARENT
+            }
+            // The state/loading page sits directly above the real wallpaper. Keeping
+            // this surface translucent makes it sample that wallpaper immediately,
+            // before the score-result Compose page is created.
+            setCardBackgroundColor(
+                if (hasCustomBackground) Color.argb(42, 255, 255, 255)
+                else Color.rgb(246, 248, 252)
+            )
             isClickable = true
             contentDescription = "选择成绩学期，当前为 $term"
             setOnClickListener { showScoreTermPicker() }
@@ -3055,7 +2949,7 @@ class MainActivity : android.app.Activity() {
                 gravity = Gravity.CENTER
                 setPadding(dp(22), dp(20), dp(22), dp(20))
                 addView(text("!", 22f, ERROR, Typeface.BOLD).apply { gravity = Gravity.CENTER }, LinearLayout.LayoutParams(dp(52), dp(44)).apply { bottomMargin = dp(10) })
-                addView(text(error, 14f, TEXT_SECONDARY, Typeface.NORMAL).apply {
+                addView(text(error, 14f, TEXT_SECONDARY, secondaryTextTypeface()).apply {
                     gravity = Gravity.CENTER
                     setLineSpacing(dp(4).toFloat(), 1f)
                 }, matchWrapParams())
@@ -3227,8 +3121,8 @@ class MainActivity : android.app.Activity() {
             setOnClickListener { showSharePicker() }
         }, LinearLayout.LayoutParams(dp(48), dp(44)))
         row.addView(ImageButton(this).apply {
-            setImageResource(R.drawable.ic_update_lightning)
-            contentDescription = "检查更新或重新登录"
+            setImageResource(R.drawable.ic_more)
+            contentDescription = "更多操作"
             setBackgroundColor(Color.TRANSPARENT)
             setPadding(dp(12), dp(10), dp(12), dp(10))
             setOnClickListener { showUpdateMenu(this) }
@@ -3239,64 +3133,237 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun showUpdateMenu(anchor: View, fromBottom: Boolean = false) {
-        val panel = verticalLayout().apply {
-            setPadding(dp(6), dp(6), dp(6), dp(6))
-        }
-        var popup: PopupWindow? = null
-        fun addAction(label: String, dismissOnClick: Boolean = true, action: () -> Unit) {
-            panel.addView(text(label, 13f, TEXT_PRIMARY, Typeface.NORMAL).apply {
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(10), dp(7), dp(10), dp(7))
-                isClickable = true
-                setOnClickListener { if (dismissOnClick) popup?.dismiss(); action() }
-            }, LinearLayout.LayoutParams(-1, dp(36)))
-        }
-        addAction("检查更新", false) {
-            panel.removeAllViews()
-            panel.addView(text("正在检查更新…", 12f, TEXT_SECONDARY, Typeface.NORMAL).apply {
-                setPadding(dp(10), dp(8), dp(10), dp(8))
-            })
-            networkExecutor.execute {
-                val update = runCatching { readRemoteUpdate() }.getOrNull()
-                runOnUiThread {
-                    panel.removeAllViews()
-                    if (update == null) {
-                        panel.addView(text("检查失败，请稍后重试", 12f, TEXT_SECONDARY, Typeface.NORMAL).apply {
-                            setPadding(dp(10), dp(8), dp(10), dp(8))
-                        })
-                    } else if (update.code <= currentVersionCode) {
-                        panel.addView(text("已是最新版本 $appDisplayVersion", 12f, TEXT_SECONDARY, Typeface.NORMAL).apply {
-                            setPadding(dp(10), dp(8), dp(10), dp(8))
-                        })
-                    } else {
-                        popup?.dismiss()
-                        showUpdateDialog(update)
-                        return@runOnUiThread
-                    }
-                    addAction("重新登录") { showLoginPage(true) }
-                }
-            }
-        }
-        addAction("重新登录") { showLoginPage(true) }
-        val card = MaterialCardView(this).apply {
-            radius = dp(18).toFloat()
-            cardElevation = dp(2).toFloat()
-            strokeWidth = dp(1)
-            setStrokeColor(OUTLINE)
-            setCardBackgroundColor(SURFACE)
-            addView(panel)
-        }
-        popup = PopupWindow(card, dp(216), ViewGroup.LayoutParams.WRAP_CONTENT, true).apply {
-            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
-            elevation = dp(8).toFloat()
-            isOutsideTouchable = true
-        }
-        if (fromBottom) {
-            popup?.showAtLocation(anchor, Gravity.BOTTOM or Gravity.END, dp(18), dp(92))
+        if (actionMenuOverlay != null || actionMenuCapturePending) return
+        val hostLocation = IntArray(2)
+        val anchorLocation = IntArray(2)
+        pageHost.getLocationInWindow(hostLocation)
+        anchor.getLocationInWindow(anchorLocation)
+        val menuWidth = dp(204)
+        val menuX = if (fromBottom) {
+            (pageHost.width - menuWidth - dp(18)).coerceAtLeast(dp(12))
         } else {
-            popup?.showAsDropDown(anchor, -dp(164), dp(4))
+            (anchorLocation[0] - hostLocation[0] + anchor.width - menuWidth)
+                .coerceIn(dp(12), (pageHost.width - menuWidth - dp(12)).coerceAtLeast(dp(12)))
+        }
+        val menuY = if (fromBottom) {
+            (pageHost.height - dp(350)).coerceAtLeast(dp(12))
+        } else {
+            (anchorLocation[1] - hostLocation[1] + anchor.height + dp(4)).coerceAtLeast(dp(12))
+        }
+
+        actionMenuCapturePending = true
+        captureUpdateBackdrop { pageSnapshot ->
+            actionMenuCapturePending = false
+            if (isFinishing || isDestroyed || actionMenuOverlay != null) {
+                pageSnapshot?.takeUnless(Bitmap::isRecycled)?.recycle()
+                return@captureUpdateBackdrop
+            }
+            lateinit var menu: LiquidActionMenuView
+            val actions = buildList {
+                add(
+                    LiquidMenuAction(
+                        title = "检查更新",
+                        iconRes = R.drawable.ic_update_lightning,
+                        dividerAfter = true,
+                        onClick = {
+                            menu.setUpdateStatus("正在检查更新…", true)
+                            networkExecutor.execute {
+                                val update = runCatching { readRemoteUpdate() }.getOrNull()
+                                runOnUiThread {
+                                    when {
+                                        update == null -> menu.setUpdateStatus("检查失败，请稍后重试", false)
+                                        update.code <= currentVersionCode ->
+                                            menu.setUpdateStatus("已是最新版本 $appDisplayVersion", false)
+                                        else -> hideActionMenu { showUpdateDialog(update) }
+                                    }
+                                }
+                            }
+                        }
+                    )
+                )
+                add(
+                    LiquidMenuAction(
+                        title = "选择背景图片",
+                        iconRes = R.drawable.ic_menu_background,
+                        onClick = {
+                            hideActionMenu { backgroundPicker.launch(arrayOf("image/*")) }
+                        }
+                    )
+                )
+                if (hasCustomBackground()) {
+                    add(
+                        LiquidMenuAction(
+                            title = "恢复默认背景",
+                            iconRes = R.drawable.ic_menu_restore,
+                            onClick = { hideActionMenu { clearCustomBackground() } }
+                        )
+                    )
+                }
+                add(
+                    LiquidMenuAction(
+                        title = "重新登录",
+                        iconRes = R.drawable.ic_menu_login,
+                        onClick = { hideActionMenu { showLoginPage(true) } }
+                    )
+                )
+            }
+            menu = LiquidActionMenuView(
+                context = this,
+                pageSnapshot = pageSnapshot,
+                menuX = menuX,
+                menuY = menuY,
+                actions = actions,
+                onDismiss = { hideActionMenu() }
+            )
+            pageHost.addView(menu, matchParentParams())
+            actionMenuOverlay = menu
+            menu.alpha = 0f
+            menu.animate().alpha(1f).setDuration(150).start()
         }
     }
+
+    private fun hideActionMenu(afterDismiss: (() -> Unit)? = null) {
+        val overlay = actionMenuOverlay
+        if (overlay == null) {
+            afterDismiss?.invoke()
+            return
+        }
+        actionMenuOverlay = null
+        overlay.animate().alpha(0f).setDuration(120).withEndAction {
+            pageHost.removeView(overlay)
+            overlay.releaseSnapshot()
+            afterDismiss?.invoke()
+        }.start()
+    }
+
+    private fun customBackgroundFile(): File = File(filesDir, CUSTOM_BACKGROUND_FILE_NAME)
+
+    private fun hasCustomBackground(): Boolean {
+        return getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .getBoolean(KEY_CUSTOM_BACKGROUND, false) && customBackgroundFile().isFile
+    }
+
+    private fun saveCustomBackground(uri: Uri) {
+        val temporaryFile = File(filesDir, "$CUSTOM_BACKGROUND_FILE_NAME.tmp")
+        try {
+            var copiedBytes = 0L
+            contentResolver.openInputStream(uri)?.use { input ->
+                FileOutputStream(temporaryFile, false).use { output ->
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        copiedBytes += count
+                        if (copiedBytes > MAX_CUSTOM_BACKGROUND_BYTES) {
+                            throw IllegalArgumentException("图片文件不能超过 30 MB")
+                        }
+                        output.write(buffer, 0, count)
+                    }
+                }
+            } ?: throw IllegalArgumentException("无法读取所选图片")
+
+            if (decodeCustomBackground(temporaryFile) == null) {
+                throw IllegalArgumentException("所选文件不是受支持的图片")
+            }
+            val destination = customBackgroundFile()
+            if (destination.exists() && !destination.delete()) {
+                throw IllegalStateException("无法替换原背景图片")
+            }
+            if (!temporaryFile.renameTo(destination)) {
+                throw IllegalStateException("无法保存背景图片")
+            }
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(KEY_CUSTOM_BACKGROUND, true)
+                .apply()
+            Toast.makeText(this, "背景图片已应用", Toast.LENGTH_SHORT).show()
+            showSchedulePage()
+        } catch (error: Exception) {
+            temporaryFile.delete()
+            Toast.makeText(
+                this,
+                error.message?.takeIf { it.isNotBlank() } ?: "背景图片设置失败",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
+    private fun clearCustomBackground() {
+        customBackgroundFile().delete()
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+            .remove(KEY_CUSTOM_BACKGROUND)
+            .apply()
+        Toast.makeText(this, "已恢复默认背景", Toast.LENGTH_SHORT).show()
+        showSchedulePage()
+    }
+
+    private fun loadCustomBackgroundDrawable(): Drawable? {
+        if (!hasCustomBackground()) return null
+        return decodeCustomBackground(customBackgroundFile())
+    }
+
+    private fun loadCustomBackgroundBitmap(): Bitmap? {
+        if (!hasCustomBackground()) return null
+        val file = customBackgroundFile()
+        return runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                ImageDecoder.decodeBitmap(ImageDecoder.createSource(file)) { decoder, info, _ ->
+                    decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                    val sourceWidth = info.size.width.coerceAtLeast(1)
+                    val sourceHeight = info.size.height.coerceAtLeast(1)
+                    val longestSide = maxOf(sourceWidth, sourceHeight)
+                    if (longestSide > MAX_CUSTOM_BACKGROUND_DIMENSION) {
+                        val scale = MAX_CUSTOM_BACKGROUND_DIMENSION.toFloat() / longestSide
+                        decoder.setTargetSize(
+                            (sourceWidth * scale).toInt().coerceAtLeast(1),
+                            (sourceHeight * scale).toInt().coerceAtLeast(1)
+                        )
+                    }
+                }
+            } else {
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeFile(file.absolutePath, bounds)
+                if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@runCatching null
+                var sampleSize = 1
+                while (maxOf(bounds.outWidth, bounds.outHeight) / sampleSize > MAX_CUSTOM_BACKGROUND_DIMENSION) {
+                    sampleSize *= 2
+                }
+                BitmapFactory.decodeFile(
+                    file.absolutePath,
+                    BitmapFactory.Options().apply { inSampleSize = sampleSize }
+                )
+            }
+        }.getOrNull()
+    }
+
+    private fun decodeCustomBackground(file: File): Drawable? = runCatching {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            ImageDecoder.decodeDrawable(ImageDecoder.createSource(file)) { decoder, info, _ ->
+                val sourceWidth = info.size.width.coerceAtLeast(1)
+                val sourceHeight = info.size.height.coerceAtLeast(1)
+                val longestSide = maxOf(sourceWidth, sourceHeight)
+                if (longestSide > MAX_CUSTOM_BACKGROUND_DIMENSION) {
+                    val scale = MAX_CUSTOM_BACKGROUND_DIMENSION.toFloat() / longestSide
+                    decoder.setTargetSize(
+                        (sourceWidth * scale).toInt().coerceAtLeast(1),
+                        (sourceHeight * scale).toInt().coerceAtLeast(1)
+                    )
+                }
+            }
+        } else {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(file.absolutePath, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@runCatching null
+            var sampleSize = 1
+            while (maxOf(bounds.outWidth, bounds.outHeight) / sampleSize > MAX_CUSTOM_BACKGROUND_DIMENSION) {
+                sampleSize *= 2
+            }
+            val bitmap = BitmapFactory.decodeFile(
+                file.absolutePath,
+                BitmapFactory.Options().apply { inSampleSize = sampleSize }
+            ) ?: return@runCatching null
+            BitmapDrawable(resources, bitmap)
+        }
+    }.getOrNull()
 
     private fun buildExportCoursePlacements(visibleCourses: List<Course>): List<CoursePlacement> {
         val result = mutableListOf<CoursePlacement>()
@@ -3822,53 +3889,52 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun showSharePicker() {
-        if (shareOverlay != null) return
-        val overlay = FrameLayout(this).apply {
-            setBackgroundColor(Color.argb(145, 12, 18, 30))
-            isClickable = true
-            setOnClickListener { hideSharePicker() }
+        if (shareOverlay != null || pickerDialogCapturePending) return
+        pickerDialogCapturePending = true
+        captureUpdateBackdrop { pageSnapshot ->
+            pickerDialogCapturePending = false
+            if (isFinishing || isDestroyed || shareOverlay != null) {
+                pageSnapshot?.takeUnless(Bitmap::isRecycled)?.recycle()
+                return@captureUpdateBackdrop
+            }
+            val dialog = LiquidPickerDialogView(
+                context = this,
+                pageSnapshot = pageSnapshot,
+                title = "分享",
+                options = listOf(
+                    LiquidPickerOption(
+                        title = if (viewingPublicSchedule) "导出本专业课表为PNG" else "导出本周课表为PNG",
+                        subtitle = if (viewingPublicSchedule) "包含课程周数" else "保存当前周课表图片",
+                        iconRes = R.drawable.ic_share_image,
+                        onClick = ::shareWeekPng
+                    ),
+                    LiquidPickerOption(
+                        title = "分享CSV文件",
+                        subtitle = "可直接导入WakeUp课程表",
+                        iconRes = R.drawable.ic_share_spreadsheet,
+                        onClick = ::shareCsv
+                    ),
+                    LiquidPickerOption(
+                        title = "分享 APP",
+                        subtitle = "WeSDAU课程表安装包",
+                        iconRes = R.drawable.ic_share_app,
+                        onClick = ::shareApp
+                    )
+                ),
+                onDismiss = ::hideSharePicker
+            )
+            pageHost.addView(dialog, matchParentParams())
+            shareOverlay = dialog
+            dialog.alpha = 0f
+            dialog.animate().alpha(1f).setDuration(180).start()
         }
-        val card = surfaceCard(dp(24f).toFloat()).apply {
-            setCardBackgroundColor(PAGE_BACKGROUND)
-            setOnClickListener { }
-        }
-        val body = verticalLayout().apply { setPadding(dp(20), dp(18), dp(20), dp(18)) }
-        body.addView(text("分享", 20f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(12)))
-        body.addView(shareRow(
-            if (viewingPublicSchedule) "导出本专业课表为PNG" else "导出本周课表为PNG",
-            if (viewingPublicSchedule) "包含课程周数" else "",
-            R.drawable.ic_share_image
-        ) { shareWeekPng() }, spacedParams(dp(8)))
-        body.addView(shareRow("分享CSV文件", "可直接导入WakeUp课程表", R.drawable.ic_share_spreadsheet) { shareCsv() }, spacedParams(dp(8)))
-        body.addView(shareRow("分享 APP", "WeSDAU课程表安装包", R.drawable.ic_share_app) { shareApp() }, matchWrapParams())
-        card.addView(body)
-        val width = minOf(dp(330f), resources.displayMetrics.widthPixels - dp(36f))
-        overlay.addView(card, FrameLayout.LayoutParams(width, -2, Gravity.CENTER))
-        pageHost.addView(overlay, matchParentParams())
-        shareOverlay = overlay
-        overlay.alpha = 0f; card.scaleX = .92f; card.scaleY = .92f
-        overlay.animate().alpha(1f).setDuration(160).start()
-        card.animate().scaleX(1f).scaleY(1f).setDuration(200).start()
-    }
-
-    private fun shareRow(title: String, subtitle: String, icon: Int, action: () -> Unit): View {
-        val row = MaterialCardView(this).apply {
-            radius = dp(14f).toFloat(); cardElevation = 0f; setCardBackgroundColor(SURFACE); setOnClickListener { action() }
-        }
-        val content = horizontalLayout().apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(14), dp(10), dp(14), dp(10)) }
-        content.addView(ImageButton(this).apply { setImageResource(icon); setBackgroundColor(Color.TRANSPARENT); isClickable = false }, LinearLayout.LayoutParams(dp(40), dp(40)))
-        val labels = verticalLayout().apply { setPadding(dp(12), 0, 0, 0) }
-        labels.addView(text(title, 15f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(3)))
-        if (subtitle.isNotEmpty()) labels.addView(text(subtitle, 12f, TEXT_SECONDARY, Typeface.NORMAL), matchWrapParams())
-        content.addView(labels, LinearLayout.LayoutParams(0, -2, 1f))
-        row.addView(content)
-        return row
     }
 
     private fun hideSharePicker() {
         val overlay = shareOverlay ?: return
         overlay.animate().alpha(0f).setDuration(140).withEndAction {
             pageHost.removeView(overlay)
+            (overlay as? LiquidPickerDialogView)?.releaseSnapshot()
             shareOverlay = null
         }.start()
     }
@@ -3964,59 +4030,62 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun showScheduleModePicker() {
-        if (modeOverlay != null) return
-        val overlay = FrameLayout(this).apply {
-            setBackgroundColor(Color.argb(145, 12, 18, 30))
-            isClickable = true
-            setOnClickListener { hideScheduleModePicker() }
+        if (modeOverlay != null || pickerDialogCapturePending) return
+        pickerDialogCapturePending = true
+        captureUpdateBackdrop { pageSnapshot ->
+            pickerDialogCapturePending = false
+            if (isFinishing || isDestroyed || modeOverlay != null) {
+                pageSnapshot?.takeUnless(Bitmap::isRecycled)?.recycle()
+                return@captureUpdateBackdrop
+            }
+            val dialog = LiquidPickerDialogView(
+                context = this,
+                pageSnapshot = pageSnapshot,
+                title = "选择作息时间",
+                options = listOf(
+                    LiquidPickerOption(
+                        title = "春秋作息",
+                        subtitle = "秋季开学到次年“五一”假期",
+                        selected = scheduleMode == ScheduleMode.SPRING,
+                        onClick = { selectScheduleMode(ScheduleMode.SPRING) }
+                    ),
+                    LiquidPickerOption(
+                        title = "夏季作息",
+                        subtitle = "“五一”放假结束后至暑假",
+                        selected = scheduleMode == ScheduleMode.SUMMER,
+                        onClick = { selectScheduleMode(ScheduleMode.SUMMER) }
+                    )
+                ),
+                onDismiss = ::hideScheduleModePicker
+            )
+            pageHost.addView(dialog, matchParentParams())
+            modeOverlay = dialog
+            dialog.alpha = 0f
+            dialog.animate().alpha(1f).setDuration(180).start()
         }
-        val card = surfaceCard(dp(24f).toFloat()).apply {
-            setCardBackgroundColor(SCHEDULE_BACKGROUND)
-            setOnClickListener { }
-        }
-        val body = verticalLayout().apply { setPadding(dp(22), dp(20), dp(22), dp(20)) }
-        body.addView(text("选择作息时间", 20f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(15)))
-        body.addView(scheduleModeRow("春秋作息", "秋季开学到次年“五一”假期", ScheduleMode.SPRING), spacedParams(dp(10)))
-        body.addView(scheduleModeRow("夏季作息", "“五一”放假结束后至暑假", ScheduleMode.SUMMER), matchWrapParams())
-        card.addView(body)
-        val width = minOf(dp(330f), resources.displayMetrics.widthPixels - dp(36f))
-        overlay.addView(card, FrameLayout.LayoutParams(width, -2, Gravity.CENTER))
-        pageHost.addView(overlay, matchParentParams())
-        modeOverlay = overlay
-        overlay.alpha = 0f; card.scaleX = .92f; card.scaleY = .92f
-        overlay.animate().alpha(1f).setDuration(160).start()
-        card.animate().scaleX(1f).scaleY(1f).setDuration(200).start()
     }
 
-    private fun scheduleModeRow(title: String, subtitle: String, mode: ScheduleMode): View {
-        val row = MaterialCardView(this).apply {
-            radius = dp(16f).toFloat()
-            cardElevation = 0f
-            setCardBackgroundColor(if (scheduleMode == mode) PRIMARY_CONTAINER else SURFACE)
-            setOnClickListener {
-                scheduleMode = mode
-                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
-                    .putString(KEY_SCHEDULE_MODE, mode.name)
-                    .apply()
-                scheduleGrid?.setScheduleMode(mode)
-                CourseWidgetProvider.updateAll(this@MainActivity)
-                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU || checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
-                    scheduleSystemCourseReminder()
-                }
-                hideScheduleModePicker()
-            }
+    private fun selectScheduleMode(mode: ScheduleMode) {
+        scheduleMode = mode
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+            .putString(KEY_SCHEDULE_MODE, mode.name)
+            .apply()
+        scheduleGrid?.setScheduleMode(mode)
+        CourseWidgetProvider.updateAll(this)
+        if (
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        ) {
+            scheduleSystemCourseReminder()
         }
-        val content = verticalLayout().apply { setPadding(dp(16), dp(12), dp(16), dp(12)) }
-        content.addView(text(title, 16f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(4)))
-        content.addView(text(subtitle, 12f, TEXT_SECONDARY, Typeface.NORMAL), matchWrapParams())
-        row.addView(content)
-        return row
+        hideScheduleModePicker()
     }
 
     private fun hideScheduleModePicker() {
         val overlay = modeOverlay ?: return
         overlay.animate().alpha(0f).setDuration(140).withEndAction {
             pageHost.removeView(overlay)
+            (overlay as? LiquidPickerDialogView)?.releaseSnapshot()
             modeOverlay = null
         }.start()
     }
@@ -4181,7 +4250,7 @@ class MainActivity : android.app.Activity() {
         CourseReminderScheduler.cancel(this)
     }
 
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == NOTIFICATION_PERMISSION_REQUEST && grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
             if (pendingPushEnable) {
@@ -4250,21 +4319,21 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun sampleCourses() = listOf(
-        Course(0, 0, 2, "高等数学 A", "5N201", "张风", Color.rgb(232, 126, 158), Color.WHITE),
-        Course(0, 2, 2, "人工智能通识基础", "5S416", "高智勇", Color.rgb(231, 142, 168), Color.WHITE),
+        Course(0, 0, 2, "高等数学 A", "5N201", "张老师", Color.rgb(232, 126, 158), Color.WHITE),
+        Course(0, 2, 2, "人工智能通识基础", "5S416", "高老师", Color.rgb(231, 142, 168), Color.WHITE),
         Course(0, 4, 2, "大学英语", "北校12号楼310", "王老师", Color.rgb(230, 157, 126), Color.WHITE),
-        Course(1, 0, 2, "大学化学", "E308", "陈田田", Color.rgb(181, 145, 226), Color.WHITE),
+        Course(1, 0, 2, "大学化学", "E308", "陈老师", Color.rgb(181, 145, 226), Color.WHITE),
         Course(1, 2, 2, "程序设计基础", "N104", "陈老师", Color.rgb(103, 205, 191), Color.WHITE),
-        Course(1, 6, 2, "体育", "S514", "孟猛", Color.rgb(109, 153, 222), Color.WHITE),
+        Course(1, 6, 2, "体育", "S514", "孟老师", Color.rgb(109, 153, 222), Color.WHITE),
         Course(2, 0, 2, "计算机导论", "图信楼413", "李老师", Color.rgb(182, 147, 224), Color.WHITE),
-        Course(2, 2, 2, "大学英语 B1", "图信楼大厅A区", "曹惠", Color.rgb(100, 158, 206), Color.WHITE),
+        Course(2, 2, 2, "大学英语 B1", "图信楼大厅A区", "曹老师", Color.rgb(100, 158, 206), Color.WHITE),
         Course(2, 4, 2, "思想道德与法治", "北校文理大楼503", "赵老师", Color.rgb(91, 167, 205), Color.WHITE),
         Course(3, 0, 2, "习近平新时代中国特色社会主义思想概论", "19#408", "周老师", Color.rgb(235, 177, 101), Color.WHITE),
         Course(3, 2, 2, "大学物理", "南校区体育北足球场", "周老师", Color.rgb(236, 132, 107), Color.WHITE),
-        Course(3, 6, 2, "新时代实践教育", "22#402", "李晨", Color.rgb(230, 128, 160), Color.WHITE),
+        Course(3, 6, 2, "新时代实践教育", "22#402", "李老师", Color.rgb(230, 128, 160), Color.WHITE),
         Course(4, 0, 2, "数据结构", "W205", "高老师", Color.rgb(100, 201, 187), Color.WHITE),
-        Course(4, 2, 2, "高等数学 A1", "西北区体育N", "张风", Color.rgb(97, 202, 188), Color.WHITE),
-        Course(4, 4, 2, "线性代数", "南校区实验楼C楼C241", "张风", Color.rgb(182, 147, 224), Color.WHITE)
+        Course(4, 2, 2, "高等数学 A1", "西北区体育N", "张老师", Color.rgb(97, 202, 188), Color.WHITE),
+        Course(4, 4, 2, "线性代数", "南校区实验楼C楼C241", "张老师", Color.rgb(182, 147, 224), Color.WHITE)
     )
 
     private fun sampleScoreResult(term: String): RemoteScoreResult {
@@ -5014,6 +5083,14 @@ class MainActivity : android.app.Activity() {
     @Deprecated("Use OnBackInvokedDispatcher on newer Android versions")
     override fun onBackPressed() {
         if (forceUpdateActive) return
+        if (actionMenuOverlay != null) {
+            hideActionMenu()
+            return
+        }
+        if (updateOverlay != null) {
+            hideUpdateDialog()
+            return
+        }
         if (onLoginPage && loginMode == LoginMode.PUBLIC) {
             loginMode = LoginMode.PERSONAL
             swapPage(buildLoginPage(), false, true)
@@ -5435,538 +5512,307 @@ class MainActivity : android.app.Activity() {
         val columnCount: Int
     )
 
-    private inner class LoginModeToggle(
+    /**
+     * 登录卡片的横向手势协调器。顶部标题和导航保持原位，仅让表单跟随手指移动；
+     * 导航胶囊的位置通过 [onPositionChanged] 使用同一份进度同步更新。
+     */
+    private inner class LoginSwipeLayout(
         context: Context,
         initialMode: LoginMode,
-        private val onModeSelected: (LoginMode, LoginModeToggle) -> Unit
-    ) : FrameLayout(context) {
-        private var selectedMode = initialMode
-        private var animating = false
-        private var selectionPosition = if (initialMode == LoginMode.PUBLIC) 1f else 0f
-        private val trackBounds = RectF()
-        private val selectionBounds = RectF()
-        private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = PUBLIC_TOGGLE_BACKGROUND
-            style = Paint.Style.FILL
+        private val onPositionChanged: (Float) -> Unit,
+        private val createModeForm: (LoginMode) -> View,
+        private val onModeSettled: (LoginMode) -> Unit
+    ) : LinearLayout(context) {
+        private val formHost = FrameLayout(context).apply {
+            clipChildren = true
+            clipToPadding = true
         }
-        private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = PUBLIC_TOGGLE_BACKGROUND
-            style = Paint.Style.FILL
-            setShadowLayer(dp(5).toFloat(), 0f, 0f, Color.argb(115, 94, 181, 255))
-        }
-        private val outlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = PUBLIC_TOGGLE_OUTLINE
-            style = Paint.Style.STROKE
-            strokeWidth = dp(1).toFloat()
-        }
-        private val selectionPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            style = Paint.Style.FILL
-            setShadowLayer(dp(3).toFloat(), 0f, dp(1).toFloat(), Color.argb(72, 32, 39, 53))
-        }
-        private val personalLabel = text("个人课表", 15f, TEXT_PRIMARY, Typeface.BOLD).apply {
-            gravity = Gravity.CENTER
-            includeFontPadding = false
-            isClickable = true
-            setOnClickListener { requestMode(LoginMode.PERSONAL) }
-        }
-        private val publicLabel = text("全校课表", 15f, TEXT_SECONDARY, Typeface.NORMAL).apply {
-            gravity = Gravity.CENTER
-            includeFontPadding = false
-            isClickable = true
-            setOnClickListener { requestMode(LoginMode.PUBLIC) }
-        }
-
-        init {
-            personalLabel.text = "个人课表"
-            personalLabel.textSize = 16f
-            publicLabel.textSize = 16f
-            setPadding(0, 0, 0, 0)
-            setWillNotDraw(false)
-            setLayerType(LAYER_TYPE_SOFTWARE, null)
-            setBackgroundColor(Color.TRANSPARENT)
-            val labels = horizontalLayout().apply {
-                gravity = Gravity.CENTER
-                setBackgroundColor(Color.TRANSPARENT)
-            }
-            labels.addView(personalLabel, LinearLayout.LayoutParams(0, -1, 1f))
-            labels.addView(publicLabel, LinearLayout.LayoutParams(0, -1, 1f))
-            addView(labels, FrameLayout.LayoutParams(-1, -1))
-            updateLabels()
-        }
-
-        override fun onDraw(canvas: Canvas) {
-            super.onDraw(canvas)
-            val trackInset = dp(4).toFloat()
-            if (width <= trackInset * 2f || height <= trackInset * 2f) return
-
-            trackBounds.set(
-                trackInset,
-                trackInset,
-                width.toFloat() - trackInset,
-                height.toFloat() - trackInset
-            )
-            val trackRadius = trackBounds.height() / 2f
-            canvas.drawRoundRect(trackBounds, trackRadius, trackRadius, glowPaint)
-            canvas.drawRoundRect(trackBounds, trackRadius, trackRadius, trackPaint)
-            canvas.drawRoundRect(trackBounds, trackRadius, trackRadius, outlinePaint)
-
-            val selectionVerticalInset = dp(4).toFloat()
-            val selectionHorizontalInset = dp(4).toFloat()
-            val segmentWidth = trackBounds.width() / 2f
-            val selectionWidth = segmentWidth - selectionHorizontalInset * 2f
-            val selectionLeft = trackBounds.left + selectionHorizontalInset + segmentWidth * selectionPosition
-            selectionBounds.set(
-                selectionLeft,
-                trackBounds.top + selectionVerticalInset,
-                selectionLeft + selectionWidth,
-                trackBounds.bottom - selectionVerticalInset
-            )
-            val selectionRadius = selectionBounds.height() / 2f
-            canvas.drawRoundRect(selectionBounds, selectionRadius, selectionRadius, selectionPaint)
-        }
-
-        private fun requestMode(mode: LoginMode) {
-            if (animating || mode == selectedMode) return
-            selectedMode = mode
-            animating = true
-            updateLabels()
-            val target = if (mode == LoginMode.PUBLIC) 1f else 0f
-            // 表单过渡与胶囊滑动在同一帧启动，并共用相同时长与曲线。
-            onModeSelected(mode, this)
-            ValueAnimator.ofFloat(selectionPosition, target).apply {
-                duration = 380L
-                interpolator = PathInterpolator(.2f, .78f, .2f, 1f)
-                addUpdateListener { animator ->
-                    selectionPosition = animator.animatedValue as Float
-                    invalidate()
-                }
-                addListener(object : android.animation.AnimatorListenerAdapter() {
-                    override fun onAnimationEnd(animation: android.animation.Animator) {
-                        selectionPosition = target
-                        animating = false
-                    }
-                })
-                start()
-            }
-        }
-
-        private fun updateLabels() {
-            val personalSelected = selectedMode == LoginMode.PERSONAL
-            personalLabel.setTextColor(if (personalSelected) TEXT_PRIMARY else TEXT_SECONDARY)
-            personalLabel.setTypeface(Typeface.DEFAULT, if (personalSelected) Typeface.BOLD else Typeface.NORMAL)
-            publicLabel.setTextColor(if (personalSelected) TEXT_SECONDARY else TEXT_PRIMARY)
-            publicLabel.setTypeface(Typeface.DEFAULT, if (personalSelected) Typeface.NORMAL else Typeface.BOLD)
-            personalLabel.setBackgroundColor(Color.TRANSPARENT)
-            publicLabel.setBackgroundColor(Color.TRANSPARENT)
-        }
-    }
-
-    /**
-     * 轻量的液态玻璃底栏。它由半透明玻璃、双层高光和会流动的选中胶囊组成，
-     * 不依赖额外图片资源，也不会改变上方课程表的七列网格模型。
-     */
-    private inner class LiquidGlassNavigationView(context: Context) : View(context) {
-        private val labels = arrayOf("课程表", "考试安排", "成绩", "空教室查询")
-        private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-        private val bounds = RectF()
-        private val indicatorBounds = RectF()
-        private val trailBounds = RectF()
-        private val iconBounds = RectF()
-        private val shaderMatrix = Matrix()
-        private var indicatorShader: LinearGradient? = null
-        private var borderShader: LinearGradient? = null
-        private var forwardRefractionShader: LinearGradient? = null
-        private var reverseRefractionShader: LinearGradient? = null
-        private val releaseInterpolator = PathInterpolator(.18f, .86f, .22f, 1f)
-        private var selectedItem = 0
-        private var committedItem = 0
-        private var indicatorPosition = 0f
-        private var lastDragItem = 0
-        private var indicatorAnimator: ValueAnimator? = null
-        private var velocityTracker: VelocityTracker? = null
-        private var dragOriginPosition = 0f
-        private var refractionAlpha = 0f
-        private var indicatorScale = 1f
-        private var selectionDispatchToken = 0
+        private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
         private val minimumFlingVelocity = ViewConfiguration.get(context).scaledMinimumFlingVelocity
-        private val maximumFlingVelocity = ViewConfiguration.get(context).scaledMaximumFlingVelocity
-        var onItemSelected: ((Int, View) -> Unit)? = null
+        private var mode = initialMode
+        private var downX = 0f
+        private var downY = 0f
+        private var dragProgress = 0f
+        private var dragging = false
+        private var velocityTracker: VelocityTracker? = null
+        private var transitionAnimator: ValueAnimator? = null
 
         init {
-            setLayerType(LAYER_TYPE_HARDWARE, null)
-            isClickable = true
-            isFocusable = true
-            importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
-            contentDescription = "校园功能底部导航"
+            orientation = VERTICAL
         }
 
-        override fun onSizeChanged(width: Int, height: Int, oldWidth: Int, oldHeight: Int) {
-            super.onSizeChanged(width, height, oldWidth, oldHeight)
-            indicatorShader = LinearGradient(
-                0f, 0f, 1f, 1f,
-                intArrayOf(Color.argb(205, 255, 255, 255), Color.argb(185, 218, 224, 255), Color.argb(172, 238, 232, 255)),
-                floatArrayOf(0f, .55f, 1f), Shader.TileMode.CLAMP
-            )
-            borderShader = LinearGradient(
-                0f, 0f, width.toFloat(), height.toFloat(),
-                intArrayOf(Color.argb(235, 255, 255, 255), Color.argb(90, 146, 158, 204), Color.argb(220, 255, 255, 255)),
-                null, Shader.TileMode.CLAMP
-            )
-            val forwardColors = intArrayOf(
-                Color.argb(18, 255, 255, 255), Color.argb(70, 255, 255, 255),
-                Color.argb(28, 159, 181, 255), Color.argb(105, 255, 255, 255), Color.TRANSPARENT
-            )
-            forwardRefractionShader = LinearGradient(
-                0f, 0f, 1f, 0f, forwardColors,
-                floatArrayOf(0f, .2f, .48f, .78f, 1f), Shader.TileMode.CLAMP
-            )
-            reverseRefractionShader = LinearGradient(
-                0f, 0f, 1f, 0f, forwardColors.reversedArray(),
-                floatArrayOf(0f, .2f, .48f, .78f, 1f), Shader.TileMode.CLAMP
-            )
+        fun attachInitialForm(form: View) {
+            formHost.removeAllViews()
+            formHost.addView(form, FrameLayout.LayoutParams(-1, -2))
+            addView(formHost, LinearLayout.LayoutParams(-1, -2))
         }
 
-        fun selectItem(index: Int, animate: Boolean) {
-            val target = index.coerceIn(labels.indices)
-            selectedItem = target
-            committedItem = target
-            indicatorAnimator?.cancel()
-            if (!animate) {
-                indicatorPosition = target.toFloat()
-                refractionAlpha = 0f
-                indicatorScale = 1f
-                invalidate()
-                return
+        fun animateToMode(targetMode: LoginMode) {
+            if (targetMode == mode || transitionAnimator != null || dragging) return
+            completeTransition(targetMode, 0f)
+        }
+
+        fun updateFromModeToggle(position: Float) {
+            if (transitionAnimator != null) return
+            val direction = if (mode == LoginMode.PERSONAL) 1f else -1f
+            val basePosition = modeIndex(mode)
+            dragProgress = ((position.coerceIn(0f, 1f) - basePosition) * direction)
+                .coerceIn(0f, .98f)
+            // A simple tap also reports an initial zero-distance drag from Compose.
+            // Do not lock the form transition unless the indicator actually moved.
+            dragging = dragProgress > .001f
+            val width = formHost.width.coerceAtLeast(1).toFloat()
+            val current = formHost.getChildAt(0) ?: return
+            current.translationX = -direction * width * dragProgress
+            current.alpha = 1f - .12f * dragProgress
+            onPositionChanged(basePosition + direction * dragProgress)
+        }
+
+        fun finishModeToggleDrag(position: Float, velocityX: Float) {
+            if (transitionAnimator != null) return
+            val direction = if (mode == LoginMode.PERSONAL) 1f else -1f
+            val basePosition = modeIndex(mode)
+            dragProgress = ((position.coerceIn(0f, 1f) - basePosition) * direction)
+                .coerceIn(0f, .98f)
+            dragging = false
+            val target = if (mode == LoginMode.PERSONAL) LoginMode.PUBLIC else LoginMode.PERSONAL
+            if (dragProgress >= .5f) {
+                completeTransition(target, dragProgress)
+            } else {
+                cancelDrag()
             }
-            animateRelease(target, 0f)
         }
 
-        private fun animateRelease(target: Int, velocityX: Float) {
-            indicatorAnimator?.cancel()
-            val targetPosition = target.toFloat()
-            val startPosition = indicatorPosition
-            val fastEdgeRelease = isFastEdgeRelease(target, velocityX)
-            indicatorAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
-                val travel = kotlin.math.abs(targetPosition - startPosition)
-                duration = if (fastEdgeRelease) 260L else (280f + travel * 24f).toLong().coerceAtMost(325L)
-                interpolator = releaseInterpolator
-                addUpdateListener { animator ->
-                    val fraction = animator.animatedFraction
-                    val rawFraction = (animator.currentPlayTime.toFloat() / animator.duration.coerceAtLeast(1L))
-                        .coerceIn(0f, 1f)
-                    indicatorPosition = lerp(startPosition, targetPosition, fraction)
-                    // 三个逐渐衰减的半波形成“膨胀—收缩—轻回弹”的阻尼弹簧。
-                    val springAmplitude = if (fastEdgeRelease) .22f else .16f
-                    val damping = kotlin.math.exp(-3.4f * rawFraction)
-                    indicatorScale = 1f + springAmplitude * damping *
-                        kotlin.math.sin((Math.PI * 3.0 * rawFraction)).toFloat()
-                    refractionAlpha = ((1f - fraction) * 1.08f).coerceIn(0f, 1f)
-                    postInvalidateOnAnimation()
+        override fun onInterceptTouchEvent(event: MotionEvent): Boolean {
+            if (transitionAnimator != null) return true
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = event.x
+                    downY = event.y
+                    dragProgress = 0f
+                    dragging = false
+                    velocityTracker?.recycle()
+                    velocityTracker = VelocityTracker.obtain().also { it.addMovement(event) }
                 }
-                addListener(object : android.animation.AnimatorListenerAdapter() {
-                    override fun onAnimationEnd(animation: android.animation.Animator) {
-                        indicatorPosition = targetPosition
-                        indicatorScale = 1f
-                        refractionAlpha = 0f
-                        invalidate()
+                MotionEvent.ACTION_MOVE -> {
+                    velocityTracker?.addMovement(event)
+                    val dx = event.x - downX
+                    val dy = event.y - downY
+                    val movingTowardOtherPage =
+                        (mode == LoginMode.PERSONAL && dx < 0f) ||
+                            (mode == LoginMode.PUBLIC && dx > 0f)
+                    if (movingTowardOtherPage &&
+                        abs(dx) > touchSlop &&
+                        abs(dx) > abs(dy) * 1.15f
+                    ) {
+                        dragging = true
+                        parent?.requestDisallowInterceptTouchEvent(true)
+                        updateDrag(dx)
+                        return true
                     }
-                })
-                start()
-            }
-        }
-
-        private fun isFastEdgeRelease(target: Int, velocityX: Float): Boolean {
-            val fast = kotlin.math.abs(velocityX) >= minimumFlingVelocity * 2.25f
-            return fast && ((target == 0 && velocityX < 0f) ||
-                (target == labels.lastIndex && velocityX > 0f))
-        }
-
-        private fun lerp(start: Float, end: Float, fraction: Float) = start + (end - start) * fraction
-
-        override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-            val width = resolveSize(dp(216), widthMeasureSpec)
-            val height = resolveSize(dp(54), heightMeasureSpec)
-            setMeasuredDimension(width, height)
-        }
-
-        override fun onDraw(canvas: Canvas) {
-            super.onDraw(canvas)
-            val edge = dp(2f).toFloat()
-            bounds.set(edge, edge, width - edge, height - edge)
-            val radius = dp(26f).toFloat()
-
-            // 分层透明阴影保持玻璃悬浮感，并避免拖动时重复计算软件模糊阴影。
-            paint.style = Paint.Style.FILL
-            paint.shader = null
-            paint.color = Color.argb(16, 50, 64, 112)
-            canvas.drawRoundRect(
-                bounds.left - dp(1f), bounds.top + dp(3f),
-                bounds.right + dp(1f), bounds.bottom + dp(4f),
-                radius + dp(1f), radius + dp(1f), paint
-            )
-            paint.color = Color.argb(18, 50, 64, 112)
-            canvas.drawRoundRect(
-                bounds.left, bounds.top + dp(2f), bounds.right, bounds.bottom + dp(2f),
-                radius, radius, paint
-            )
-            paint.color = Color.argb(218, 249, 251, 255)
-            canvas.drawRoundRect(bounds, radius, radius, paint)
-
-            val itemWidth = (width - edge * 2f) / labels.size
-            val indicatorLeft = edge + indicatorPosition * itemWidth + dp(4f)
-            indicatorBounds.set(
-                indicatorLeft, dp(5f).toFloat(),
-                indicatorLeft + itemWidth - dp(8f), height.toFloat() - dp(5f)
-            )
-            val horizontalExpansion = indicatorBounds.width() * (indicatorScale - 1f) * .5f
-            val verticalExpansion = indicatorBounds.height() * (indicatorScale - 1f) * .5f
-            indicatorBounds.inset(-horizontalExpansion, -verticalExpansion)
-
-            drawDragRefraction(canvas, edge, itemWidth, indicatorBounds)
-
-            indicatorShader?.let { shader ->
-                shaderMatrix.reset()
-                shaderMatrix.setScale(indicatorBounds.width().coerceAtLeast(1f), indicatorBounds.height().coerceAtLeast(1f))
-                shaderMatrix.postTranslate(indicatorBounds.left, indicatorBounds.top)
-                shader.setLocalMatrix(shaderMatrix)
-                paint.shader = shader
-            }
-            canvas.drawRoundRect(indicatorBounds, dp(22f).toFloat(), dp(22f).toFloat(), paint)
-            paint.shader = null
-
-            // 流体边缘的小光斑让胶囊在移动时更像凝聚的玻璃液滴。
-            paint.color = Color.argb(105, 255, 255, 255)
-            canvas.drawCircle(indicatorBounds.left + dp(11f), indicatorBounds.top + dp(8f), dp(6f).toFloat(), paint)
-            paint.color = Color.argb(48, 116, 136, 235)
-            canvas.drawCircle(indicatorBounds.right - dp(8f), indicatorBounds.bottom - dp(8f), dp(5f).toFloat(), paint)
-
-            paint.style = Paint.Style.STROKE
-            paint.strokeWidth = dp(1f).toFloat()
-            paint.shader = borderShader
-            canvas.drawRoundRect(bounds, radius, radius, paint)
-            paint.shader = null
-
-            // 顶缘高光。
-            paint.color = Color.argb(190, 255, 255, 255)
-            paint.strokeWidth = dp(1.2f).toFloat()
-            canvas.drawLine(dp(22f).toFloat(), dp(4f).toFloat(), width - dp(22f).toFloat(), dp(4f).toFloat(), paint)
-
-            for (index in labels.indices) {
-                val centerX = edge + itemWidth * (index + .5f)
-                val active = index == selectedItem
-                val currentInfluence = (1f - kotlin.math.abs(index - indicatorPosition)).coerceIn(0f, 1f)
-                val trailStart = minOf(dragOriginPosition, indicatorPosition)
-                val trailEnd = maxOf(dragOriginPosition, indicatorPosition)
-                val indexPosition = index.toFloat()
-                val passedInfluence = if (indexPosition >= trailStart && indexPosition <= trailEnd) .34f else 0f
-                val refractionInfluence = maxOf(currentInfluence, passedInfluence) * refractionAlpha
-                val lift = dp(2.2f) * refractionInfluence
-                drawNavigationIcon(
-                    canvas, index, centerX, height / 2f - lift,
-                    active, refractionInfluence
-                )
-            }
-        }
-
-        private fun drawDragRefraction(canvas: Canvas, edge: Float, itemWidth: Float, indicator: RectF) {
-            if (refractionAlpha <= .01f) return
-            val originCenter = edge + itemWidth * (dragOriginPosition + .5f)
-            val currentCenter = indicator.centerX()
-            if (kotlin.math.abs(currentCenter - originCenter) < dp(2f)) return
-
-            val left = minOf(originCenter, currentCenter) - itemWidth * .28f
-            val right = maxOf(originCenter, currentCenter) + itemWidth * .28f
-            trailBounds.set(left, dp(7f).toFloat(), right, height - dp(7f).toFloat())
-            val directionFromLeft = currentCenter >= originCenter
-
-            val checkpoint = canvas.save()
-            canvas.clipRect(bounds)
-            paint.style = Paint.Style.FILL
-            val refractionShader = if (directionFromLeft) forwardRefractionShader else reverseRefractionShader
-            refractionShader?.let { shader ->
-                shaderMatrix.reset()
-                shaderMatrix.setScale(trailBounds.width().coerceAtLeast(1f), 1f)
-                shaderMatrix.postTranslate(trailBounds.left, 0f)
-                shader.setLocalMatrix(shaderMatrix)
-                paint.shader = shader
-            }
-            paint.alpha = (255 * refractionAlpha).toInt().coerceIn(0, 255)
-            canvas.drawRoundRect(trailBounds, dp(18f).toFloat(), dp(18f).toFloat(), paint)
-            paint.alpha = 255
-            paint.shader = null
-
-            canvas.restoreToCount(checkpoint)
-        }
-
-        private fun drawNavigationIcon(
-            canvas: Canvas,
-            index: Int,
-            cx: Float,
-            cy: Float,
-            active: Boolean,
-            refraction: Float
-        ) {
-            if (refraction > .01f) {
-                paint.style = Paint.Style.STROKE
-                paint.shader = null
-                paint.strokeCap = Paint.Cap.ROUND
-                paint.strokeJoin = Paint.Join.ROUND
-                paint.strokeWidth = dp(2.8f).toFloat()
-                paint.color = Color.argb((70f * refraction).toInt(), 119, 151, 255)
-                val checkpoint = canvas.save()
-                canvas.translate(0f, dp(.85f) * refraction)
-                drawNavigationIconShape(canvas, index, cx, cy)
-                canvas.restoreToCount(checkpoint)
-            }
-
-            paint.style = Paint.Style.STROKE
-            paint.shader = null
-            paint.strokeCap = Paint.Cap.ROUND
-            paint.strokeJoin = Paint.Join.ROUND
-            paint.strokeWidth = dp(if (active) 2.1f else 1.75f).toFloat()
-            paint.color = if (active) PRIMARY_DARK else Color.rgb(105, 113, 132)
-            drawNavigationIconShape(canvas, index, cx, cy)
-
-            if (refraction > .01f) {
-                paint.style = Paint.Style.FILL
-                paint.color = Color.argb((125f * refraction).toInt(), 255, 255, 255)
-                canvas.drawCircle(cx - dp(5.5f), cy - dp(6.5f), dp(1.15f) * refraction, paint)
-            }
-        }
-
-        private fun drawNavigationIconShape(canvas: Canvas, index: Int, cx: Float, cy: Float) {
-            val s = dp(8f).toFloat()
-            when (index) {
-                0 -> {
-                    iconBounds.set(cx - s, cy - s * .72f, cx + s, cy + s * .78f)
-                    canvas.drawRoundRect(iconBounds, dp(2.5f).toFloat(), dp(2.5f).toFloat(), paint)
-                    canvas.drawLine(iconBounds.left, cy - s * .28f, iconBounds.right, cy - s * .28f, paint)
-                    canvas.drawLine(cx - s * .48f, cy - s, cx - s * .48f, cy - s * .5f, paint)
-                    canvas.drawLine(cx + s * .48f, cy - s, cx + s * .48f, cy - s * .5f, paint)
                 }
-                1 -> {
-                    iconBounds.set(cx - s * .72f, cy - s, cx + s * .72f, cy + s)
-                    canvas.drawRoundRect(iconBounds, dp(2f).toFloat(), dp(2f).toFloat(), paint)
-                    canvas.drawLine(cx - s * .4f, cy - s * .48f, cx + s * .38f, cy - s * .48f, paint)
-                    canvas.drawLine(cx - s * .4f, cy - s * .08f, cx + s * .2f, cy - s * .08f, paint)
-                    canvas.drawCircle(cx + s * .34f, cy + s * .48f, s * .28f, paint)
-                    canvas.drawLine(cx + s * .34f, cy + s * .48f, cx + s * .34f, cy + s * .31f, paint)
-                    canvas.drawLine(cx + s * .34f, cy + s * .48f, cx + s * .47f, cy + s * .56f, paint)
-                }
-                2 -> {
-                    canvas.drawLine(cx - s, cy + s * .9f, cx + s, cy + s * .9f, paint)
-                    canvas.drawLine(cx - s * .65f, cy + s * .9f, cx - s * .65f, cy + s * .1f, paint)
-                    canvas.drawLine(cx, cy + s * .9f, cx, cy - s * .45f, paint)
-                    canvas.drawLine(cx + s * .65f, cy + s * .9f, cx + s * .65f, cy - s, paint)
-                }
-                3 -> {
-                    canvas.drawCircle(cx - s * .18f, cy - s * .18f, s * .58f, paint)
-                    canvas.drawLine(
-                        cx + s * .23f, cy + s * .23f,
-                        cx + s * .86f, cy + s * .86f,
-                        paint
-                    )
-                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> recycleVelocityTracker()
             }
+            return super.onInterceptTouchEvent(event)
         }
 
         override fun onTouchEvent(event: MotionEvent): Boolean {
+            if (transitionAnimator != null) return true
             velocityTracker?.addMovement(event)
             when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN -> {
-                    indicatorAnimator?.cancel()
-                    velocityTracker?.recycle()
-                    velocityTracker = VelocityTracker.obtain().also { it.addMovement(event) }
-                    selectionDispatchToken++
-                    dragOriginPosition = committedItem.toFloat()
-                    refractionAlpha = 1f
-                    indicatorScale = 1f
-                    val position = indicatorPositionForX(event.x)
-                    indicatorPosition = position
-                    selectedItem = nearestItem(position)
-                    lastDragItem = selectedItem
-                    parent?.requestDisallowInterceptTouchEvent(true)
-                    postInvalidateOnAnimation()
-                    return true
-                }
                 MotionEvent.ACTION_MOVE -> {
-                    val position = indicatorPositionForX(event.x)
-                    indicatorPosition = position
-                    selectedItem = nearestItem(position)
-                    if (selectedItem != lastDragItem) {
-                        performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
-                        lastDragItem = selectedItem
-                    }
-                    postInvalidateOnAnimation()
-                    return true
+                    if (dragging) updateDrag(event.x - downX)
+                    return dragging
                 }
                 MotionEvent.ACTION_UP -> {
-                    velocityTracker?.computeCurrentVelocity(1000, maximumFlingVelocity.toFloat())
+                    if (!dragging) {
+                        recycleVelocityTracker()
+                        return false
+                    }
+                    velocityTracker?.computeCurrentVelocity(1000)
                     val velocityX = velocityTracker?.xVelocity ?: 0f
-                    val releasePosition = indicatorPositionForX(event.x)
-                    val itemWidth = ((width - dp(4f)).toFloat() / labels.size).coerceAtLeast(1f)
-                    val projectedPosition = if (kotlin.math.abs(velocityX) >= minimumFlingVelocity * 2.25f) {
-                        releasePosition + (velocityX / itemWidth).coerceIn(-1.8f, 1.8f) * .16f
-                    } else {
-                        releasePosition
-                    }
-                    val target = nearestItem(projectedPosition.coerceIn(0f, labels.lastIndex.toFloat()))
+                    val direction = if (mode == LoginMode.PERSONAL) 1 else -1
+                    val flingTowardTarget =
+                        abs(velocityX) >= minimumFlingVelocity * 4f &&
+                            velocityX * direction < 0f
+                    val shouldCommit = dragProgress >= .26f || flingTowardTarget
+                    val target = if (mode == LoginMode.PERSONAL) LoginMode.PUBLIC else LoginMode.PERSONAL
+                    dragging = false
                     parent?.requestDisallowInterceptTouchEvent(false)
-                    performClick()
-                    if (target != lastDragItem) performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
-                    selectedItem = target
-                    committedItem = target
-                    val fastEdgeRelease = isFastEdgeRelease(target, velocityX)
-                    animateRelease(target, velocityX)
-                    velocityTracker?.recycle()
-                    velocityTracker = null
-                    contentDescription = "已选择${labels[target]}"
-                    val dispatchToken = ++selectionDispatchToken
-                    if (fastEdgeRelease) {
-                        postDelayed({
-                            if (dispatchToken == selectionDispatchToken && committedItem == target) {
-                                onItemSelected?.invoke(target, this)
-                            }
-                        }, 265L)
-                    } else {
-                        onItemSelected?.invoke(target, this)
-                    }
+                    recycleVelocityTracker()
+                    if (shouldCommit) completeTransition(target, dragProgress) else cancelDrag()
                     return true
                 }
                 MotionEvent.ACTION_CANCEL -> {
+                    if (dragging) cancelDrag()
+                    dragging = false
                     parent?.requestDisallowInterceptTouchEvent(false)
-                    selectedItem = committedItem
-                    animateRelease(committedItem, 0f)
-                    velocityTracker?.recycle()
-                    velocityTracker = null
+                    recycleVelocityTracker()
                     return true
                 }
             }
             return true
         }
 
-        private fun indicatorPositionForX(x: Float): Float {
-            val edge = dp(2f).toFloat()
-            val itemWidth = (width - edge * 2f) / labels.size
-            return ((x - edge) / itemWidth - .5f).coerceIn(0f, labels.lastIndex.toFloat())
+        private fun updateDrag(dx: Float) {
+            val width = formHost.width.coerceAtLeast(1).toFloat()
+            val direction = if (mode == LoginMode.PERSONAL) 1 else -1
+            dragProgress = (-dx * direction / width).coerceIn(0f, .98f)
+            val current = formHost.getChildAt(0) ?: return
+            current.translationX = -direction * width * dragProgress
+            current.alpha = 1f - .12f * dragProgress
+            onPositionChanged(modeIndex(mode) + direction * dragProgress)
         }
 
-        private fun nearestItem(position: Float) = (position + .5f).toInt().coerceIn(labels.indices)
-
-        override fun performClick(): Boolean {
-            super.performClick()
-            return true
+        private fun cancelDrag() {
+            val current = formHost.getChildAt(0) ?: return
+            val start = dragProgress
+            val direction = if (mode == LoginMode.PERSONAL) 1 else -1
+            val width = formHost.width.coerceAtLeast(1).toFloat()
+            transitionAnimator = ValueAnimator.ofFloat(start, 0f).apply {
+                duration = (120L + 140L * start).toLong()
+                interpolator = PathInterpolator(.2f, .78f, .2f, 1f)
+                addUpdateListener { animator ->
+                    val progress = animator.animatedValue as Float
+                    current.translationX = -direction * width * progress
+                    current.alpha = 1f - .12f * progress
+                    onPositionChanged(modeIndex(mode) + direction * progress)
+                }
+                addListener(object : android.animation.AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: android.animation.Animator) {
+                        current.translationX = 0f
+                        current.alpha = 1f
+                        dragProgress = 0f
+                        transitionAnimator = null
+                        onModeSettled(mode)
+                    }
+                })
+                start()
+            }
         }
 
-        override fun onDetachedFromWindow() {
-            indicatorAnimator?.removeAllUpdateListeners()
-            indicatorAnimator?.removeAllListeners()
-            indicatorAnimator?.cancel()
-            indicatorAnimator = null
+        private fun completeTransition(targetMode: LoginMode, startProgress: Float) {
+            val previous = formHost.getChildAt(0) ?: return
+            val oldMode = mode
+            val direction = modeIndex(targetMode) - modeIndex(oldMode)
+            if (direction == 0f) return
+            val width = formHost.width.coerceAtLeast(1)
+            val startHeight = formHost.height
+            val next = createModeForm(targetMode)
+            // ComposeView needs an attached window to obtain its windowRecomposer.
+            // Attach the new form before pre-measuring it for the height animation.
+            formHost.addView(next, FrameLayout.LayoutParams(-1, -2))
+            next.measure(
+                View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+                View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+            )
+            val targetHeight = next.measuredHeight
+            formHost.layoutParams = formHost.layoutParams.apply { height = startHeight }
+
+            fun applyProgress(progress: Float) {
+                previous.translationX = -direction * width * progress
+                previous.alpha = 1f - .12f * progress
+                next.translationX = direction * width * (1f - progress)
+                next.alpha = .72f + .28f * progress
+                formHost.layoutParams = formHost.layoutParams.apply {
+                    height = (startHeight + (targetHeight - startHeight) * progress).toInt()
+                }
+                onPositionChanged(modeIndex(oldMode) + direction * progress)
+            }
+
+            applyProgress(startProgress)
+            transitionAnimator = ValueAnimator.ofFloat(startProgress, 1f).apply {
+                duration = (160L + 180L * (1f - startProgress)).toLong()
+                interpolator = PathInterpolator(.2f, .78f, .2f, 1f)
+                addUpdateListener { animator -> applyProgress(animator.animatedValue as Float) }
+                addListener(object : android.animation.AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: android.animation.Animator) {
+                        formHost.removeView(previous)
+                        next.translationX = 0f
+                        next.alpha = 1f
+                        formHost.layoutParams = formHost.layoutParams.apply {
+                            height = ViewGroup.LayoutParams.WRAP_CONTENT
+                        }
+                        mode = targetMode
+                        dragProgress = 0f
+                        transitionAnimator = null
+                        onModeSettled(targetMode)
+                    }
+                })
+                start()
+            }
+        }
+
+        private fun modeIndex(value: LoginMode): Float =
+            if (value == LoginMode.PUBLIC) 1f else 0f
+
+        private fun recycleVelocityTracker() {
             velocityTracker?.recycle()
             velocityTracker = null
-            super.onDetachedFromWindow()
+        }
+    }
+
+    private inner class LoginModeToggle(
+        context: Context,
+        initialMode: LoginMode,
+        private val onDragPosition: ((Float) -> Unit)? = null,
+        private val onDragFinished: ((Float, Float) -> Unit)? = null,
+        private val onModeSelected: (LoginMode, LoginModeToggle) -> Unit
+    ) : FrameLayout(context) {
+        private var selectedMode = initialMode
+        private var modeChangePending = false
+        private val liquidToggle: LoginLiquidModeToggleView
+
+        init {
+            setBackgroundColor(Color.TRANSPARENT)
+            liquidToggle = createLoginLiquidModeToggleView(
+                context = context,
+                initialIndex = if (initialMode == LoginMode.PUBLIC) 1 else 0,
+                onTabSelected = { index ->
+                    requestMode(if (index == 1) LoginMode.PUBLIC else LoginMode.PERSONAL)
+                },
+                onPositionDragged = { position -> onDragPosition?.invoke(position) },
+                onDragFinished = { position, velocityX ->
+                    if (onDragFinished != null) onDragFinished.invoke(position, velocityX)
+                    else finishStandaloneDrag(position, velocityX)
+                }
+            )
+            addView(liquidToggle, FrameLayout.LayoutParams(-1, -1))
+        }
+
+        private fun requestMode(mode: LoginMode) {
+            if (mode == selectedMode || modeChangePending) return
+            modeChangePending = true
+            try {
+                onModeSelected(mode, this)
+            } catch (error: Exception) {
+                modeChangePending = false
+                liquidToggle.setSettledIndex(if (selectedMode == LoginMode.PUBLIC) 1 else 0)
+                Toast.makeText(
+                    this@MainActivity,
+                    "切换课表类型失败：${error.message ?: "未知错误"}",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+
+        private fun finishStandaloneDrag(position: Float, velocityX: Float) {
+            val target = if (position >= .5f) LoginMode.PUBLIC else LoginMode.PERSONAL
+            if (target == selectedMode) {
+                liquidToggle.setSettledIndex(if (selectedMode == LoginMode.PUBLIC) 1 else 0)
+            } else {
+                requestMode(target)
+            }
+        }
+
+        fun setSelectionPosition(position: Float) {
+            liquidToggle.setSelectionPosition(position)
+        }
+
+        fun setSettledMode(mode: LoginMode) {
+            selectedMode = mode
+            modeChangePending = false
+            liquidToggle.setSettledIndex(if (mode == LoginMode.PUBLIC) 1 else 0)
         }
     }
 
@@ -6261,7 +6107,7 @@ class MainActivity : android.app.Activity() {
                 descriptionCenterY,
                 sp(13f),
                 TEXT_SECONDARY,
-                Typeface.NORMAL
+                secondaryTextTypeface()
             )
         }
 
@@ -6564,7 +6410,15 @@ class MainActivity : android.app.Activity() {
             val month = monthDate.get(Calendar.MONTH) + 1
             val monthSize = fittedGridTextSize(month.toString(), sp(14f), timeColumnWidth - dp(6f), Typeface.BOLD)
             drawCenteredText(canvas, month.toString(), timeColumnWidth / 2f, dp(14f).toFloat(), monthSize, TEXT_PRIMARY, Typeface.BOLD)
-            drawCenteredText(canvas, "月", timeColumnWidth / 2f, dp(31f).toFloat(), sp(9f), TEXT_PRIMARY, Typeface.NORMAL)
+            drawCenteredText(
+                canvas,
+                "月",
+                timeColumnWidth / 2f,
+                dp(31f).toFloat(),
+                sp(9f),
+                TEXT_PRIMARY,
+                if (currentPageBackgroundBitmap != null) Typeface.BOLD else Typeface.NORMAL
+            )
             for (day in 0..6) {
                 val center = timeColumnWidth + day * dayColumnWidth + dayColumnWidth / 2f
                 val headerDate = monthDate.clone() as Calendar
@@ -6579,7 +6433,7 @@ class MainActivity : android.app.Activity() {
                     dp(14f).toFloat(),
                     sp(if (isToday) 12.6f else 11.7f),
                     textColor,
-                    if (isToday) Typeface.BOLD else Typeface.NORMAL
+                    if (isToday || currentPageBackgroundBitmap != null) Typeface.BOLD else Typeface.NORMAL
                 )
                 drawCenteredText(
                     canvas,
@@ -6588,7 +6442,7 @@ class MainActivity : android.app.Activity() {
                     dp(31f).toFloat(),
                     sp(if (isToday) 8.6f else 7.8f),
                     textColor,
-                    if (isToday) Typeface.BOLD else Typeface.NORMAL
+                    if (isToday || currentPageBackgroundBitmap != null) Typeface.BOLD else Typeface.NORMAL
                 )
             }
         }
@@ -6910,6 +6764,11 @@ class MainActivity : android.app.Activity() {
     override fun onDestroy() {
         scheduleGrid?.releaseTransientCaches()
         publicScheduleIndexCache.clear()
+        updateDialogView?.releaseSnapshot()
+        updateDialogView = null
+        (shareOverlay as? LiquidPickerDialogView)?.releaseSnapshot()
+        (modeOverlay as? LiquidPickerDialogView)?.releaseSnapshot()
+        actionMenuOverlay?.releaseSnapshot()
         clearUpdateDownloadReceiver()
         networkExecutor.shutdownNow()
         publicSyncExecutor.shutdownNow()
@@ -6947,6 +6806,10 @@ class MainActivity : android.app.Activity() {
         private const val KEY_PUSH_ENABLED = "push_enabled"
         private const val KEY_BATTERY_PROMPTED = "battery_prompted"
         private const val KEY_UPDATE_STARTED_CODE = "update_started_code"
+        private const val KEY_CUSTOM_BACKGROUND = "custom_background"
+        private const val CUSTOM_BACKGROUND_FILE_NAME = "custom_schedule_background"
+        private const val MAX_CUSTOM_BACKGROUND_BYTES = 30L * 1024L * 1024L
+        private const val MAX_CUSTOM_BACKGROUND_DIMENSION = 2048
         private const val VERSION_URL = "https://raw.giteeusercontent.com/sleexy/onlinedata/raw/master/WeSDAU_Class_Schedule_version.json"
         private const val APK_URL = "https://gitee.com/sleexy/onlinedata/raw/master/ClassSchedule-modern.apk"
         private const val UPDATE_FILE_NAME = "WeSDAU课程表最新版本.apk"
@@ -6974,6 +6837,7 @@ class MainActivity : android.app.Activity() {
         private val PUBLIC_TOGGLE_BACKGROUND = Color.rgb(239, 241, 243)
         private val PUBLIC_TOGGLE_OUTLINE = Color.rgb(143, 199, 246)
         private val SCHEDULE_BACKGROUND = Color.rgb(238, 242, 250)
+        private val CUSTOM_BACKGROUND_SCRIM = Color.argb(92, 238, 241, 248)
         private val GRADIENT_COLORS = intArrayOf(
             Color.rgb(243, 242, 249), // #F3F2F9
             Color.rgb(240, 241, 249), // #F0F1F9
