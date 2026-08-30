@@ -581,7 +581,7 @@ class SdauCourseRepository {
         val optionRegex = Regex("<option([^>]*)>([\\s\\S]*?)</option>", RegexOption.IGNORE_CASE)
         optionRegex.findAll(selectBody).forEach { match ->
             val code = htmlAttribute(match.groupValues[1], "value")
-            val name = stripTags(match.groupValues[2]).replace(Regex("\\s+"), "")
+            val name = clean(match.groupValues[2]).replace(Regex("\\s+"), "")
             if (code.isBlank() || name.isBlank()) return@forEach
             // 实际第三项为“泮河校区西北片区”，必须先识别西北，不能覆盖泮河的 002。
             when {
@@ -694,7 +694,7 @@ class SdauCourseRepository {
                 } ?: options.firstOrNull()
                 selectedOption?.let { option ->
                     htmlAttribute(option.groupValues[1], "value")
-                        .ifBlank { stripTags(option.groupValues[2]) }
+                        .ifBlank { clean(option.groupValues[2]) }
                         .takeIf { it.isNotBlank() }
                         ?.let { return it }
                 }
@@ -932,7 +932,7 @@ class SdauCourseRepository {
         val title = Regex(
             "<[^>]*class\\s*=\\s*[\\\"'][^\\\"']*\\binfoContentTitle\\b[^\\\"']*[\\\"'][^>]*>([\\s\\S]*?)</[^>]+>",
             setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
-        ).find(html)?.groupValues?.getOrNull(1)?.let(::stripTags).orEmpty()
+        ).find(html)?.groupValues?.getOrNull(1)?.let(::clean).orEmpty()
 
         val titleMatch = Regex("(.+?)-([0-9]{6,})$").find(title)
         val nameFromTitle = titleMatch?.groupValues?.getOrNull(1).orEmpty().trim()
@@ -941,7 +941,7 @@ class SdauCourseRepository {
         val nameFromDetail = Regex(
             "(?:姓名|名字)\\s*[：:]\\s*([^<\\r\\n]+)",
             RegexOption.IGNORE_CASE
-        ).find(stripTags(html))?.groupValues?.getOrNull(1)?.trim().orEmpty()
+        ).find(clean(html))?.groupValues?.getOrNull(1)?.trim().orEmpty()
         val name = nameFromTitle.ifBlank { nameFromDetail }
         val studentId = idFromTitle.ifBlank { fallbackStudentId.trim() }
         return if (name.isNotBlank() && studentId.isNotBlank()) {
@@ -966,7 +966,7 @@ class SdauCourseRepository {
                 itemRegex.findAll(cell).forEach itemLoop@ { item ->
                     val nameMatch = titleRegex.find(item.groupValues[1]) ?: return@itemLoop
                     val name = clean(nameMatch.groupValues[1])
-                    val match = detailRegex.find(stripTags(item.groupValues[1])) ?: return@itemLoop
+                    val match = detailRegex.find(clean(item.groupValues[1])) ?: return@itemLoop
                     val start = match.groupValues[2].toIntOrNull()?.minus(1) ?: return@itemLoop
                     val end = (match.groupValues[3].toIntOrNull()?.minus(1) ?: start)
                     if (start !in 0..9 || end !in start..9) return@itemLoop
@@ -974,7 +974,7 @@ class SdauCourseRepository {
                 }
                 // Newer timetable pages can use plain text cells instead of
                 // courselists-item nodes.
-                courseRegex.findAll(stripTags(cell)).forEach courseLoop@ { match ->
+                courseRegex.findAll(clean(cell)).forEach courseLoop@ { match ->
                     val start = match.groupValues[3].toIntOrNull()?.minus(1) ?: return@courseLoop
                     val end = match.groupValues[4].toIntOrNull()?.minus(1) ?: start
                     if (start !in 0..9 || end !in start..9) return@courseLoop
@@ -1143,7 +1143,6 @@ class SdauCourseRepository {
     private fun capture(value: String, expression: String) = Regex(expression, setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)).find(value)?.groupValues?.getOrNull(1)?.trim().orEmpty()
     private fun clean(value: String) = value.replace(Regex("<[^>]+>"), " ").replace(Regex("\\s+"), " ").trim()
     private fun cleanLocation(value: String) = value.replace(Regex("(?i)<br\\s*/?>"), " / ").replace(Regex("<[^>]+>"), " ").replace(Regex("\\s+"), " ").trim()
-    private fun stripTags(value: String) = value.replace(Regex("<[^>]+>"), " ").replace(Regex("\\s+"), " ").trim()
     private fun splitLines(value: String) = value.replace(Regex("(?i)<br\\s*/?>"), "\n").split('\n').map { clean(it) }.filter { it.isNotEmpty() }
 
     companion object {

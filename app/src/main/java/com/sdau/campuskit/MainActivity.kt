@@ -69,7 +69,6 @@ import androidx.core.content.FileProvider
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
-import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
 import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.textfield.TextInputLayout
@@ -243,7 +242,6 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
-    private var pendingTestNotification = false
     private var pendingPushEnable = false
     private var pushButton: ImageButton? = null
     private var bottomNavigation: View? = null
@@ -926,11 +924,10 @@ class MainActivity : ComponentActivity() {
         form.addView(loginStatus, spacedParams(dp(12)))
 
         val loginHeight = if (mode == LoginMode.PERSONAL) 56 else 46
-        val login = createLiquidTintedActionButtonView(
+        val login = LiquidTintedActionButtonView(
             context = this,
-            text = if (mode == LoginMode.PERSONAL) "进入个人课表" else "查询班级课表",
-            heightDp = loginHeight,
-            backdropColor = PUBLIC_SURFACE,
+            initialText = if (mode == LoginMode.PERSONAL) "进入个人课表" else "查询班级课表",
+            buttonHeightDp = loginHeight,
             onClick = {
                 if (mode == LoginMode.PERSONAL) attemptLogin() else attemptPublicScheduleLookup()
             }
@@ -948,144 +945,6 @@ class MainActivity : ComponentActivity() {
             if (mode == LoginMode.PUBLIC) topMargin = dp(6)
         })
         return form
-    }
-
-    private fun transitionLoginModeForm(host: FrameLayout, next: View, forward: Boolean) {
-        val previous = host.getChildAt(0)
-        if (previous == null || host.width <= 0) {
-            host.removeAllViews()
-            host.addView(next, FrameLayout.LayoutParams(-1, -2))
-            return
-        }
-
-        host.addView(next, FrameLayout.LayoutParams(-1, -2))
-        next.measure(
-            View.MeasureSpec.makeMeasureSpec(host.width, View.MeasureSpec.EXACTLY),
-            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
-        )
-        val startHeight = host.height
-        val targetHeight = next.measuredHeight
-        val distance = dp(24).toFloat() * if (forward) 1f else -1f
-        next.alpha = 0f
-        next.translationX = distance
-        host.isEnabled = false
-
-        ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = 380L
-            interpolator = PathInterpolator(.2f, .78f, .2f, 1f)
-            addUpdateListener { animator ->
-                val progress = animator.animatedValue as Float
-                host.layoutParams = host.layoutParams.apply {
-                    height = (startHeight + (targetHeight - startHeight) * progress).toInt()
-                }
-                previous.alpha = 1f - progress
-                previous.translationX = -distance * .45f * progress
-                next.alpha = progress
-                next.translationX = distance * (1f - progress)
-            }
-            addListener(object : android.animation.AnimatorListenerAdapter() {
-                override fun onAnimationEnd(animation: android.animation.Animator) {
-                    host.removeView(previous)
-                    next.alpha = 1f
-                    next.translationX = 0f
-                    host.layoutParams = host.layoutParams.apply { height = ViewGroup.LayoutParams.WRAP_CONTENT }
-                    host.isEnabled = true
-                }
-            })
-            start()
-        }
-    }
-
-    /**
-     * 全校课表使用与个人登录不同的筛选表单：标签位于值的上方，字段底部使用
-     * 一条轻量分隔线，整体更接近课程查询页面而不是账号输入页面。
-     */
-    private fun buildPublicLoginPage(): View {
-        val scroll = ScheduleScrollView(this).apply {
-            isFillViewport = true
-            clipToPadding = false
-            overScrollMode = View.OVER_SCROLL_NEVER
-            setBackgroundColor(PUBLIC_PAGE_BACKGROUND)
-        }
-        val viewport = verticalLayout().apply {
-            gravity = Gravity.CENTER
-            setPadding(dp(20), 0, dp(20), dp(24))
-        }
-        scroll.addView(viewport, FrameLayout.LayoutParams(-1, -2))
-
-        val card = surfaceCard(dp(28f).toFloat()).apply {
-            setCardBackgroundColor(PUBLIC_SURFACE)
-            setStrokeColor(PUBLIC_CARD_OUTLINE)
-            cardElevation = dp(2).toFloat()
-        }
-        val body = verticalLayout().apply {
-            setPadding(dp(24), dp(24), dp(24), dp(22))
-        }
-
-        body.addView(text("登录", 28f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(8)))
-
-        // 全校课表与个人登录使用不同的表单构建分支，切换器需要
-        // 在两个分支中都显式加入，否则进入全校课表后会丢失顶部胶囊。
-        val modeToggle = LoginModeToggle(this, loginMode) { nextMode, _ ->
-            if (nextMode != loginMode) {
-                loginMode = nextMode
-                swapPage(buildLoginPage(), nextMode == LoginMode.PUBLIC, true)
-            }
-        }
-        body.addView(modeToggle, LinearLayout.LayoutParams(-1, dp(60)).apply {
-            leftMargin = dp(16)
-            rightMargin = dp(16)
-            bottomMargin = dp(18)
-        })
-
-        semesterInput = MaterialAutoCompleteTextView(this)
-        val semesterOptions = semesterOptions().toList()
-        val savedTerm = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_TERM, "")
-        val selectedTerm = savedTerm?.takeIf { it in semesterOptions } ?: semesterOptions.first()
-        semesterInput.setText(selectedTerm, false)
-        body.addView(publicFormField("学期", semesterInput, semesterOptions, selectedTerm) {
-            showSemesterPicker()
-        }, spacedParams(dp(14)))
-
-        buildPublicFilterFields(body, selectedTerm)
-
-        loginStatus = text("", 13f, ERROR, Typeface.NORMAL).apply {
-            visibility = View.GONE
-            setLineSpacing(dp(2).toFloat(), 1f)
-        }
-        body.addView(loginStatus, spacedParams(dp(12)))
-
-        val login = createLiquidTintedActionButtonView(
-            context = this,
-            text = "查询班级课表",
-            heightDp = 46,
-            backdropColor = PUBLIC_SURFACE,
-            onClick = { attemptPublicScheduleLookup() }
-        )
-        if (!hasPublicScheduleCache(selectedTerm) ||
-            loadStoredPublicScheduleIndex(selectedTerm) == null ||
-            !hasPublicScheduleLookup(selectedTerm)
-        ) {
-            login.setButtonEnabled(false)
-            login.text = "正在准备全校课表…"
-        }
-        loginButton = login
-        body.addView(login, LinearLayout.LayoutParams(-1, dp(46)).apply {
-            topMargin = dp(6)
-        })
-
-        card.addView(body)
-        viewport.addView(card, matchWrapParams())
-        viewport.addOnLayoutChangeListener { view, _, _, _, _, _, _, _, _ ->
-            val available = view.width - view.paddingLeft - view.paddingRight
-            val width = minOf(available, dp(480))
-            val params = card.layoutParams
-            if (width > 0 && params.width != width) {
-                params.width = width
-                card.layoutParams = params
-            }
-        }
-        return scroll
     }
 
     private fun attemptLogin() {
@@ -2252,17 +2111,6 @@ class MainActivity : ComponentActivity() {
     private fun emptyRoomNaturalSortKey(room: String): String = Regex("\\d+")
         .replace(emptyRoomMatchKey(room)) { match -> match.value.padStart(7, '0') }
 
-    private fun blendColors(base: Int, tint: Int, amount: Float): Int {
-        val ratio = amount.coerceIn(0f, 1f)
-        fun channel(baseChannel: Int, tintChannel: Int): Int =
-            (baseChannel + (tintChannel - baseChannel) * ratio).toInt().coerceIn(0, 255)
-        return Color.rgb(
-            channel(Color.red(base), Color.red(tint)),
-            channel(Color.green(base), Color.green(tint)),
-            channel(Color.blue(base), Color.blue(tint))
-        )
-    }
-
     private fun onEmptyRoomFilterChanged() {
         emptyRoomRequestGeneration++
         emptyRoomsLoading = false
@@ -2525,12 +2373,6 @@ class MainActivity : ComponentActivity() {
             onScoreClick = ::showScoreDetail,
             onExport = { exportScoreImage(result.term) }
         )
-    }
-
-    private fun scoreMetric(label: String, value: String, valueColor: Int): View = verticalLayout().apply {
-        gravity = Gravity.CENTER
-        addView(text(value.ifBlank { "-" }, 21f, valueColor, Typeface.BOLD).apply { gravity = Gravity.CENTER }, spacedParams(dp(5)))
-        addView(text(label, 11f, TEXT_SECONDARY, Typeface.NORMAL).apply { gravity = Gravity.CENTER }, matchWrapParams())
     }
 
     private fun scoreColor(value: String): Int {
@@ -3032,53 +2874,6 @@ class MainActivity : ComponentActivity() {
         }.start()
     }
 
-    private fun buildDataSection(
-        title: String,
-        summary: String,
-        symbol: String,
-        emptyTitle: String,
-        emptyDescription: String
-    ): View {
-        val scroll = ScrollView(this).apply {
-            isFillViewport = true
-            clipToPadding = false
-            overScrollMode = View.OVER_SCROLL_NEVER
-            setBackgroundColor(Color.TRANSPARENT)
-        }
-        val body = verticalLayout().apply {
-            setPadding(dp(20), dp(18), dp(20), dp(28))
-        }
-        body.addView(text(title, 28f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(7)))
-        body.addView(text(summary, 13f, TEXT_SECONDARY, Typeface.NORMAL), spacedParams(dp(24)))
-        val card = surfaceCard(dp(26f).toFloat()).apply {
-            cardElevation = 0f
-            setCardBackgroundColor(Color.argb(214, 255, 255, 255))
-        }
-        val empty = verticalLayout().apply {
-            gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(dp(28), dp(42), dp(28), dp(42))
-        }
-        empty.addView(text(symbol, 22f, PRIMARY_DARK, Typeface.BOLD).apply {
-            gravity = Gravity.CENTER
-            background = android.graphics.drawable.GradientDrawable().apply {
-                shape = android.graphics.drawable.GradientDrawable.OVAL
-                setColor(PRIMARY_CONTAINER)
-                setStroke(dp(1), Color.argb(150, 255, 255, 255))
-            }
-        }, LinearLayout.LayoutParams(dp(64), dp(64)).apply { bottomMargin = dp(20) })
-        empty.addView(text(emptyTitle, 19f, TEXT_PRIMARY, Typeface.BOLD).apply {
-            gravity = Gravity.CENTER
-        }, spacedParams(dp(10)))
-        empty.addView(text(emptyDescription, 14f, TEXT_SECONDARY, Typeface.NORMAL).apply {
-            gravity = Gravity.CENTER
-            setLineSpacing(dp(4).toFloat(), 1f)
-        }, matchWrapParams())
-        card.addView(empty)
-        body.addView(card, matchWrapParams())
-        scroll.addView(body, FrameLayout.LayoutParams(-1, -2))
-        return scroll
-    }
-
     private fun buildScheduleHeader(): View {
         val header = verticalLayout().apply {
             setBackgroundColor(Color.TRANSPARENT)
@@ -3294,11 +3089,6 @@ class MainActivity : ComponentActivity() {
             .apply()
         Toast.makeText(this, "已恢复默认背景", Toast.LENGTH_SHORT).show()
         showSchedulePage()
-    }
-
-    private fun loadCustomBackgroundDrawable(): Drawable? {
-        if (!hasCustomBackground()) return null
-        return decodeCustomBackground(customBackgroundFile())
     }
 
     private fun loadCustomBackgroundBitmap(): Bitmap? {
@@ -3990,24 +3780,6 @@ class MainActivity : ComponentActivity() {
         return !CampusHolidayCalendar.isHoliday(courseDate)
     }
 
-    private fun changeWeek(delta: Int, swipeDirection: Int = 0) {
-        val nextWeek = (currentWeek + delta).coerceIn(0, 20)
-        if (nextWeek == currentWeek) return
-        currentWeek = nextWeek
-        scheduleWeek?.text = formatWeekLabel(currentWeek)
-        val grid = scheduleGrid ?: return
-        if (swipeDirection == 0) {
-            grid.setWeekIndex(currentWeek)
-            return
-        }
-        val distance = dp(72f).toFloat() * swipeDirection
-        grid.animate().translationX(distance).alpha(0f).setDuration(150).withEndAction {
-            grid.setWeekIndex(currentWeek)
-            grid.translationX = -distance
-            grid.animate().translationX(0f).alpha(1f).setDuration(180).start()
-        }.start()
-    }
-
     private fun jumpToCurrentWeek() {
         val actualWeek = weekForTerm(selectedTerm())
         if (actualWeek == currentWeek) return
@@ -4145,18 +3917,6 @@ class MainActivity : ComponentActivity() {
         }.start()
     }
 
-    private fun triggerTestNotification() {
-        CourseNotification.createChannel(this)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            pendingTestNotification = true
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), NOTIFICATION_PERMISSION_REQUEST)
-            return
-        }
-        val course = nextCourseForNow() ?: loadCourseCache().firstOrNull() ?: return
-        CourseNotification.show(this, course.name, course.room, courseTimeLabel(course))
-    }
-
     private fun updatePushButton() {
         pushButton?.setImageResource(if (pushEnabled) R.drawable.ic_push_on else R.drawable.ic_push_off)
         pushButton?.contentDescription = if (pushEnabled) "关闭课程推送" else "开启课程推送"
@@ -4207,16 +3967,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun prepareSystemCourseReminder() {
-        CourseNotification.createChannel(this)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), NOTIFICATION_PERMISSION_REQUEST)
-            return
-        }
-        scheduleSystemCourseReminder()
-    }
-
     private fun scheduleSystemCourseReminder() {
         schedulePushNotifications()
     }
@@ -4258,13 +4008,7 @@ class MainActivity : ComponentActivity() {
                 enablePushNotifications()
                 return
             }
-            if (pendingTestNotification) {
-                pendingTestNotification = false
-                val course = nextCourseForNow() ?: loadCourseCache().firstOrNull()
-                if (course != null) CourseNotification.show(this, course.name, course.room, courseTimeLabel(course))
-            } else {
-                scheduleSystemCourseReminder()
-            }
+            scheduleSystemCourseReminder()
         }
     }
 
@@ -4286,11 +4030,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun formatWeekDate(week: Int): String {
-        val date = termStartDate(selectedTerm()).apply { add(Calendar.DAY_OF_MONTH, (week - 1) * 7 + 1) }
-        return SimpleDateFormat("yyyy/M/d", Locale.CHINA).format(date.time)
-    }
-
     private fun todayLabel(): String = SimpleDateFormat("yyyy/M/d", Locale.CHINA).format(Calendar.getInstance().time)
 
     private fun daysUntilTermStart(): Int {
@@ -4304,19 +4043,6 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun formatWeekLabel(week: Int): String = if (week > 0) "第 $week 周" else "学期未开始"
-
-    private fun compactButton(label: String) = MaterialButton(this).apply {
-        text = label
-        textSize = 14f
-        setTextColor(PRIMARY_DARK)
-        setTypeface(Typeface.DEFAULT, Typeface.BOLD)
-        isAllCaps = false
-        cornerRadius = dp(14)
-        insetTop = 0
-        insetBottom = 0
-        setPadding(dp(8), 0, dp(8), 0)
-        backgroundTintList = ColorStateList.valueOf(PRIMARY_CONTAINER)
-    }
 
     private fun sampleCourses() = listOf(
         Course(0, 0, 2, "高等数学 A", "5N201", "张老师", Color.rgb(232, 126, 158), Color.WHITE),
@@ -5041,10 +4767,6 @@ class MainActivity : ComponentActivity() {
     private fun inputStrokeColors() = ColorStateList(
         arrayOf(intArrayOf(android.R.attr.state_focused), intArrayOf(-android.R.attr.state_enabled), intArrayOf()),
         intArrayOf(PRIMARY, Color.rgb(232, 234, 240), OUTLINE)
-    )
-
-    private fun buttonColors() = ColorStateList(
-        arrayOf(intArrayOf(android.R.attr.state_pressed), intArrayOf()), intArrayOf(PRIMARY_DARK, PRIMARY)
     )
 
     private fun surfaceCard(radius: Float) = MaterialCardView(this).apply {
@@ -6584,13 +6306,6 @@ class MainActivity : ComponentActivity() {
             val metrics = paint.fontMetrics; canvas.drawText(value, centerX, centerY - (metrics.ascent + metrics.descent) / 2f, paint); paint.textAlign = Paint.Align.LEFT
         }
 
-        private fun drawLeftText(canvas: Canvas, value: String, x: Float, centerY: Float, size: Float, color: Int, style: Int) {
-            paint.style = Paint.Style.FILL; paint.textSize = size; paint.color = color; paint.typeface = Typeface.create(Typeface.DEFAULT, style); paint.textAlign = Paint.Align.LEFT
-            val metrics = paint.fontMetrics
-            canvas.drawText(value, x, centerY - (metrics.ascent + metrics.descent) / 2f, paint)
-        }
-
-        // 课程表网格尺寸固定，因此字号使用 density，不跟随系统 fontScale 放大。
         private fun sp(value: Float) = value * resources.displayMetrics.density
     }
 

@@ -863,7 +863,6 @@ internal class LiquidTintedActionButtonView(
     context: Context,
     initialText: String,
     private val buttonHeightDp: Int,
-    backdropColor: Int,
     onClick: () -> Unit
 ) : FrameLayout(context) {
     private var labelState by mutableStateOf(initialText)
@@ -878,30 +877,26 @@ internal class LiquidTintedActionButtonView(
     init {
         setBackgroundColor(android.graphics.Color.TRANSPARENT)
         addView(
-            ComposeView(context).apply {
-                setBackgroundColor(android.graphics.Color.TRANSPARENT)
-                setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnDetachedFromWindow)
-                setContent {
-                    // A transparent CanvasBackdrop still allocates a filtered rectangle
-                    // on Android and can leave a faint box around the capsule. Tinted
-                    // buttons only need their own blue surface and interaction highlight,
-                    // so an empty source avoids that offscreen residue completely.
-                    val backdrop = emptyBackdrop()
-                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        CampusLiquidButton(
-                            onClick = onClick,
-                            backdrop = backdrop,
-                            style = LiquidButtonStyle.TINTED,
-                            enabled = buttonEnabledState,
-                            allowDragDeformation = false,
-                            modifier = Modifier.fillMaxWidth(),
-                            height = buttonHeightDp.dp
-                        ) {
-                            BasicText(
-                                labelState,
-                                style = TextStyle(Color.White, 16.sp, FontWeight.SemiBold)
-                            )
-                        }
+            composeHostView(context) {
+                // A transparent CanvasBackdrop still allocates a filtered rectangle
+                // on Android and can leave a faint box around the capsule. Tinted
+                // buttons only need their own blue surface and interaction highlight,
+                // so an empty source avoids that offscreen residue completely.
+                val backdrop = emptyBackdrop()
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CampusLiquidButton(
+                        onClick = onClick,
+                        backdrop = backdrop,
+                        style = LiquidButtonStyle.TINTED,
+                        enabled = buttonEnabledState,
+                        allowDragDeformation = false,
+                        modifier = Modifier.fillMaxWidth(),
+                        height = buttonHeightDp.dp
+                    ) {
+                        BasicText(
+                            labelState,
+                            style = TextStyle(Color.White, 16.sp, FontWeight.SemiBold)
+                        )
                     }
                 }
             },
@@ -914,19 +909,14 @@ internal class LiquidTintedActionButtonView(
     }
 }
 
-internal fun createLiquidTintedActionButtonView(
+private fun composeHostView(
     context: Context,
-    text: String,
-    heightDp: Int,
-    backdropColor: Int,
-    onClick: () -> Unit
-): LiquidTintedActionButtonView = LiquidTintedActionButtonView(
-    context = context,
-    initialText = text,
-    buttonHeightDp = heightDp,
-    backdropColor = backdropColor,
-    onClick = onClick
-)
+    content: @Composable () -> Unit
+): ComposeView = ComposeView(context).apply {
+    setBackgroundColor(android.graphics.Color.TRANSPARENT)
+    setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnDetachedFromWindow)
+    setContent(content)
+}
 
 /**
  * Full score result page using the same structure as the reference ScrollContainer:
@@ -943,20 +933,16 @@ internal fun createScoreLiquidScrollPageView(
     onTermClick: () -> Unit,
     onScoreClick: (RemoteScore) -> Unit,
     onExport: () -> Unit
-): View = ComposeView(context).apply {
-    setBackgroundColor(android.graphics.Color.TRANSPARENT)
-    setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnDetachedFromWindow)
-    setContent {
-        ScoreLiquidScrollPage(
-            result = result,
-            scoreColors = scoreColors,
-            pageBackgroundBitmap = pageBackgroundBitmap,
-            pageBackgroundScrim = pageBackgroundScrim,
-            onTermClick = onTermClick,
-            onScoreClick = onScoreClick,
-            onExport = onExport
-        )
-    }
+): View = composeHostView(context) {
+    ScoreLiquidScrollPage(
+        result = result,
+        scoreColors = scoreColors,
+        pageBackgroundBitmap = pageBackgroundBitmap,
+        pageBackgroundScrim = pageBackgroundScrim,
+        onTermClick = onTermClick,
+        onScoreClick = onScoreClick,
+        onExport = onExport
+    )
 }
 
 /**
@@ -970,17 +956,13 @@ internal fun createExamLiquidScrollPageView(
     records: List<RemoteExam>,
     pageBackgroundBitmap: Bitmap?,
     pageBackgroundScrim: Int
-): View = ComposeView(context).apply {
-    setBackgroundColor(android.graphics.Color.TRANSPARENT)
-    setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnDetachedFromWindow)
-    setContent {
-        ExamLiquidScrollPage(
-            term = term,
-            records = records,
-            pageBackgroundBitmap = pageBackgroundBitmap,
-            pageBackgroundScrim = pageBackgroundScrim
-        )
-    }
+): View = composeHostView(context) {
+    ExamLiquidScrollPage(
+        term = term,
+        records = records,
+        pageBackgroundBitmap = pageBackgroundBitmap,
+        pageBackgroundScrim = pageBackgroundScrim
+    )
 }
 
 internal fun createEmptyRoomLiquidGroupCardView(
@@ -993,21 +975,17 @@ internal fun createEmptyRoomLiquidGroupCardView(
     pageBackgroundBitmap: Bitmap?,
     pageBackgroundScrim: Int,
     onExpandedChanged: (Boolean) -> Unit
-): View = ComposeView(context).apply {
-    setBackgroundColor(android.graphics.Color.TRANSPARENT)
-    setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnDetachedFromWindow)
-    setContent {
-        EmptyRoomLiquidGroupCard(
-            groupKey = groupKey,
-            title = title,
-            accentColor = accentColor,
-            rooms = rooms,
-            initiallyExpanded = initiallyExpanded,
-            pageBackgroundBitmap = pageBackgroundBitmap,
-            pageBackgroundScrim = pageBackgroundScrim,
-            onExpandedChanged = onExpandedChanged
-        )
-    }
+): View = composeHostView(context) {
+    EmptyRoomLiquidGroupCard(
+        groupKey = groupKey,
+        title = title,
+        accentColor = accentColor,
+        rooms = rooms,
+        initiallyExpanded = initiallyExpanded,
+        pageBackgroundBitmap = pageBackgroundBitmap,
+        pageBackgroundScrim = pageBackgroundScrim,
+        onExpandedChanged = onExpandedChanged
+    )
 }
 
 @Composable
