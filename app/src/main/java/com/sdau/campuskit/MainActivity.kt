@@ -2338,15 +2338,16 @@ class MainActivity : ComponentActivity() {
             pageBackgroundBitmap = currentPageBackgroundBitmap,
             pageBackgroundScrim = CUSTOM_BACKGROUND_SCRIM,
             termSelectorExpanded = scoreTermSelectorExpanded,
-            onTermClick = { bounds: android.graphics.Rect ->
-                if (scoreTermOverlay == null && !scoreTermMenuCapturePending) {
-                    scoreTermSelectorExpanded.value = true
-                    this@MainActivity.showScoreTermPicker(bounds)
-                }
-            },
+            onTermClick = ::requestScoreTermPicker,
             onScoreClick = ::showScoreDetail,
             onExport = { exportScoreImage(result.term) }
         )
+    }
+
+    private fun requestScoreTermPicker(bounds: android.graphics.Rect) {
+        if (scoreTermOverlay != null || scoreTermMenuCapturePending) return
+        scoreTermSelectorExpanded.value = true
+        showScoreTermPicker(bounds)
     }
 
     private fun scoreColor(value: String): Int {
@@ -2591,7 +2592,6 @@ class MainActivity : ComponentActivity() {
                 context = this,
                 pageSnapshot = pageSnapshot,
                 courseName = record.courseName,
-                courseCode = record.courseCode,
                 onDismiss = ::hideScoreDetail
             )
             pageHost.addView(dialog, matchParentParams())
@@ -2639,39 +2639,16 @@ class MainActivity : ComponentActivity() {
 
 
     private fun addGradeHeader(body: LinearLayout, term: String) {
-        val hasCustomBackground = currentPageBackgroundBitmap != null
         val header = horizontalLayout().apply { gravity = Gravity.CENTER_VERTICAL }
         header.addView(text("成绩", 28f, TEXT_PRIMARY, Typeface.BOLD), LinearLayout.LayoutParams(0, -2, 1f))
-        val selector = MaterialCardView(this).apply {
-            radius = dp(14f).toFloat()
-            cardElevation = 0f
-            strokeWidth = if (hasCustomBackground) dp(1) else 0
-            strokeColor = if (hasCustomBackground) {
-                Color.argb(118, 255, 255, 255)
-            } else {
-                Color.TRANSPARENT
-            }
-            // The state/loading page sits directly above the real wallpaper. Keeping
-            // this surface translucent makes it sample that wallpaper immediately,
-            // before the score-result Compose page is created.
-            setCardBackgroundColor(
-                if (hasCustomBackground) Color.argb(42, 255, 255, 255)
-                else Color.rgb(246, 248, 252)
-            )
-            isClickable = true
-            contentDescription = "选择成绩学期，当前为 $term"
-            setOnClickListener { showScoreTermPicker(this) }
-        }
-        val selectorContent = horizontalLayout().apply {
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(11), dp(7), dp(9), dp(7))
-        }
-        selectorContent.addView(text(term, 12f, TEXT_PRIMARY, Typeface.NORMAL), LinearLayout.LayoutParams(-2, -2))
-        selectorContent.addView(text("⌄", 15f, TEXT_SECONDARY, Typeface.NORMAL).apply {
-            gravity = Gravity.CENTER
-            setPadding(dp(5), 0, 0, dp(2))
-        }, LinearLayout.LayoutParams(dp(20), -2))
-        selector.addView(selectorContent)
+        val selector = createScoreTermSelectorView(
+            context = this,
+            term = term,
+            pageBackgroundBitmap = currentPageBackgroundBitmap,
+            pageBackgroundScrim = CUSTOM_BACKGROUND_SCRIM,
+            termSelectorExpanded = scoreTermSelectorExpanded,
+            onTermClick = ::requestScoreTermPicker
+        )
         header.addView(selector, LinearLayout.LayoutParams(-2, -2))
         body.addView(header, spacedParams(dp(18)))
     }
@@ -4743,10 +4720,6 @@ class MainActivity : ComponentActivity() {
             val cy = height / 2f
             illustrationPaint.style = Paint.Style.FILL
             illustrationPaint.shader = null
-            illustrationPaint.color = Color.argb(38, 255, 255, 255)
-            canvas.drawCircle(cx, cy, dp(57f).toFloat(), illustrationPaint)
-            illustrationPaint.color = Color.argb(18, 131, 140, 199)
-            canvas.drawCircle(cx + dp(17f), cy - dp(8f), dp(42f).toFloat(), illustrationPaint)
             when (type) {
                 EmptyAcademicState.EXAMS -> drawEmptyExam(canvas, cx, cy)
                 EmptyAcademicState.GRADES -> drawEmptyGrades(canvas, cx, cy)
@@ -5578,10 +5551,6 @@ class MainActivity : ComponentActivity() {
             paint.style = Paint.Style.FILL
             paint.strokeCap = Paint.Cap.ROUND
             paint.strokeJoin = Paint.Join.ROUND
-            paint.color = Color.argb(38, 255, 255, 255)
-            canvas.drawCircle(cx, cy, dp(57f).toFloat(), paint)
-            paint.color = Color.argb(18, 131, 140, 199)
-            canvas.drawCircle(cx + dp(17f), cy - dp(8f), dp(42f).toFloat(), paint)
             if (beforeTerm) drawBeforeTermIllustration(canvas, cx, cy)
             else drawRelaxingWeekIllustration(canvas, cx, cy)
         }

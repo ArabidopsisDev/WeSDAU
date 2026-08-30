@@ -131,6 +131,126 @@ internal fun createScoreLiquidScrollPageView(
     )
 }
 
+internal fun createScoreTermSelectorView(
+    context: Context,
+    term: String,
+    pageBackgroundBitmap: Bitmap?,
+    pageBackgroundScrim: Int,
+    termSelectorExpanded: State<Boolean>,
+    onTermClick: (android.graphics.Rect) -> Unit
+): View = composeHostView(context) {
+    val backdrop = rememberLayerBackdrop()
+    val pageBackgroundImage = remember(pageBackgroundBitmap) {
+        pageBackgroundBitmap?.asImageBitmap()
+    }
+    val pageGradient = Brush.linearGradient(
+        listOf(
+            Color(0xFFF3F2F9),
+            Color(0xFFF0F1F9),
+            Color(0xFFEBEFF8),
+            Color(0xFFE3EBF7),
+            Color(0xFFD9E5F4)
+        )
+    )
+    Box {
+        PageAlignedBackdropSource(
+            backdrop = backdrop,
+            pageBackgroundImage = pageBackgroundImage,
+            pageBackgroundScrim = pageBackgroundScrim,
+            pageGradient = pageGradient,
+            // The source must follow the selector after Box measurement. A
+            // fillMaxSize child would otherwise make this wrap-content bridge
+            // consume the whole native score page while switching terms.
+            modifier = Modifier.matchParentSize()
+        )
+        ScoreTermSelector(
+            term = term,
+            backdrop = backdrop,
+            expanded = termSelectorExpanded.value,
+            hasCustomBackground = pageBackgroundImage != null,
+            onClick = onTermClick
+        )
+    }
+}
+
+@Composable
+private fun ScoreTermSelector(
+    term: String,
+    backdrop: Backdrop,
+    expanded: Boolean,
+    hasCustomBackground: Boolean,
+    onClick: (android.graphics.Rect) -> Unit
+) {
+    val textPrimary = Color(0xFF1C2230)
+    val textSecondary = Color(0xFF666F85)
+    val termFontWeight = if (hasCustomBackground) FontWeight.Bold else FontWeight.Normal
+    var bounds by remember { mutableStateOf<android.graphics.Rect?>(null) }
+    val arrowRotation by animateFloatAsState(
+        targetValue = if (expanded) 180f else 0f,
+        animationSpec = tween(durationMillis = 220),
+        label = "scoreTermArrowRotation"
+    )
+
+    Row(
+        Modifier
+            .onGloballyPositioned { coordinates ->
+                val position = coordinates.positionInWindow()
+                bounds = android.graphics.Rect(
+                    position.x.roundToInt(),
+                    position.y.roundToInt(),
+                    (position.x + coordinates.size.width).roundToInt(),
+                    (position.y + coordinates.size.height).roundToInt()
+                )
+            }
+            .drawBackdrop(
+                backdrop = backdrop,
+                shape = { RoundedRectangle(14.dp) },
+                effects = {
+                    vibrancy()
+                    blur(4.dp.toPx())
+                    lens(8.dp.toPx(), 16.dp.toPx())
+                },
+                shadow = null,
+                highlight = { Highlight.Default.copy(alpha = 0.46f) },
+                onDrawSurface = { drawRect(Color.White.copy(alpha = 0.16f)) }
+            )
+            .clickable(
+                interactionSource = null,
+                indication = null,
+                role = Role.Button,
+                onClick = { bounds?.let(onClick) }
+            )
+            .heightIn(min = 36.dp)
+            .padding(start = 11.dp, top = 8.dp, end = 9.dp, bottom = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        BasicText(term, style = TextStyle(textPrimary, 12.sp, termFontWeight))
+        Canvas(
+            modifier = Modifier
+                .padding(start = 5.dp)
+                .size(width = 15.dp, height = 20.dp)
+                .graphicsLayer { rotationZ = arrowRotation }
+        ) {
+            val strokeWidth = 1.8.dp.toPx()
+            val center = Offset(size.width * 0.5f, size.height * 0.62f)
+            drawLine(
+                color = textSecondary,
+                start = Offset(size.width * 0.20f, size.height * 0.36f),
+                end = center,
+                strokeWidth = strokeWidth,
+                cap = StrokeCap.Round
+            )
+            drawLine(
+                color = textSecondary,
+                start = center,
+                end = Offset(size.width * 0.80f, size.height * 0.36f),
+                strokeWidth = strokeWidth,
+                cap = StrokeCap.Round
+            )
+        }
+    }
+}
+
 @Composable
 private fun ScoreLiquidScrollPage(
     result: RemoteScoreResult,
@@ -159,13 +279,6 @@ private fun ScoreLiquidScrollPage(
             Color(0xFFD9E5F4)
         )
     )
-    var termSelectorBounds by remember { mutableStateOf<android.graphics.Rect?>(null) }
-    val termArrowRotation by animateFloatAsState(
-        targetValue = if (termSelectorExpanded) 180f else 0f,
-        animationSpec = tween(durationMillis = 220),
-        label = "scoreTermArrowRotation"
-    )
-
     Box(Modifier.fillMaxSize()) {
         // This is the actual source sampled by every card and by the export button.
         PageAlignedBackdropSource(
@@ -192,66 +305,13 @@ private fun ScoreLiquidScrollPage(
                     "成绩",
                     style = TextStyle(textPrimary, 28.sp, FontWeight.Bold)
                 )
-                Row(
-                    Modifier
-                        .onGloballyPositioned { coordinates ->
-                            val position = coordinates.positionInWindow()
-                            termSelectorBounds = android.graphics.Rect(
-                                position.x.roundToInt(),
-                                position.y.roundToInt(),
-                                (position.x + coordinates.size.width).roundToInt(),
-                                (position.y + coordinates.size.height).roundToInt()
-                            )
-                        }
-                        .drawBackdrop(
-                            backdrop = backdrop,
-                            shape = { RoundedRectangle(14.dp) },
-                            effects = {
-                                vibrancy()
-                                blur(4.dp.toPx())
-                                lens(8.dp.toPx(), 16.dp.toPx())
-                            },
-                            shadow = null,
-                            highlight = { Highlight.Default.copy(alpha = 0.46f) },
-                            onDrawSurface = {
-                                drawRect(Color.White.copy(alpha = 0.16f))
-                            }
-                        )
-                        .clickable(
-                            interactionSource = null,
-                            indication = null,
-                            role = Role.Button,
-                            onClick = { termSelectorBounds?.let(onTermClick) }
-                        )
-                        .heightIn(min = 34.dp)
-                        .padding(start = 11.dp, top = 7.dp, end = 9.dp, bottom = 7.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    BasicText(result.term, style = TextStyle(textPrimary, 12.sp))
-                    Canvas(
-                        modifier = Modifier
-                            .padding(start = 5.dp)
-                            .size(width = 15.dp, height = 20.dp)
-                            .graphicsLayer { rotationZ = termArrowRotation }
-                    ) {
-                        val strokeWidth = 1.8.dp.toPx()
-                        val center = Offset(size.width * 0.5f, size.height * 0.62f)
-                        drawLine(
-                            color = textSecondary,
-                            start = Offset(size.width * 0.20f, size.height * 0.36f),
-                            end = center,
-                            strokeWidth = strokeWidth,
-                            cap = StrokeCap.Round
-                        )
-                        drawLine(
-                            color = textSecondary,
-                            start = center,
-                            end = Offset(size.width * 0.80f, size.height * 0.36f),
-                            strokeWidth = strokeWidth,
-                            cap = StrokeCap.Round
-                        )
-                    }
-                }
+                ScoreTermSelector(
+                    term = result.term,
+                    backdrop = backdrop,
+                    expanded = termSelectorExpanded,
+                    hasCustomBackground = pageBackgroundImage != null,
+                    onClick = onTermClick
+                )
             }
 
             Row(

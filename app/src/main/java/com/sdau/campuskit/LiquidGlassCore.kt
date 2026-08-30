@@ -300,7 +300,8 @@ internal fun PageAlignedBackdropSource(
     backdrop: LayerBackdrop,
     pageBackgroundImage: ImageBitmap?,
     pageBackgroundScrim: Int,
-    pageGradient: Brush
+    pageGradient: Brush,
+    modifier: Modifier = Modifier.fillMaxSize()
 ) {
     val hostView = LocalView.current
     var hostOffsetInWindow by remember { mutableStateOf(IntOffset.Zero) }
@@ -310,8 +311,7 @@ internal fun PageAlignedBackdropSource(
     }
 
     Box(
-        Modifier
-            .fillMaxSize()
+        modifier
             .onGloballyPositioned { coordinates ->
                 val root = hostView.rootView
                 val rootLocation = IntArray(2)
@@ -362,5 +362,4 @@ internal fun PageAlignedBackdropSource(
         }
     }
 }
-
 

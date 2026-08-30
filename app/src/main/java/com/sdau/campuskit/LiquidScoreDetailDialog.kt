@@ -110,7 +110,6 @@ internal class LiquidScoreDetailDialogView(
     context: Context,
     private var pageSnapshot: Bitmap?,
     courseName: String,
-    courseCode: String,
     onDismiss: () -> Unit
 ) : FrameLayout(context) {
     private var detailState by mutableStateOf<RemoteScoreDetail?>(null)
@@ -125,7 +124,6 @@ internal class LiquidScoreDetailDialogView(
                 LiquidScoreDetailDialog(
                     pageSnapshot = pageSnapshot,
                     courseName = courseName,
-                    courseCode = courseCode,
                     detail = detailState,
                     errorMessage = errorState,
                     totalScoreColor = totalScoreColorState,
@@ -159,7 +157,6 @@ internal class LiquidScoreDetailDialogView(
 private fun LiquidScoreDetailDialog(
     pageSnapshot: Bitmap?,
     courseName: String,
-    courseCode: String,
     detail: RemoteScoreDetail?,
     errorMessage: String?,
     totalScoreColor: Int,
@@ -172,10 +169,8 @@ private fun LiquidScoreDetailDialog(
     val dimColor = Color(0xFF29293A).copy(alpha = 0.23f)
     val snapshotImage = remember(pageSnapshot) { pageSnapshot?.asImageBitmap() }
     val backdrop = rememberLayerBackdrop()
-    val title = listOf(courseName, courseCode)
-        .filter { it.isNotBlank() }
-        .joinToString("-")
-        .ifBlank { "课程成绩" }
+    val title = courseName.ifBlank { "课程成绩" }
+    val titleTextSize = ((212f / title.length.coerceAtLeast(1)).coerceIn(9f, 20f) + 1f).sp
 
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Box(
@@ -229,28 +224,34 @@ private fun LiquidScoreDetailDialog(
                 )
                 .animateContentSize()
         ) {
-            Row(
+            Column(
                 Modifier
                     .fillMaxWidth()
-                    .padding(start = 26.dp, top = 22.dp, end = 20.dp, bottom = 16.dp),
-                verticalAlignment = Alignment.CenterVertically
+                    .padding(start = 26.dp, top = 16.dp, end = 20.dp, bottom = 10.dp)
             ) {
-                Box(
-                    Modifier
-                        .padding(end = 12.dp)
-                        .size(width = 5.dp, height = 42.dp)
-                        .clip(RoundedRectangle(3.dp))
-                        .background(accentColor)
+                BasicText(
+                    "成绩构成",
+                    style = TextStyle(secondaryColor, 13.sp, FontWeight.Medium)
                 )
-                Column(Modifier.weight(1f).padding(end = 12.dp)) {
-                    BasicText(
-                        "成绩构成",
-                        style = TextStyle(secondaryColor, 13.sp, FontWeight.Medium)
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(top = 5.dp, end = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        Modifier
+                            .padding(end = 8.dp)
+                            .size(width = 5.dp, height = 28.dp)
+                            .clip(RoundedRectangle(3.dp))
+                            .background(accentColor)
                     )
                     BasicText(
                         title,
-                        modifier = Modifier.padding(top = 5.dp),
-                        style = TextStyle(contentColor, 20.sp, FontWeight.SemiBold)
+                        modifier = Modifier.weight(1f),
+                        maxLines = 1,
+                        softWrap = false,
+                        style = TextStyle(contentColor, titleTextSize, FontWeight.SemiBold)
                     )
                 }
             }
@@ -258,7 +259,7 @@ private fun LiquidScoreDetailDialog(
             Box(
                 Modifier
                     .fillMaxWidth()
-                    .padding(start = 20.dp, end = 20.dp, bottom = 24.dp),
+                    .padding(start = 20.dp, end = 20.dp, bottom = 16.dp),
                 contentAlignment = Alignment.Center
             ) {
                 when {
@@ -272,8 +273,8 @@ private fun LiquidScoreDetailDialog(
                         errorMessage,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .heightIn(min = 128.dp)
-                            .padding(18.dp),
+                            .heightIn(min = 108.dp)
+                            .padding(14.dp),
                         style = TextStyle(Color(0xFFB3261E), 14.sp, lineHeight = 21.sp)
                     )
                     else -> {
@@ -289,7 +290,7 @@ private fun LiquidScoreDetailDialog(
                             label = "scoreDetailLoadingRotation"
                         )
                         Row(
-                            Modifier.height(160.dp),
+                            Modifier.height(126.dp),
                             horizontalArrangement = Arrangement.spacedBy(12.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
@@ -329,7 +330,7 @@ private fun ScoreDetailDialogContent(
     contentColor: Color,
     secondaryColor: Color
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(
             Modifier
                 .fillMaxWidth()
@@ -338,7 +339,7 @@ private fun ScoreDetailDialogContent(
                     color = Color.White.copy(alpha = 0.58f),
                     shape = RoundedCornerShape(20.dp)
                 )
-                .padding(start = 10.dp, top = 12.dp, end = 18.dp, bottom = 12.dp),
+                .padding(start = 10.dp, top = 9.dp, end = 18.dp, bottom = 9.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             BasicText(
@@ -361,7 +362,7 @@ private fun ScoreDetailDialogContent(
         }
         Row(
             Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             ScoreDetailMetric(
                 label = "平时成绩",
@@ -380,7 +381,7 @@ private fun ScoreDetailDialogContent(
         }
         Row(
             Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             ScoreDetailMetric(
                 label = "期末成绩",
@@ -415,12 +416,12 @@ private fun ScoreDetailMetric(
                 color = Color.White.copy(alpha = 0.58f),
                 shape = RoundedCornerShape(20.dp)
             )
-            .padding(start = 16.dp, top = 12.dp, end = 8.dp, bottom = 12.dp)
+            .padding(start = 16.dp, top = 9.dp, end = 8.dp, bottom = 9.dp)
     ) {
         BasicText(label, style = TextStyle(secondaryColor, 13.sp))
         BasicText(
             value.ifBlank { "-" },
-            modifier = Modifier.padding(top = 7.dp),
+            modifier = Modifier.padding(top = 4.dp),
             style = TextStyle(contentColor, 22.sp, FontWeight.SemiBold)
         )
     }
@@ -434,5 +435,3 @@ private fun formatScoreRatioForDialog(value: String): String {
         clean.ifBlank { "-" }
     }
 }
-
-

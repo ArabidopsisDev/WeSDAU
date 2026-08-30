@@ -341,12 +341,21 @@ private fun LiquidActionMenu(
                     shape = { RoundedRectangle(22.dp) },
                     effects = {
                         vibrancy()
-                        colorControls(brightness = 0.06f, saturation = 1.25f)
-                        blur(12.dp.toPx())
+                        if (hasCustomBackground) {
+                            colorControls(brightness = 0.06f, saturation = 1.25f)
+                            blur(12.dp.toPx())
+                        } else {
+                            colorControls(brightness = 0.10f, saturation = 0.88f)
+                            blur(18.dp.toPx())
+                        }
                         lens(12.dp.toPx(), 24.dp.toPx(), depthEffect = true)
                     },
                     highlight = { Highlight.Default.copy(alpha = 0.68f) },
-                    onDrawSurface = { drawRect(Color.White.copy(alpha = 0.30f)) }
+                    onDrawSurface = {
+                        drawRect(
+                            Color.White.copy(alpha = if (hasCustomBackground) 0.30f else 0.42f)
+                        )
+                    }
                 )
                 .clip(panelShape)
                 .drawWithContent {
