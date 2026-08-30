@@ -66,7 +66,6 @@ class CourseWidgetProvider : AppWidgetProvider() {
         private const val KEY_ACCOUNT = "account"
         private const val KEY_PASSWORD = "password"
         private const val KEY_TERM = "term"
-        private const val KEY_SCHEDULE_MODE = "schedule_mode"
         private const val KEY_COURSES = "courses_cache"
         private const val KEY_WIDGET_LAST_NETWORK_REFRESH = "widget_last_network_refresh"
         private const val WIDGET_NETWORK_REFRESH_INTERVAL = 24L * 60L * 60L * 1000L
@@ -265,7 +264,7 @@ class CourseWidgetProvider : AppWidgetProvider() {
             limit: Int
         ): List<CourseOccurrence> {
             if (courses.isEmpty()) return emptyList()
-            val ranges = timeRanges(context)
+            val ranges = timeRanges()
             if (weekForDate(now, termStart) <= 0) {
                 val openingDay = dayStart(termStart)
                 if (CampusHolidayCalendar.isHoliday(openingDay)) return emptyList()
@@ -354,11 +353,8 @@ class CourseWidgetProvider : AppWidgetProvider() {
             }
         }
 
-        private fun timeRanges(context: Context): Array<Pair<Int, Int>> {
-            val mode = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .getString(KEY_SCHEDULE_MODE, null)
-                ?: if (Calendar.getInstance().get(Calendar.MONTH) + 1 >= 9 || Calendar.getInstance().get(Calendar.MONTH) + 1 <= 4) "SPRING" else "SUMMER"
-            val starts = if (mode == "SPRING") {
+        private fun timeRanges(): Array<Pair<Int, Int>> {
+            val starts = if (ScheduleTimePolicy.currentMode() == ScheduleMode.SPRING) {
                 intArrayOf(480, 535, 600, 655, 840, 895, 960, 1015, 1140, 1195)
             } else {
                 intArrayOf(480, 535, 600, 655, 870, 925, 990, 1045, 1170, 1225)

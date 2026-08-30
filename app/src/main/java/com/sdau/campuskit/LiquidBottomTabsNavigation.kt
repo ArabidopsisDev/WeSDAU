@@ -120,12 +120,6 @@ import kotlinx.coroutines.launch
 import kotlin.math.abs
 import kotlin.math.sign
 
-/**
- * Android View 页面与参考项目 Compose Bottom Tabs 之间的唯一桥接层。
- *
- * LiquidBottomTabs、阻尼拖动和互动高光均移植自 AndroidLiquidGlass-kmp；只将高度按
- * 现有 54dp 导航约束等比缩放，并把内容替换为本项目原有的四个图标。
- */
 internal fun createCampusLiquidBottomTabsView(
     context: Context,
     initialIndex: Int,
@@ -487,7 +481,6 @@ private fun LiquidBottomTabs(
                 valueRange = 0f..(tabsCount - 1).toFloat(),
                 visibilityThreshold = 0.001f,
                 initialScale = 1f,
-                // 原组件所在父容器有额外留白；本项目固定为 216x54dp，过度放大会被裁成直边。
                 pressedScale = pressedScale,
                 onDragStarted = {},
                 onDragStopped = {

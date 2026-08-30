@@ -12,7 +12,7 @@
 
 <img src="docs/images/readme-hero-liquidglass-v034.png" alt="WeSDAU 新版界面艺术展示" width="100%" />
 
-<sub>画面中的应用界面均来自 WeSDAU V0.3.4 实机截图</sub>
+<sub>画面中的应用界面均来自实机截图</sub>
 
 </div>
 
@@ -114,7 +114,7 @@ WeSDAU课程表 是一款面向山东农业大学学生的 Android 校园工具�
 
 | 项目 | 当前值 |
 | --- | --- |
-| 当前版本 | `0.3.4`（Version Code 8） |
+| 当前版本 | `0.3.5`（Version Code 9） |
 | 最低系统 | Android 8.0（API 26） |
 | 开发语言 | Kotlin |
 

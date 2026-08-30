@@ -64,6 +64,7 @@ import android.widget.Toast
 import android.widget.ProgressBar
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.mutableStateOf
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.core.view.ViewCompat
@@ -198,14 +199,12 @@ class MainActivity : ComponentActivity() {
     private var mainSectionHost: FrameLayout? = null
     private var currentMainSection = 0
     private var mainSectionTransitionGeneration = 0
-    private var detailOverlay: View? = null
-    private var editorOverlay: View? = null
-    private var modeOverlay: View? = null
-    private var semesterOverlay: View? = null
-    private var scoreTermOverlay: View? = null
-    private var scoreDetailOverlay: View? = null
-    private var emptyRoomFilterOverlay: View? = null
-    private var publicOptionOverlay: View? = null
+    private var detailOverlay: LiquidCourseDialogView? = null
+    private var scoreTermOverlay: LiquidScoreTermDropdownView? = null
+    private val scoreTermSelectorExpanded = mutableStateOf(false)
+    private var scoreDetailOverlay: LiquidScoreDetailDialogView? = null
+    private var emptyRoomFilterOverlay: LiquidPickerDialogView? = null
+    private var publicOptionOverlay: LiquidPickerDialogView? = null
     private var shareOverlay: View? = null
     private var actionMenuOverlay: LiquidActionMenuView? = null
     private var updateOverlay: View? = null
@@ -214,6 +213,11 @@ class MainActivity : ComponentActivity() {
     private var updateDialogCapturePending = false
     private var pickerDialogCapturePending = false
     private var actionMenuCapturePending = false
+    private var scoreTermMenuCapturePending = false
+    private var scoreDetailCapturePending = false
+    private var courseDialogCapturePending = false
+    private var emptyRoomFilterCapturePending = false
+    private var publicOptionPickerCapturePending = false
     private var updateDownloadId: Long? = null
     private var updateDownloadReceiverRegistered = false
     private val updateDownloadReceiver = object : BroadcastReceiver() {
@@ -243,7 +247,6 @@ class MainActivity : ComponentActivity() {
         }
     }
     private var pendingPushEnable = false
-    private var pushButton: ImageButton? = null
     private var bottomNavigation: View? = null
     private var scoresLoading = false
     private var scoreExporting = false
@@ -265,7 +268,7 @@ class MainActivity : ComponentActivity() {
     private var emptyRoomQueryExpanded = true
     private val collapsedEmptyRoomGroups = mutableSetOf<String>()
     private var pushEnabled = false
-    private var scheduleMode = ScheduleMode.SPRING
+    private var scheduleMode = ScheduleTimePolicy.currentMode()
     private var currentWeek = 1
     private var pendingApkUrl = APK_URL
     private val networkExecutor = Executors.newSingleThreadExecutor()
@@ -306,7 +309,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
-        scheduleMode = loadScheduleMode()
         pushEnabled = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(KEY_PUSH_ENABLED, false)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             window.setDecorFitsSystemWindows(true)
@@ -610,20 +612,27 @@ class MainActivity : ComponentActivity() {
         emptyRoomLoadError = null
         emptyRoomResult = null
         bottomNavigation = null
-        pushButton = null
+        detailOverlay?.releaseSnapshot()
         detailOverlay = null
-        editorOverlay = null
-        modeOverlay = null
-        semesterOverlay = null
+        courseDialogCapturePending = false
+        scoreTermOverlay?.releaseSnapshot()
         scoreTermOverlay = null
+        scoreTermSelectorExpanded.value = false
+        scoreTermMenuCapturePending = false
+        scoreDetailOverlay?.releaseSnapshot()
         scoreDetailOverlay = null
+        emptyRoomFilterOverlay?.releaseSnapshot()
         emptyRoomFilterOverlay = null
+        emptyRoomFilterCapturePending = false
+        publicOptionOverlay?.releaseSnapshot()
         publicOptionOverlay = null
+        publicOptionPickerCapturePending = false
         shareOverlay = null
         swapPage(buildLoginPage(), false, animate)
     }
 
     private fun showSchedulePage() {
+        scheduleMode = ScheduleTimePolicy.currentMode()
         onLoginPage = false
         hideKeyboard()
         val immersiveBackground = hasCustomBackground()
@@ -641,12 +650,6 @@ class MainActivity : ComponentActivity() {
         window.navigationBarColor = GRADIENT_END
         WindowCompat.setDecorFitsSystemWindows(window, !immersiveBackground)
         swapPage(buildSchedulePage(), true, true)
-        updatePushButton()
-    }
-
-    private fun defaultScheduleMode(): ScheduleMode {
-        val month = Calendar.getInstance().get(Calendar.MONTH) + 1
-        return if (month >= 9 || month <= 4) ScheduleMode.SPRING else ScheduleMode.SUMMER
     }
 
     private fun selectedTerm(): String = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
@@ -706,28 +709,24 @@ class MainActivity : ComponentActivity() {
         return if (parts[2] == "1") "${start}-${start + 1}-2" else "${start + 1}-${start + 2}-1"
     }
 
-    private fun previousTerm(term: String): String {
-        val parts = term.split("-")
-        if (parts.size != 3) return term
-        val start = parts[0].toIntOrNull() ?: return term
-        return if (parts[2] == "2") "$start-${start + 1}-1" else "${start - 1}-$start-2"
-    }
-
     private fun scoreTermOptions(): List<String> {
-        val terms = mutableListOf<String>()
-        var term = inferredCurrentTerm()
-        repeat(8) {
-            terms += term
-            term = previousTerm(term)
-        }
-        return terms
+        val account = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .getString(KEY_ACCOUNT, "")
+            .orEmpty()
+        return scoreTermsForAccount(account).asReversed()
     }
 
     private fun allScoreTerms(account: String): List<String> {
+        return scoreTermsForAccount(account)
+    }
+
+    private fun scoreTermsForAccount(account: String): List<String> {
         val current = inferredCurrentTerm()
+        val currentStartYear = current.substringBefore('-').toIntOrNull()
+            ?: Calendar.getInstance().get(Calendar.YEAR)
         val enrollmentYear = account.take(4).toIntOrNull()
-            ?.takeIf { it in 2000..Calendar.getInstance().get(Calendar.YEAR) }
-            ?: return scoreTermOptions().reversed()
+            ?.takeIf { it in 2000..currentStartYear }
+            ?: return listOf(current)
         val result = mutableListOf<String>()
         var term = "$enrollmentYear-${enrollmentYear + 1}-1"
         while (termOrder(term) <= termOrder(current)) {
@@ -766,13 +765,6 @@ class MainActivity : ComponentActivity() {
         val start = parts.getOrNull(0)?.toIntOrNull() ?: return Int.MIN_VALUE
         val number = parts.getOrNull(2)?.toIntOrNull() ?: return 0
         return start * 2 + number - 1
-    }
-
-    private fun loadScheduleMode(): ScheduleMode {
-        return getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-            .getString(KEY_SCHEDULE_MODE, null)
-            ?.let { runCatching { ScheduleMode.valueOf(it) }.getOrNull() }
-            ?: defaultScheduleMode()
     }
 
     private fun setSystemBars(color: Int) {
@@ -889,30 +881,27 @@ class MainActivity : ComponentActivity() {
             passwordBox.addView(password)
             form.addView(passwordBox, spacedParams(dp(20)))
 
-            val semesterBox = inputBox("学期")
             val semesterOptions = semesterOptions()
-            semesterInput = MaterialAutoCompleteTextView(this).apply {
-                val savedTerm = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_TERM, "")
-                setText(if (savedTerm in semesterOptions) savedTerm else semesterOptions.first(), false)
-                setTextColor(TEXT_PRIMARY)
-                textSize = 16f
-                inputType = InputType.TYPE_NULL
-                isFocusable = false
-                minHeight = dp(72)
-                setPadding(dp(16), dp(16), dp(16), dp(6))
-                gravity = Gravity.CENTER_VERTICAL
-                setOnClickListener { showSemesterPicker() }
-            }
-            semesterBox.addView(semesterInput)
-            form.addView(semesterBox, spacedParams(dp(18)))
+            val savedTerm = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_TERM, "")
+            val selectedTerm = savedTerm?.takeIf { it in semesterOptions } ?: semesterOptions.first()
+            semesterInput = MaterialAutoCompleteTextView(this)
+            form.addView(
+                publicFormField("学期", semesterInput, semesterOptions.toList(), selectedTerm) { },
+                spacedParams(dp(18))
+            )
         } else {
             semesterInput = MaterialAutoCompleteTextView(this)
             val semesterOptions = semesterOptions().toList()
             val savedTerm = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_TERM, "")
             val selectedTerm = savedTerm?.takeIf { it in semesterOptions } ?: semesterOptions.first()
             semesterInput.setText(selectedTerm, false)
-            form.addView(publicFormField("学期", semesterInput, semesterOptions, selectedTerm) {
-                showSemesterPicker()
+            form.addView(publicFormField("学期", semesterInput, semesterOptions, selectedTerm) { semester ->
+                publicCollegeSelection = ""
+                publicGradeSelection = ""
+                publicMajorSelection = ""
+                publicClassSelection = ""
+                startPublicScheduleSyncIfNeeded(semester)
+                swapPage(buildLoginPage(), false, false)
             }, spacedParams(dp(14)))
             buildPublicFilterFields(form, selectedTerm)
         }
@@ -923,7 +912,7 @@ class MainActivity : ComponentActivity() {
         }
         form.addView(loginStatus, spacedParams(dp(12)))
 
-        val loginHeight = if (mode == LoginMode.PERSONAL) 56 else 46
+        val loginHeight = 56
         val login = LiquidTintedActionButtonView(
             context = this,
             initialText = if (mode == LoginMode.PERSONAL) "进入个人课表" else "查询班级课表",
@@ -1074,75 +1063,48 @@ class MainActivity : ComponentActivity() {
         selected: String,
         onSelected: (String) -> Unit
     ) {
-        if (publicOptionOverlay != null || options.isEmpty()) return
-        val overlay = FrameLayout(this).apply {
-            setBackgroundColor(Color.argb(145, 12, 18, 30))
-            isClickable = true
-            setOnClickListener { hidePublicOptionPicker() }
-        }
-        val card = surfaceCard(dp(24f).toFloat()).apply {
-            setCardBackgroundColor(PAGE_BACKGROUND)
-            setOnClickListener { }
-        }
-        val body = verticalLayout().apply { setPadding(dp(20), dp(18), dp(20), dp(18)) }
-        body.addView(text("选择$title", 20f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(12)))
-        val optionList = verticalLayout()
-        options.forEach { option ->
-            val row = MaterialCardView(this).apply {
-                radius = dp(13f).toFloat()
-                cardElevation = 0f
-                strokeWidth = 0
-                setCardBackgroundColor(if (option == selected) PRIMARY_CONTAINER else Color.TRANSPARENT)
-                setOnClickListener {
-                    hidePublicOptionPicker()
-                    onSelected(option)
-                }
+        if (
+            publicOptionOverlay != null ||
+            publicOptionPickerCapturePending ||
+            options.isEmpty()
+        ) return
+        publicOptionPickerCapturePending = true
+        captureUpdateBackdrop { pageSnapshot ->
+            publicOptionPickerCapturePending = false
+            if (isFinishing || isDestroyed || !onLoginPage || publicOptionOverlay != null) {
+                pageSnapshot?.takeUnless(Bitmap::isRecycled)?.recycle()
+                return@captureUpdateBackdrop
             }
-            val rowContent = horizontalLayout().apply {
-                gravity = Gravity.CENTER_VERTICAL
-                addView(text(option, 15f, TEXT_PRIMARY, Typeface.NORMAL).apply {
-                    setPadding(dp(14), dp(11), dp(14), dp(11))
-                }, LinearLayout.LayoutParams(0, -2, 1f))
-                if (option == selected) {
-                    addView(ImageView(this@MainActivity).apply {
-                        setImageResource(R.drawable.ic_check)
-                        setColorFilter(PRIMARY_DARK)
-                        setPadding(dp(8), dp(8), dp(14), dp(8))
-                    }, LinearLayout.LayoutParams(dp(40), dp(48)))
-                }
-            }
-            row.addView(rowContent)
-            optionList.addView(row, spacedParams(dp(7)))
+            val dialog = LiquidPickerDialogView(
+                context = this,
+                pageSnapshot = pageSnapshot,
+                title = "选择$title",
+                options = options.map { option ->
+                    LiquidPickerOption(
+                        title = option,
+                        selected = option == selected,
+                        onClick = {
+                            hidePublicOptionPicker()
+                            onSelected(option)
+                        }
+                    )
+                },
+                highFrost = true,
+                onDismiss = ::hidePublicOptionPicker
+            )
+            pageHost.addView(dialog, matchParentParams())
+            publicOptionOverlay = dialog
+            dialog.alpha = 0f
+            dialog.animate().alpha(1f).setDuration(180).start()
         }
-        if (title == "学院") {
-            val scroll = ScrollView(this).apply {
-                isVerticalScrollBarEnabled = true
-                isScrollbarFadingEnabled = false
-                scrollBarStyle = View.SCROLLBARS_INSIDE_INSET
-                overScrollMode = View.OVER_SCROLL_NEVER
-                addView(optionList, FrameLayout.LayoutParams(-1, -2))
-            }
-            body.addView(scroll, LinearLayout.LayoutParams(-1, dp(6 * 52)))
-        } else {
-            body.addView(optionList)
-        }
-        card.addView(body)
-        val width = minOf(dp(360f), resources.displayMetrics.widthPixels - dp(36f))
-        overlay.addView(card, FrameLayout.LayoutParams(width, -2, Gravity.CENTER))
-        pageHost.addView(overlay, matchParentParams())
-        publicOptionOverlay = overlay
-        overlay.alpha = 0f
-        card.scaleX = .94f
-        card.scaleY = .94f
-        overlay.animate().alpha(1f).setDuration(150).start()
-        card.animate().scaleX(1f).scaleY(1f).setDuration(190).start()
     }
 
     private fun hidePublicOptionPicker() {
         val overlay = publicOptionOverlay ?: return
         overlay.animate().alpha(0f).setDuration(130).withEndAction {
             pageHost.removeView(overlay)
-            publicOptionOverlay = null
+            overlay.releaseSnapshot()
+            if (publicOptionOverlay === overlay) publicOptionOverlay = null
         }.start()
     }
 
@@ -1227,37 +1189,13 @@ class MainActivity : ComponentActivity() {
         onSelected: (String) -> Unit
     ): View {
         val enabled = options.isNotEmpty()
-        val container = verticalLayout()
-        container.addView(text(label, 14f, TEXT_SECONDARY, Typeface.NORMAL).apply {
-            includeFontPadding = true
-        }, matchWrapParams())
-        field.apply {
-            setText(selected.takeIf { it in options }.orEmpty(), false)
-            setTextColor(TEXT_PRIMARY)
-            textSize = 18f
-            setTypeface(Typeface.DEFAULT, Typeface.NORMAL)
-            inputType = InputType.TYPE_NULL
-            isFocusable = false
-            isEnabled = enabled
-            alpha = if (enabled) 1f else .55f
-            minHeight = dp(34)
-            setPadding(0, 0, 0, dp(2))
-            gravity = Gravity.CENTER_VERTICAL
-            background = ColorDrawable(Color.TRANSPARENT)
-            setOnClickListener {
-                if (!enabled) return@setOnClickListener
-                showPublicOptionPicker(label, options, text?.toString().orEmpty()) { value ->
-                    setText(value, false)
-                    onSelected(value)
-                }
+        val resolved = selected.takeIf { it in options }.orEmpty()
+        return selectionFilterCard(label, resolved, field, enabled, true) {
+            showPublicOptionPicker(label, options, field.text?.toString().orEmpty()) { value ->
+                field.setText(value, false)
+                onSelected(value)
             }
         }
-        container.addView(field, matchWrapParams())
-        container.addView(View(this).apply {
-            setBackgroundColor(PUBLIC_FIELD_DIVIDER)
-            alpha = if (enabled) 1f else .55f
-        }, LinearLayout.LayoutParams(-1, dp(1)))
-        return container
     }
 
     private fun attemptPublicScheduleLookup() {
@@ -1401,7 +1339,16 @@ class MainActivity : ComponentActivity() {
             3 -> buildEmptyRoomSection()
             else -> buildScheduleSection()
         }
-        val distance = dp(42).toFloat() * if (index > previousIndex) 1f else -1f
+        // Exam and score pages contain their own full-page backdrop source for
+        // LiquidGlass sampling. Sliding that source over the fixed custom
+        // wallpaper makes the image appear to jump during section changes.
+        val customBackdropTransition = currentPageBackgroundBitmap != null &&
+            (index == 1 || index == 2 || previousIndex == 1 || previousIndex == 2)
+        val distance = if (index == 2 || customBackdropTransition) {
+            0f
+        } else {
+            dp(42).toFloat() * if (index > previousIndex) 1f else -1f
+        }
         replaceMainSection(host, next, index, distance, 230L)
     }
 
@@ -1710,6 +1657,8 @@ class MainActivity : ComponentActivity() {
                 it.weekday == emptyRoomWeekday && it.sectionCode == emptyRoomSectionCode
         }
         val visibleGroups = visibleResult?.let(::groupEmptyRooms).orEmpty()
+        val shouldShowResultSection = emptyRoomsLoading ||
+            !emptyRoomLoadError.isNullOrBlank() || visibleResult != null
         val scroll = ScrollView(this).apply {
             clipToPadding = false
             overScrollMode = View.OVER_SCROLL_NEVER
@@ -1719,64 +1668,65 @@ class MainActivity : ComponentActivity() {
         body.addView(text("空教室查询", 28f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(18)))
         body.addView(buildEmptyRoomQueryPanel(), spacedParams(dp(26)))
 
-        val resultHeader = horizontalLayout().apply {
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(16), 0, dp(16), 0)
-        }
-        resultHeader.addView(text("查询结果", 20f, TEXT_PRIMARY, Typeface.BOLD), LinearLayout.LayoutParams(0, -2, 1f))
-        body.addView(resultHeader, spacedParams(dp(7)))
-        body.addView(text(
-            "${emptyRoomCampus} · 第${emptyRoomWeek}周 · ${emptyRoomWeekdayLabel(emptyRoomWeekday)} · ${emptyRoomSectionLabel(emptyRoomSectionCode)}",
-            12f,
-            TEXT_SECONDARY,
-            secondaryTextTypeface()
-        ).apply { setPadding(dp(16), 0, dp(16), 0) }, spacedParams(dp(15)))
+        if (shouldShowResultSection) {
+            val resultHeader = horizontalLayout().apply {
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(16), 0, dp(16), 0)
+            }
+            resultHeader.addView(text("查询结果", 20f, TEXT_PRIMARY, Typeface.BOLD), LinearLayout.LayoutParams(0, -2, 1f))
+            body.addView(resultHeader, spacedParams(dp(7)))
+            body.addView(text(
+                "${emptyRoomCampus} · 第${emptyRoomWeek}周 · ${emptyRoomWeekdayLabel(emptyRoomWeekday)} · ${emptyRoomSectionLabel(emptyRoomSectionCode)}",
+                12f,
+                TEXT_SECONDARY,
+                secondaryTextTypeface()
+            ).apply { setPadding(dp(16), 0, dp(16), 0) }, spacedParams(dp(15)))
 
-        val state = when {
-            emptyRoomsLoading -> emptyRoomResultSurface().apply {
-                minimumHeight = dp(260)
-                val loading = verticalLayout().apply {
-                    gravity = Gravity.CENTER
-                    addView(ProgressBar(this@MainActivity).apply {
-                        isIndeterminate = true
-                        indeterminateTintList = ColorStateList.valueOf(PRIMARY)
-                        contentDescription = "正在查询空教室"
-                    }, LinearLayout.LayoutParams(dp(36), dp(36)))
-                    addView(text("正在整理空闲教室", 13f, TEXT_SECONDARY, secondaryTextTypeface()).apply {
+            val state = when {
+                emptyRoomsLoading -> emptyRoomResultSurface().apply {
+                    minimumHeight = dp(260)
+                    val loading = verticalLayout().apply {
                         gravity = Gravity.CENTER
-                    }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(14) })
+                        addView(ProgressBar(this@MainActivity).apply {
+                            isIndeterminate = true
+                            indeterminateTintList = ColorStateList.valueOf(PRIMARY)
+                            contentDescription = "正在查询空教室"
+                        }, LinearLayout.LayoutParams(dp(36), dp(36)))
+                        addView(text("正在整理空闲教室", 13f, TEXT_SECONDARY, secondaryTextTypeface()).apply {
+                            gravity = Gravity.CENTER
+                        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(14) })
+                    }
+                    addView(loading, FrameLayout.LayoutParams(-1, dp(260)))
                 }
-                addView(loading, FrameLayout.LayoutParams(-1, dp(260)))
-            }
-            !emptyRoomLoadError.isNullOrBlank() -> emptyRoomResultSurface().apply {
-                minimumHeight = dp(260)
-                val errorView = verticalLayout().apply {
-                    gravity = Gravity.CENTER
-                    setPadding(dp(22), dp(32), dp(22), dp(32))
-                    addView(text("!", 21f, ERROR, Typeface.BOLD).apply { gravity = Gravity.CENTER }, LinearLayout.LayoutParams(dp(50), dp(44)).apply {
-                        bottomMargin = dp(8)
-                    })
-                    addView(text(emptyRoomLoadError.orEmpty(), 14f, TEXT_SECONDARY, secondaryTextTypeface()).apply {
+                !emptyRoomLoadError.isNullOrBlank() -> emptyRoomResultSurface().apply {
+                    minimumHeight = dp(260)
+                    val errorView = verticalLayout().apply {
                         gravity = Gravity.CENTER
-                        setLineSpacing(dp(4).toFloat(), 1f)
-                    }, matchWrapParams())
+                        setPadding(dp(22), dp(32), dp(22), dp(32))
+                        addView(text("!", 21f, ERROR, Typeface.BOLD).apply { gravity = Gravity.CENTER }, LinearLayout.LayoutParams(dp(50), dp(44)).apply {
+                            bottomMargin = dp(8)
+                        })
+                        addView(text(emptyRoomLoadError.orEmpty(), 14f, TEXT_SECONDARY, secondaryTextTypeface()).apply {
+                            gravity = Gravity.CENTER
+                            setLineSpacing(dp(4).toFloat(), 1f)
+                        }, matchWrapParams())
+                    }
+                    addView(errorView, FrameLayout.LayoutParams(-1, dp(260)))
+                    isClickable = true
+                    contentDescription = "空教室查询失败，点击重试"
+                    setOnClickListener { refreshEmptyRooms() }
                 }
-                addView(errorView, FrameLayout.LayoutParams(-1, dp(260)))
-                isClickable = true
-                contentDescription = "空教室查询失败，点击重试"
-                setOnClickListener { refreshEmptyRooms() }
+                visibleGroups.isEmpty() -> emptyRoomResultSurface().apply {
+                    addView(buildAcademicEmptyState(
+                        EmptyAcademicState.ROOMS,
+                        "暂无空闲教室",
+                        "当前校区与时段暂未找到可用教室\n可以更换星期或节次后再查询"
+                    ), FrameLayout.LayoutParams(-1, dp(310)))
+                }
+                else -> buildEmptyRoomResults(requireNotNull(visibleResult), visibleGroups)
             }
-            visibleResult == null -> buildEmptyRoomIdleState()
-            visibleGroups.isEmpty() -> emptyRoomResultSurface().apply {
-                addView(buildAcademicEmptyState(
-                    EmptyAcademicState.ROOMS,
-                    "暂无空闲教室",
-                    "当前校区与时段暂未找到可用教室\n可以更换星期或节次后再查询"
-                ), FrameLayout.LayoutParams(-1, dp(310)))
-            }
-            else -> buildEmptyRoomResults(requireNotNull(visibleResult), visibleGroups)
+            body.addView(state, matchWrapParams())
         }
-        body.addView(state, matchWrapParams())
         scroll.addView(body, FrameLayout.LayoutParams(-1, -2))
         return scroll
     }
@@ -1973,24 +1923,66 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun emptyRoomFilterCard(label: String, value: String, onClick: () -> Unit): View = MaterialCardView(this).apply {
+    private fun emptyRoomFilterCard(label: String, value: String, onClick: () -> Unit): View =
+        selectionFilterCard(label, value, null, true, false, onClick)
+
+    private fun selectionFilterCard(
+        label: String,
+        value: String,
+        field: MaterialAutoCompleteTextView?,
+        enabled: Boolean,
+        showBottomDivider: Boolean,
+        onClick: () -> Unit
+    ): View = MaterialCardView(this).apply {
         radius = dp(15f).toFloat()
         cardElevation = 0f
         strokeWidth = 0
         setCardBackgroundColor(Color.argb(102, 255, 255, 255))
-        isClickable = true
+        isClickable = enabled
+        isEnabled = enabled
+        alpha = if (enabled) 1f else .55f
         contentDescription = "$label，当前$value"
-        setOnClickListener { onClick() }
+        setOnClickListener { if (enabled) onClick() }
         val content = verticalLayout().apply { setPadding(dp(13), dp(10), dp(11), dp(10)) }
-        content.addView(text(label, 11f, TEXT_SECONDARY, Typeface.NORMAL), spacedParams(dp(5)))
+        val labelTextSize = if (showBottomDivider) 13f else 11f
+        val valueTextSize = if (showBottomDivider) 15.5f else 13.5f
+        content.addView(text(label, labelTextSize, TEXT_SECONDARY, Typeface.NORMAL), spacedParams(dp(5)))
         val valueRow = horizontalLayout().apply { gravity = Gravity.CENTER_VERTICAL }
-        valueRow.addView(text(value, 13.5f, TEXT_PRIMARY, Typeface.BOLD).apply {
+        val displayValue = value.ifBlank { "请选择" }
+        val valueView = field?.apply {
+            setText(value, false)
+            setTextColor(TEXT_PRIMARY)
+            textSize = valueTextSize
+            setTypeface(Typeface.DEFAULT, Typeface.BOLD)
+            inputType = InputType.TYPE_NULL
+            isFocusable = false
+            isClickable = enabled
+            isEnabled = enabled
+            minHeight = 0
+            setPadding(0, 0, 0, 0)
+            gravity = Gravity.CENTER_VERTICAL
+            background = ColorDrawable(Color.TRANSPARENT)
             maxLines = 1
-        }, LinearLayout.LayoutParams(0, -2, 1f))
-        valueRow.addView(text("⌄", 14f, TEXT_SECONDARY, Typeface.NORMAL).apply {
-            gravity = Gravity.CENTER
-        }, LinearLayout.LayoutParams(dp(18), -2))
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setOnClickListener { if (enabled) onClick() }
+        } ?: text(displayValue, valueTextSize, TEXT_PRIMARY, Typeface.BOLD).apply {
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }
+        valueRow.addView(valueView, LinearLayout.LayoutParams(0, -2, 1f))
+        if (!showBottomDivider) {
+            valueRow.addView(text("⌄", 14f, TEXT_SECONDARY, Typeface.NORMAL).apply {
+                gravity = Gravity.CENTER
+            }, LinearLayout.LayoutParams(dp(18), -2))
+        }
         content.addView(valueRow, matchWrapParams())
+        if (showBottomDivider) {
+            content.addView(View(this@MainActivity).apply {
+                setBackgroundColor(PUBLIC_FIELD_DIVIDER)
+            }, LinearLayout.LayoutParams(-1, dp(1)).apply {
+                topMargin = dp(8)
+            })
+        }
         addView(content)
     }
 
@@ -2000,14 +1992,6 @@ class MainActivity : ComponentActivity() {
         strokeWidth = dp(1)
         strokeColor = Color.argb(92, 255, 255, 255)
         setCardBackgroundColor(Color.argb(104, 216, 225, 242))
-    }
-
-    private fun buildEmptyRoomIdleState(): View = emptyRoomResultSurface().apply {
-        addView(buildAcademicEmptyState(
-            EmptyAcademicState.ROOM_QUERY,
-            "等待查询",
-            "选择条件后点击查询"
-        ), FrameLayout.LayoutParams(-1, dp(300)))
     }
 
     private fun buildEmptyRoomResults(
@@ -2218,67 +2202,51 @@ class MainActivity : ComponentActivity() {
         selected: String,
         onSelected: (String) -> Unit
     ) {
-        if (emptyRoomFilterOverlay != null) return
-        val overlay = FrameLayout(this).apply {
-            setBackgroundColor(Color.argb(145, 12, 18, 30))
-            isClickable = true
-            setOnClickListener { hideEmptyRoomFilterPicker() }
-        }
-        val card = surfaceCard(dp(24f).toFloat()).apply {
-            strokeWidth = 0
-            setCardBackgroundColor(PAGE_BACKGROUND)
-            setOnClickListener { }
-        }
-        val cardBody = verticalLayout().apply { setPadding(dp(18), dp(17), dp(18), dp(17)) }
-        cardBody.addView(text(title, 20f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(12)))
-        val optionList = verticalLayout()
-        options.forEach { (label, value) ->
-            val active = value == selected
-            val row = horizontalLayout().apply {
-                gravity = Gravity.CENTER_VERTICAL
-                background = android.graphics.drawable.GradientDrawable().apply {
-                    cornerRadius = dp(11f).toFloat()
-                    setColor(if (active) Color.rgb(238, 241, 255) else Color.TRANSPARENT)
-                }
-                setPadding(dp(13), dp(10), dp(10), dp(10))
-                isClickable = true
-                setOnClickListener {
-                    hideEmptyRoomFilterPicker()
-                    onSelected(value)
-                }
+        if (emptyRoomFilterOverlay != null || emptyRoomFilterCapturePending || options.isEmpty()) return
+        emptyRoomFilterCapturePending = true
+        captureUpdateBackdrop { pageSnapshot ->
+            emptyRoomFilterCapturePending = false
+            if (
+                isFinishing ||
+                isDestroyed ||
+                onLoginPage ||
+                currentMainSection != 3 ||
+                emptyRoomFilterOverlay != null
+            ) {
+                pageSnapshot?.takeUnless(Bitmap::isRecycled)?.recycle()
+                return@captureUpdateBackdrop
             }
-            row.addView(text(label, 14f, if (active) PRIMARY_DARK else TEXT_PRIMARY, if (active) Typeface.BOLD else Typeface.NORMAL), LinearLayout.LayoutParams(0, -2, 1f))
-            if (active) row.addView(ImageView(this).apply {
-                setImageResource(R.drawable.ic_check)
-                imageTintList = ColorStateList.valueOf(PRIMARY_DARK)
-            }, LinearLayout.LayoutParams(dp(24), dp(24)))
-            optionList.addView(row, spacedParams(dp(3)))
+            val dialog = LiquidPickerDialogView(
+                context = this,
+                pageSnapshot = pageSnapshot,
+                title = title,
+                options = options.map { (label, value) ->
+                    LiquidPickerOption(
+                        title = label,
+                        selected = value == selected,
+                        onClick = {
+                            hideEmptyRoomFilterPicker()
+                            onSelected(value)
+                        }
+                    )
+                },
+                highFrost = true,
+                onDismiss = ::hideEmptyRoomFilterPicker
+            )
+            pageHost.addView(dialog, matchParentParams())
+            emptyRoomFilterOverlay = dialog
+            dialog.alpha = 0f
+            // 该 View 包含全屏壁纸快照，缩放会让快照与真实壁纸错位并产生抖动。
+            dialog.animate().alpha(1f).setDuration(180).start()
         }
-        if (options.size > 8) {
-            cardBody.addView(ScrollView(this).apply {
-                overScrollMode = View.OVER_SCROLL_NEVER
-                addView(optionList, FrameLayout.LayoutParams(-1, -2))
-            }, LinearLayout.LayoutParams(-1, minOf(dp(430), resources.displayMetrics.heightPixels - dp(150))))
-        } else {
-            cardBody.addView(optionList, matchWrapParams())
-        }
-        card.addView(cardBody)
-        val width = minOf(dp(330), resources.displayMetrics.widthPixels - dp(36))
-        overlay.addView(card, FrameLayout.LayoutParams(width, -2, Gravity.CENTER))
-        pageHost.addView(overlay, matchParentParams())
-        emptyRoomFilterOverlay = overlay
-        overlay.alpha = 0f
-        card.scaleX = .94f
-        card.scaleY = .94f
-        overlay.animate().alpha(1f).setDuration(150).start()
-        card.animate().scaleX(1f).scaleY(1f).setDuration(190).start()
     }
 
     private fun hideEmptyRoomFilterPicker() {
         val overlay = emptyRoomFilterOverlay ?: return
         overlay.animate().alpha(0f).setDuration(130).withEndAction {
             pageHost.removeView(overlay)
-            emptyRoomFilterOverlay = null
+            overlay.releaseSnapshot()
+            if (emptyRoomFilterOverlay === overlay) emptyRoomFilterOverlay = null
         }.start()
     }
 
@@ -2369,7 +2337,13 @@ class MainActivity : ComponentActivity() {
             scoreColors = result.records.map { scoreColor(it.score) },
             pageBackgroundBitmap = currentPageBackgroundBitmap,
             pageBackgroundScrim = CUSTOM_BACKGROUND_SCRIM,
-            onTermClick = ::showScoreTermPicker,
+            termSelectorExpanded = scoreTermSelectorExpanded,
+            onTermClick = { bounds: android.graphics.Rect ->
+                if (scoreTermOverlay == null && !scoreTermMenuCapturePending) {
+                    scoreTermSelectorExpanded.value = true
+                    this@MainActivity.showScoreTermPicker(bounds)
+                }
+            },
             onScoreClick = ::showScoreDetail,
             onExport = { exportScoreImage(result.term) }
         )
@@ -2598,140 +2572,71 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showScoreDetail(record: RemoteScore) {
-        if (scoreDetailOverlay != null) return
-        val overlay = FrameLayout(this).apply {
-            setBackgroundColor(Color.argb(150, 12, 18, 30))
-            isClickable = true
-            setOnClickListener { hideScoreDetail() }
-        }
-        val card = surfaceCard(dp(25f).toFloat()).apply {
-            cardElevation = dp(3).toFloat()
-            strokeWidth = 0
-            setCardBackgroundColor(Color.rgb(250, 252, 254))
-            setOnClickListener { }
-        }
-        val body = verticalLayout().apply { setPadding(dp(18), dp(17), dp(18), dp(18)) }
-        val header = horizontalLayout().apply { gravity = Gravity.CENTER_VERTICAL }
-        val titleGroup = verticalLayout()
-        titleGroup.addView(text("成绩构成", 13f, TEXT_SECONDARY, Typeface.NORMAL), spacedParams(dp(5)))
-        titleGroup.addView(text(
-            listOf(record.courseName, record.courseCode).filter { it.isNotBlank() }.joinToString("-").ifBlank { "课程成绩" },
-            20f, TEXT_PRIMARY, Typeface.BOLD
-        ), matchWrapParams())
-        header.addView(titleGroup, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(10) })
-        header.addView(ImageButton(this).apply {
-            setImageResource(R.drawable.ic_close)
-            contentDescription = "关闭"
-            imageTintList = ColorStateList.valueOf(TEXT_SECONDARY)
-            setPadding(dp(9), dp(9), dp(9), dp(9))
-            background = android.graphics.drawable.GradientDrawable().apply {
-                shape = android.graphics.drawable.GradientDrawable.OVAL
-                setColor(Color.rgb(241, 245, 248))
+        if (scoreDetailOverlay != null || scoreDetailCapturePending) return
+        scoreDetailCapturePending = true
+        captureUpdateBackdrop { pageSnapshot ->
+            scoreDetailCapturePending = false
+            if (
+                isFinishing ||
+                isDestroyed ||
+                onLoginPage ||
+                currentMainSection != 2 ||
+                scoreDetailOverlay != null
+            ) {
+                pageSnapshot?.takeUnless(Bitmap::isRecycled)?.recycle()
+                return@captureUpdateBackdrop
             }
-            setOnClickListener { hideScoreDetail() }
-        }, LinearLayout.LayoutParams(dp(40), dp(40)))
-        body.addView(header, spacedParams(dp(16)))
 
-        val content = FrameLayout(this)
-        content.addView(android.widget.ProgressBar(this).apply {
-            isIndeterminate = true
-            indeterminateTintList = ColorStateList.valueOf(PRIMARY)
-            contentDescription = "加载成绩构成"
-        }, FrameLayout.LayoutParams(dp(38), dp(38), Gravity.CENTER))
-        body.addView(content, LinearLayout.LayoutParams(-1, dp(220)))
-        card.addView(body)
-        val width = minOf(dp(370), resources.displayMetrics.widthPixels - dp(24))
-        overlay.addView(card, FrameLayout.LayoutParams(width, -2, Gravity.CENTER))
-        pageHost.addView(overlay, matchParentParams())
-        scoreDetailOverlay = overlay
-        overlay.alpha = 0f
-        card.scaleX = .94f
-        card.scaleY = .94f
-        overlay.animate().alpha(1f).setDuration(150).start()
-        card.animate().scaleX(1f).scaleY(1f).setDuration(190).start()
+            val dialog = LiquidScoreDetailDialogView(
+                context = this,
+                pageSnapshot = pageSnapshot,
+                courseName = record.courseName,
+                courseCode = record.courseCode,
+                onDismiss = ::hideScoreDetail
+            )
+            pageHost.addView(dialog, matchParentParams())
+            scoreDetailOverlay = dialog
+            dialog.alpha = 0f
+            // 弹层包含一张全屏页面快照；缩放整个 View 会连同自定义壁纸一起缩放，
+            // 在真实页面与快照切换时产生明显抖动，因此这里只做淡入。
+            dialog.animate().alpha(1f).setDuration(190).start()
 
-        val preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-        val account = preferences.getString(KEY_ACCOUNT, "").orEmpty()
-        val password = preferences.getString(KEY_PASSWORD, "").orEmpty()
-        networkExecutor.execute {
-            val result = if (account == "114514") {
-                Result.success(sampleScoreDetail(record))
-            } else {
-                runCatching { SdauCourseRepository().queryScoreDetail(account, password, record) }
-            }
-            runOnUiThread {
-                if (scoreDetailOverlay !== overlay) return@runOnUiThread
-                content.removeAllViews()
-                result.onSuccess { detail ->
-                    content.addView(buildScoreDetailContent(detail), FrameLayout.LayoutParams(-1, -2))
-                    val params = content.layoutParams
-                    params.height = ViewGroup.LayoutParams.WRAP_CONTENT
-                    content.layoutParams = params
-                }.onFailure { error ->
-                    content.addView(text(
-                        error.message?.replace(Regex("\\s+"), " ")?.take(150) ?: "成绩构成查询失败",
-                        14f, ERROR, Typeface.NORMAL
-                    ).apply { gravity = Gravity.CENTER }, FrameLayout.LayoutParams(-1, dp(120), Gravity.CENTER))
-                    val params = content.layoutParams
-                    params.height = dp(120)
-                    content.layoutParams = params
+            val preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            val account = preferences.getString(KEY_ACCOUNT, "").orEmpty()
+            val password = preferences.getString(KEY_PASSWORD, "").orEmpty()
+            networkExecutor.execute {
+                val result = if (account == "114514") {
+                    Result.success(sampleScoreDetail(record))
+                } else {
+                    runCatching { SdauCourseRepository().queryScoreDetail(account, password, record) }
+                }
+                runOnUiThread {
+                    if (scoreDetailOverlay !== dialog) return@runOnUiThread
+                    result.onSuccess { detail ->
+                        dialog.showDetail(detail, scoreColor(detail.totalScore))
+                    }.onFailure { error ->
+                        dialog.showError(
+                            error.message
+                                ?.replace(Regex("\\s+"), " ")
+                                ?.take(150)
+                                ?: "成绩构成查询失败"
+                        )
+                    }
                 }
             }
         }
     }
 
-    private fun buildScoreDetailContent(detail: RemoteScoreDetail): View {
-        val content = verticalLayout()
-        val total = MaterialCardView(this).apply {
-            radius = dp(20f).toFloat()
-            cardElevation = 0f
-            strokeWidth = 0
-            setCardBackgroundColor(Color.rgb(243, 248, 251))
-        }
-        val totalRow = horizontalLayout().apply {
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(16), dp(13), dp(16), dp(13))
-        }
-        totalRow.addView(text("总成绩", 16f, TEXT_SECONDARY, Typeface.BOLD), LinearLayout.LayoutParams(0, -2, 1f))
-        totalRow.addView(text(detail.totalScore, 30f, scoreColor(detail.totalScore), Typeface.BOLD), LinearLayout.LayoutParams(-2, -2))
-        total.addView(totalRow)
-        content.addView(total, spacedParams(dp(12)))
-
-        val firstRow = horizontalLayout()
-        firstRow.addView(scoreDetailCell("平时成绩", detail.usualScore), LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(6) })
-        firstRow.addView(scoreDetailCell("平时占比", formatScoreRatio(detail.usualRatio)), LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(6) })
-        content.addView(firstRow, spacedParams(dp(12)))
-        val secondRow = horizontalLayout()
-        secondRow.addView(scoreDetailCell("期末成绩", detail.finalScore), LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(6) })
-        secondRow.addView(scoreDetailCell("期末占比", formatScoreRatio(detail.finalRatio)), LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(6) })
-        content.addView(secondRow, matchWrapParams())
-        return content
-    }
-
-    private fun scoreDetailCell(label: String, value: String): View = MaterialCardView(this).apply {
-        radius = dp(20f).toFloat()
-        cardElevation = 0f
-        strokeWidth = 0
-        setCardBackgroundColor(Color.rgb(243, 248, 251))
-        addView(verticalLayout().apply {
-            setPadding(dp(15), dp(13), dp(15), dp(13))
-            addView(text(label, 14f, TEXT_SECONDARY, Typeface.NORMAL), spacedParams(dp(7)))
-            addView(text(value.ifBlank { "-" }, 23f, TEXT_PRIMARY, Typeface.BOLD), matchWrapParams())
-        })
-    }
-
-    private fun formatScoreRatio(value: String): String {
-        val clean = value.trim()
-        return if (clean.isNotBlank() && clean != "-" && !clean.contains("%")) "$clean%" else clean.ifBlank { "-" }
-    }
-
     private fun hideScoreDetail() {
         val overlay = scoreDetailOverlay ?: return
-        overlay.animate().alpha(0f).setDuration(130).withEndAction {
+        // 保持全屏快照与底层页面像素对齐，关闭时同样只做淡出。
+        overlay.animate().alpha(0f).setDuration(140).withEndAction {
             pageHost.removeView(overlay)
-            scoreDetailOverlay = null
+            overlay.releaseSnapshot()
+            if (scoreDetailOverlay === overlay) scoreDetailOverlay = null
         }.start()
     }
+
 
     private fun addGradeHeader(body: LinearLayout, term: String) {
         val hasCustomBackground = currentPageBackgroundBitmap != null
@@ -2755,7 +2660,7 @@ class MainActivity : ComponentActivity() {
             )
             isClickable = true
             contentDescription = "选择成绩学期，当前为 $term"
-            setOnClickListener { showScoreTermPicker() }
+            setOnClickListener { showScoreTermPicker(this) }
         }
         val selectorContent = horizontalLayout().apply {
             gravity = Gravity.CENTER_VERTICAL
@@ -2815,63 +2720,96 @@ class MainActivity : ComponentActivity() {
         return scroll
     }
 
-    private fun showScoreTermPicker() {
-        if (scoreTermOverlay != null) return
-        val selected = selectedScoreTerm()
-        val overlay = FrameLayout(this).apply {
-            setBackgroundColor(Color.argb(145, 12, 18, 30))
-            isClickable = true
-            setOnClickListener { hideScoreTermPicker() }
-        }
-        val card = surfaceCard(dp(24f).toFloat()).apply {
-            strokeWidth = 0
-            setCardBackgroundColor(PAGE_BACKGROUND)
-            setOnClickListener { }
-        }
-        val body = verticalLayout().apply { setPadding(dp(18), dp(17), dp(18), dp(17)) }
-        body.addView(text("选择成绩学期", 20f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(13)))
-        scoreTermOptions().forEach { term ->
-            val active = term == selected
-            val row = horizontalLayout().apply {
-                gravity = Gravity.CENTER_VERTICAL
-                background = android.graphics.drawable.GradientDrawable().apply {
-                    cornerRadius = dp(11f).toFloat()
-                    setColor(if (active) Color.rgb(238, 241, 255) else Color.TRANSPARENT)
-                }
-                setPadding(dp(13), dp(10), dp(10), dp(10))
-                setOnClickListener {
-                    getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putString(KEY_SCORE_TERM, term).apply()
-                    scoreLoadError = null
-                    hideScoreTermPicker()
-                    refreshVisibleGrades()
-                    refreshScores()
-                }
-            }
-            row.addView(text(term, 14f, if (active) PRIMARY_DARK else TEXT_PRIMARY, if (active) Typeface.BOLD else Typeface.NORMAL), LinearLayout.LayoutParams(0, -2, 1f))
-            if (active) row.addView(ImageView(this).apply {
-                setImageResource(R.drawable.ic_check)
-                imageTintList = ColorStateList.valueOf(PRIMARY_DARK)
-            }, LinearLayout.LayoutParams(dp(24), dp(24)))
-            body.addView(row, spacedParams(dp(3)))
-        }
-        card.addView(body)
-        val width = minOf(dp(330), resources.displayMetrics.widthPixels - dp(36))
-        overlay.addView(card, FrameLayout.LayoutParams(width, -2, Gravity.CENTER))
-        pageHost.addView(overlay, matchParentParams())
-        scoreTermOverlay = overlay
-        overlay.alpha = 0f
-        card.scaleX = .94f
-        card.scaleY = .94f
-        overlay.animate().alpha(1f).setDuration(150).start()
-        card.animate().scaleX(1f).scaleY(1f).setDuration(190).start()
+    private fun showScoreTermPicker(anchor: View) {
+        val location = IntArray(2)
+        anchor.getLocationInWindow(location)
+        showScoreTermPicker(
+            Rect(
+                location[0],
+                location[1],
+                location[0] + anchor.width,
+                location[1] + anchor.height
+            )
+        )
     }
 
-    private fun hideScoreTermPicker() {
-        val overlay = scoreTermOverlay ?: return
-        overlay.animate().alpha(0f).setDuration(130).withEndAction {
+    private fun showScoreTermPicker(anchorBoundsInWindow: Rect) {
+        if (scoreTermOverlay != null || scoreTermMenuCapturePending) return
+        val terms = scoreTermOptions()
+        val hostLocation = IntArray(2)
+        pageHost.getLocationInWindow(hostLocation)
+        val menuWidth = dp(176)
+        val horizontalMargin = dp(12)
+        val anchorLeft = anchorBoundsInWindow.left - hostLocation[0]
+        val anchorTop = anchorBoundsInWindow.top - hostLocation[1]
+        val anchorRight = anchorBoundsInWindow.right - hostLocation[0]
+        val anchorBottom = anchorBoundsInWindow.bottom - hostLocation[1]
+        val menuX = (anchorRight - menuWidth).coerceIn(
+            horizontalMargin,
+            (pageHost.width - menuWidth - horizontalMargin).coerceAtLeast(horizontalMargin)
+        )
+        val desiredHeight = dp(terms.size * 44 + 12).coerceAtMost(dp(364))
+        val belowY = anchorBottom + dp(4)
+        val belowSpace = pageHost.height - belowY - dp(12)
+        val useBelow = belowSpace >= minOf(desiredHeight, dp(154))
+        val maxMenuHeight: Int
+        val menuY: Int
+        if (useBelow) {
+            menuY = belowY.coerceAtLeast(dp(12))
+            maxMenuHeight = minOf(desiredHeight, belowSpace).coerceAtLeast(dp(88))
+        } else {
+            maxMenuHeight = minOf(desiredHeight, anchorTop - dp(16)).coerceAtLeast(dp(88))
+            menuY = (anchorTop - dp(4) - maxMenuHeight).coerceAtLeast(dp(12))
+        }
+
+        scoreTermMenuCapturePending = true
+        captureUpdateBackdrop { pageSnapshot ->
+            scoreTermMenuCapturePending = false
+            if (isFinishing || isDestroyed || scoreTermOverlay != null) {
+                scoreTermSelectorExpanded.value = false
+                pageSnapshot?.takeUnless(Bitmap::isRecycled)?.recycle()
+                return@captureUpdateBackdrop
+            }
+            val menu = LiquidScoreTermDropdownView(
+                context = this,
+                pageSnapshot = pageSnapshot,
+                menuX = menuX,
+                menuY = menuY,
+                menuWidth = menuWidth,
+                maxMenuHeight = maxMenuHeight,
+                expandDownward = useBelow,
+                terms = terms,
+                selectedTerm = selectedScoreTerm(),
+                onTermSelected = { term ->
+                    hideScoreTermPicker {
+                        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                            .putString(KEY_SCORE_TERM, term)
+                            .apply()
+                        scoreLoadError = null
+                        refreshVisibleGrades()
+                        refreshScores()
+                    }
+                },
+                onDismiss = { hideScoreTermPicker() }
+            )
+            pageHost.addView(menu, matchParentParams())
+            scoreTermOverlay = menu
+        }
+    }
+
+    private fun hideScoreTermPicker(afterDismiss: (() -> Unit)? = null) {
+        scoreTermSelectorExpanded.value = false
+        val overlay = scoreTermOverlay
+        if (overlay == null) {
+            afterDismiss?.invoke()
+            return
+        }
+        overlay.collapse {
+            if (scoreTermOverlay === overlay) scoreTermOverlay = null
             pageHost.removeView(overlay)
-            scoreTermOverlay = null
-        }.start()
+            overlay.releaseSnapshot()
+            afterDismiss?.invoke()
+        }
     }
 
     private fun buildScheduleHeader(): View {
@@ -2892,28 +2830,12 @@ class MainActivity : ComponentActivity() {
         group.addView(scheduleDate, spacedParams(dp(7)))
         group.addView(scheduleWeek, matchWrapParams())
         row.addView(group, LinearLayout.LayoutParams(0, -2, 1f))
-        pushButton = ImageButton(this).apply {
-            setImageResource(if (pushEnabled) R.drawable.ic_push_on else R.drawable.ic_push_off)
-            contentDescription = if (pushEnabled) "关闭课程推送" else "开启课程推送"
-            setBackgroundColor(Color.TRANSPARENT)
-            setPadding(dp(10), dp(10), dp(10), dp(10))
-            setOnClickListener { togglePushNotifications() }
-        }
-        if (viewingPublicSchedule) pushButton?.visibility = View.GONE
-        row.addView(pushButton, LinearLayout.LayoutParams(dp(48), dp(44)))
         row.addView(ImageButton(this).apply {
-            setImageResource(R.drawable.ic_schedule_mode)
-            contentDescription = "选择作息时间"
+            setImageResource(R.drawable.ic_menu_login)
+            contentDescription = "退出登录"
             setBackgroundColor(Color.TRANSPARENT)
-            setPadding(dp(10), dp(10), dp(10), dp(10))
-            setOnClickListener { showScheduleModePicker() }
-        }, LinearLayout.LayoutParams(dp(48), dp(44)))
-        row.addView(ImageButton(this).apply {
-            setImageResource(R.drawable.ic_share)
-            contentDescription = "分享"
-            setBackgroundColor(Color.TRANSPARENT)
-            setPadding(dp(10), dp(10), dp(10), dp(10))
-            setOnClickListener { showSharePicker() }
+            setPadding(dp(11), dp(10), dp(11), dp(10))
+            setOnClickListener { showLoginPage(true) }
         }, LinearLayout.LayoutParams(dp(48), dp(44)))
         row.addView(ImageButton(this).apply {
             setImageResource(R.drawable.ic_more)
@@ -2923,7 +2845,6 @@ class MainActivity : ComponentActivity() {
             setOnClickListener { showUpdateMenu(this) }
         }, LinearLayout.LayoutParams(dp(56), dp(44)))
         header.addView(row, spacedParams(dp(6)))
-        updatePushButton()
         return header
     }
 
@@ -2959,6 +2880,7 @@ class MainActivity : ComponentActivity() {
                     LiquidMenuAction(
                         title = "检查更新",
                         iconRes = R.drawable.ic_update_lightning,
+                        isUpdateAction = true,
                         dividerAfter = true,
                         onClick = {
                             menu.setUpdateStatus("正在检查更新…", true)
@@ -2974,6 +2896,26 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                         }
+                    )
+                )
+                if (!viewingPublicSchedule) {
+                    add(
+                        LiquidMenuAction(
+                            title = if (pushEnabled) "关闭课程通知" else "开启课程通知",
+                            iconRes = if (pushEnabled) R.drawable.ic_push_on else R.drawable.ic_push_off,
+                            isPushAction = true,
+                            onClick = {
+                                togglePushNotifications()
+                                menu.setPushState(pushEnabled)
+                            }
+                        )
+                    )
+                }
+                add(
+                    LiquidMenuAction(
+                        title = "分享",
+                        iconRes = R.drawable.ic_share,
+                        onClick = { hideActionMenu { showSharePicker() } }
                     )
                 )
                 add(
@@ -2994,13 +2936,6 @@ class MainActivity : ComponentActivity() {
                         )
                     )
                 }
-                add(
-                    LiquidMenuAction(
-                        title = "重新登录",
-                        iconRes = R.drawable.ic_menu_login,
-                        onClick = { hideActionMenu { showLoginPage(true) } }
-                    )
-                )
             }
             menu = LiquidActionMenuView(
                 context = this,
@@ -3008,12 +2943,11 @@ class MainActivity : ComponentActivity() {
                 menuX = menuX,
                 menuY = menuY,
                 actions = actions,
+                hasCustomBackground = hasCustomBackground(),
                 onDismiss = { hideActionMenu() }
             )
             pageHost.addView(menu, matchParentParams())
             actionMenuOverlay = menu
-            menu.alpha = 0f
-            menu.animate().alpha(1f).setDuration(150).start()
         }
     }
 
@@ -3023,12 +2957,12 @@ class MainActivity : ComponentActivity() {
             afterDismiss?.invoke()
             return
         }
-        actionMenuOverlay = null
-        overlay.animate().alpha(0f).setDuration(120).withEndAction {
+        overlay.collapse {
+            if (actionMenuOverlay === overlay) actionMenuOverlay = null
             pageHost.removeView(overlay)
             overlay.releaseSnapshot()
             afterDismiss?.invoke()
-        }.start()
+        }
     }
 
     private fun customBackgroundFile(): File = File(filesDir, CUSTOM_BACKGROUND_FILE_NAME)
@@ -3801,133 +3735,11 @@ class MainActivity : ComponentActivity() {
         intArrayOf(480, 535, 600, 655, 870, 925, 990, 1045, 1170, 1225)
     }
 
-    private fun showScheduleModePicker() {
-        if (modeOverlay != null || pickerDialogCapturePending) return
-        pickerDialogCapturePending = true
-        captureUpdateBackdrop { pageSnapshot ->
-            pickerDialogCapturePending = false
-            if (isFinishing || isDestroyed || modeOverlay != null) {
-                pageSnapshot?.takeUnless(Bitmap::isRecycled)?.recycle()
-                return@captureUpdateBackdrop
-            }
-            val dialog = LiquidPickerDialogView(
-                context = this,
-                pageSnapshot = pageSnapshot,
-                title = "选择作息时间",
-                options = listOf(
-                    LiquidPickerOption(
-                        title = "春秋作息",
-                        subtitle = "秋季开学到次年“五一”假期",
-                        selected = scheduleMode == ScheduleMode.SPRING,
-                        onClick = { selectScheduleMode(ScheduleMode.SPRING) }
-                    ),
-                    LiquidPickerOption(
-                        title = "夏季作息",
-                        subtitle = "“五一”放假结束后至暑假",
-                        selected = scheduleMode == ScheduleMode.SUMMER,
-                        onClick = { selectScheduleMode(ScheduleMode.SUMMER) }
-                    )
-                ),
-                onDismiss = ::hideScheduleModePicker
-            )
-            pageHost.addView(dialog, matchParentParams())
-            modeOverlay = dialog
-            dialog.alpha = 0f
-            dialog.animate().alpha(1f).setDuration(180).start()
-        }
-    }
-
-    private fun selectScheduleMode(mode: ScheduleMode) {
-        scheduleMode = mode
-        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
-            .putString(KEY_SCHEDULE_MODE, mode.name)
-            .apply()
-        scheduleGrid?.setScheduleMode(mode)
-        CourseWidgetProvider.updateAll(this)
-        if (
-            Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
-        ) {
-            scheduleSystemCourseReminder()
-        }
-        hideScheduleModePicker()
-    }
-
-    private fun hideScheduleModePicker() {
-        val overlay = modeOverlay ?: return
-        overlay.animate().alpha(0f).setDuration(140).withEndAction {
-            pageHost.removeView(overlay)
-            (overlay as? LiquidPickerDialogView)?.releaseSnapshot()
-            modeOverlay = null
-        }.start()
-    }
-
-    private fun showSemesterPicker() {
-        if (semesterOverlay != null) return
-        val overlay = FrameLayout(this).apply {
-            setBackgroundColor(Color.argb(145, 12, 18, 30))
-            isClickable = true
-            setOnClickListener { hideSemesterPicker() }
-        }
-        val card = surfaceCard(dp(24f).toFloat()).apply {
-            setCardBackgroundColor(PAGE_BACKGROUND)
-            setOnClickListener { }
-        }
-        val body = verticalLayout().apply { setPadding(dp(20), dp(18), dp(20), dp(18)) }
-        body.addView(text("选择学期", 20f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(12)))
-        semesterOptions().forEach { semester ->
-            val row = MaterialCardView(this).apply {
-                radius = dp(13f).toFloat()
-                cardElevation = 0f
-                strokeWidth = 0
-                setCardBackgroundColor(if (semester == semesterInput.text?.toString()) PRIMARY_CONTAINER else SURFACE)
-                setOnClickListener {
-                    semesterInput.setText(semester, false)
-                    hideSemesterPicker()
-                    if (loginMode == LoginMode.PUBLIC) {
-                        publicCollegeSelection = ""
-                        publicGradeSelection = ""
-                        publicMajorSelection = ""
-                        publicClassSelection = ""
-                        startPublicScheduleSyncIfNeeded(semester)
-                        swapPage(buildLoginPage(), false, false)
-                    }
-                }
-            }
-            row.addView(text(semester, 15f, TEXT_PRIMARY, Typeface.NORMAL).apply {
-                setPadding(dp(14), dp(10), dp(14), dp(10))
-            })
-            body.addView(row, spacedParams(dp(7)))
-        }
-        card.addView(body)
-        val width = minOf(dp(330f), resources.displayMetrics.widthPixels - dp(36f))
-        overlay.addView(card, FrameLayout.LayoutParams(width, -2, Gravity.CENTER))
-        pageHost.addView(overlay, matchParentParams())
-        semesterOverlay = overlay
-        overlay.alpha = 0f; card.scaleX = .92f; card.scaleY = .92f
-        overlay.animate().alpha(1f).setDuration(160).start()
-        card.animate().scaleX(1f).scaleY(1f).setDuration(200).start()
-    }
-
-    private fun hideSemesterPicker() {
-        val overlay = semesterOverlay ?: return
-        overlay.animate().alpha(0f).setDuration(140).withEndAction {
-            pageHost.removeView(overlay)
-            semesterOverlay = null
-        }.start()
-    }
-
-    private fun updatePushButton() {
-        pushButton?.setImageResource(if (pushEnabled) R.drawable.ic_push_on else R.drawable.ic_push_off)
-        pushButton?.contentDescription = if (pushEnabled) "关闭课程推送" else "开启课程推送"
-    }
-
     private fun togglePushNotifications() {
         if (pushEnabled) {
             pushEnabled = false
             getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putBoolean(KEY_PUSH_ENABLED, false).apply()
             cancelSystemCourseReminder()
-            updatePushButton()
             Toast.makeText(this, "课程提醒已关闭", Toast.LENGTH_SHORT).show()
             return
         }
@@ -3943,7 +3755,6 @@ class MainActivity : ComponentActivity() {
     private fun enablePushNotifications() {
         pushEnabled = true
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putBoolean(KEY_PUSH_ENABLED, true).apply()
-        updatePushButton()
         Toast.makeText(this, "课程提醒已开启", Toast.LENGTH_SHORT).show()
         requestBatteryOptimizationExemption()
         schedulePushNotifications()
@@ -4006,6 +3817,7 @@ class MainActivity : ComponentActivity() {
             if (pendingPushEnable) {
                 pendingPushEnable = false
                 enablePushNotifications()
+                actionMenuOverlay?.setPushState(pushEnabled)
                 return
             }
             scheduleSystemCourseReminder()
@@ -4805,6 +4617,18 @@ class MainActivity : ComponentActivity() {
     @Deprecated("Use OnBackInvokedDispatcher on newer Android versions")
     override fun onBackPressed() {
         if (forceUpdateActive) return
+        if (emptyRoomFilterOverlay != null) {
+            hideEmptyRoomFilterPicker()
+            return
+        }
+        if (publicOptionOverlay != null) {
+            hidePublicOptionPicker()
+            return
+        }
+        if (scoreDetailOverlay != null) {
+            hideScoreDetail()
+            return
+        }
         if (actionMenuOverlay != null) {
             hideActionMenu()
             return
@@ -4891,7 +4715,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private enum class EmptyAcademicState { EXAMS, GRADES, ROOMS, ROOM_QUERY }
+    private enum class EmptyAcademicState { EXAMS, GRADES, ROOMS }
 
     private inner class AcademicEmptyIllustration(
         context: Context,
@@ -4910,7 +4734,6 @@ class MainActivity : ComponentActivity() {
                 EmptyAcademicState.EXAMS -> "暂无考试安排"
                 EmptyAcademicState.GRADES -> "暂无课程成绩"
                 EmptyAcademicState.ROOMS -> "暂无空闲教室"
-                EmptyAcademicState.ROOM_QUERY -> "等待查询空闲教室"
             }
         }
 
@@ -4928,7 +4751,6 @@ class MainActivity : ComponentActivity() {
                 EmptyAcademicState.EXAMS -> drawEmptyExam(canvas, cx, cy)
                 EmptyAcademicState.GRADES -> drawEmptyGrades(canvas, cx, cy)
                 EmptyAcademicState.ROOMS -> drawEmptyRooms(canvas, cx, cy, true)
-                EmptyAcademicState.ROOM_QUERY -> drawWaitingRoomQuery(canvas, cx, cy)
             }
         }
 
@@ -5034,86 +4856,6 @@ class MainActivity : ComponentActivity() {
             illustrationPaint.color = Color.WHITE
             canvas.drawLine(cx + dp(35f), cy - dp(27f), cx + dp(38f), cy - dp(24f), illustrationPaint)
             canvas.drawLine(cx + dp(38f), cy - dp(24f), cx + dp(44f), cy - dp(31f), illustrationPaint)
-        }
-
-        private fun drawWaitingRoomQuery(canvas: Canvas, cx: Float, cy: Float) {
-            val cardSave = canvas.save()
-            canvas.rotate(-3f, cx, cy)
-            illustrationRect.set(cx - dp(42f), cy - dp(38f), cx + dp(33f), cy + dp(38f))
-            illustrationPaint.style = Paint.Style.FILL
-            illustrationPaint.color = Color.argb(27, 55, 72, 125)
-            canvas.drawRoundRect(
-                illustrationRect.left + dp(3f), illustrationRect.top + dp(5f),
-                illustrationRect.right + dp(3f), illustrationRect.bottom + dp(5f),
-                dp(14f).toFloat(), dp(14f).toFloat(), illustrationPaint
-            )
-            illustrationPaint.color = Color.argb(218, 252, 253, 255)
-            canvas.drawRoundRect(illustrationRect, dp(14f).toFloat(), dp(14f).toFloat(), illustrationPaint)
-            illustrationPaint.style = Paint.Style.STROKE
-            illustrationPaint.strokeWidth = dp(1.2f).toFloat()
-            illustrationPaint.color = Color.argb(100, 126, 139, 179)
-            canvas.drawRoundRect(illustrationRect, dp(14f).toFloat(), dp(14f).toFloat(), illustrationPaint)
-
-            // 彩色查询条与小圆点提供和课程空状态一致的插画层次。
-            illustrationPaint.style = Paint.Style.FILL
-            illustrationPaint.color = Color.rgb(131, 140, 199)
-            canvas.drawRoundRect(
-                illustrationRect.left + dp(13f), illustrationRect.top + dp(14f),
-                illustrationRect.right - dp(14f), illustrationRect.top + dp(25f),
-                dp(5.5f).toFloat(), dp(5.5f).toFloat(), illustrationPaint
-            )
-            illustrationPaint.color = Color.argb(215, 255, 255, 255)
-            canvas.drawRoundRect(
-                illustrationRect.left + dp(21f), illustrationRect.top + dp(18f),
-                illustrationRect.right - dp(23f), illustrationRect.top + dp(21f),
-                dp(1.5f).toFloat(), dp(1.5f).toFloat(), illustrationPaint
-            )
-
-            val resultColors = intArrayOf(
-                Color.rgb(130, 173, 247),
-                Color.rgb(105, 205, 185),
-                Color.rgb(245, 108, 126)
-            )
-            for (row in 0..2) {
-                val rowY = illustrationRect.top + dp(37f + row * 13f)
-                illustrationPaint.color = resultColors[row]
-                canvas.drawCircle(illustrationRect.left + dp(18f), rowY, dp(3.5f).toFloat(), illustrationPaint)
-                illustrationPaint.color = Color.argb(82, 105, 113, 132)
-                canvas.drawRoundRect(
-                    illustrationRect.left + dp(27f), rowY - dp(1.7f),
-                    illustrationRect.right - dp(12f + row * 5f), rowY + dp(1.7f),
-                    dp(1.7f).toFloat(), dp(1.7f).toFloat(), illustrationPaint
-                )
-            }
-            canvas.restoreToCount(cardSave)
-
-            // 右下角的大放大镜与卡片发生遮挡，形成和参考图杯子相同的前后关系。
-            val lensX = cx + dp(27f)
-            val lensY = cy + dp(20f)
-            illustrationPaint.style = Paint.Style.FILL
-            illustrationPaint.color = Color.argb(235, 248, 250, 255)
-            canvas.drawCircle(lensX, lensY, dp(19f).toFloat(), illustrationPaint)
-            illustrationPaint.style = Paint.Style.STROKE
-            illustrationPaint.strokeWidth = dp(3.2f).toFloat()
-            illustrationPaint.color = Color.rgb(131, 140, 199)
-            canvas.drawCircle(lensX - dp(2f), lensY - dp(2f), dp(13f).toFloat(), illustrationPaint)
-            canvas.drawLine(
-                lensX + dp(8f), lensY + dp(8f),
-                lensX + dp(19f), lensY + dp(19f), illustrationPaint
-            )
-
-            // 左上角两枚柔和彩叶延续图二的点缀方式。
-            illustrationPaint.style = Paint.Style.FILL
-            illustrationPaint.color = Color.rgb(105, 205, 185)
-            val leafSave = canvas.save()
-            canvas.rotate(-26f, cx - dp(34f), cy - dp(38f))
-            canvas.drawOval(cx - dp(43f), cy - dp(43f), cx - dp(26f), cy - dp(33f), illustrationPaint)
-            canvas.restoreToCount(leafSave)
-            illustrationPaint.color = Color.rgb(130, 173, 247)
-            val secondLeafSave = canvas.save()
-            canvas.rotate(28f, cx - dp(20f), cy - dp(42f))
-            canvas.drawOval(cx - dp(28f), cy - dp(47f), cx - dp(13f), cy - dp(37f), illustrationPaint)
-            canvas.restoreToCount(secondLeafSave)
         }
 
         private fun drawEmptyRooms(canvas: Canvas, cx: Float, cy: Float, showNoRoomBadge: Boolean) {
@@ -5223,8 +4965,6 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
-
-    private enum class ScheduleMode { SPRING, SUMMER }
 
     private data class Course(val day: Int, val startSlot: Int, val slotCount: Int, val name: String, val room: String, val teacher: String, val background: Int, val foreground: Int, val weeks: String = "")
 
@@ -6155,7 +5895,8 @@ class MainActivity : ComponentActivity() {
                     dp(14f).toFloat(),
                     sp(if (isToday) 12.6f else 11.7f),
                     textColor,
-                    if (isToday || currentPageBackgroundBitmap != null) Typeface.BOLD else Typeface.NORMAL
+                    if (isToday || currentPageBackgroundBitmap != null) Typeface.BOLD else Typeface.NORMAL,
+                    extraBold = isToday
                 )
                 drawCenteredText(
                     canvas,
@@ -6164,7 +5905,8 @@ class MainActivity : ComponentActivity() {
                     dp(31f).toFloat(),
                     sp(if (isToday) 8.6f else 7.8f),
                     textColor,
-                    if (isToday || currentPageBackgroundBitmap != null) Typeface.BOLD else Typeface.NORMAL
+                    if (isToday || currentPageBackgroundBitmap != null) Typeface.BOLD else Typeface.NORMAL,
+                    extraBold = isToday
                 )
             }
         }
@@ -6301,9 +6043,26 @@ class MainActivity : ComponentActivity() {
             return result
         }
 
-        private fun drawCenteredText(canvas: Canvas, value: String, centerX: Float, centerY: Float, size: Float, color: Int, style: Int) {
-            paint.style = Paint.Style.FILL; paint.textSize = size; paint.color = color; paint.typeface = Typeface.create(Typeface.DEFAULT, style); paint.textAlign = Paint.Align.CENTER
-            val metrics = paint.fontMetrics; canvas.drawText(value, centerX, centerY - (metrics.ascent + metrics.descent) / 2f, paint); paint.textAlign = Paint.Align.LEFT
+        private fun drawCenteredText(
+            canvas: Canvas,
+            value: String,
+            centerX: Float,
+            centerY: Float,
+            size: Float,
+            color: Int,
+            style: Int,
+            extraBold: Boolean = false
+        ) {
+            paint.style = Paint.Style.FILL
+            paint.textSize = size
+            paint.color = color
+            paint.typeface = Typeface.create(Typeface.DEFAULT, style)
+            paint.isFakeBoldText = extraBold
+            paint.textAlign = Paint.Align.CENTER
+            val metrics = paint.fontMetrics
+            canvas.drawText(value, centerX, centerY - (metrics.ascent + metrics.descent) / 2f, paint)
+            paint.isFakeBoldText = false
+            paint.textAlign = Paint.Align.LEFT
         }
 
         private fun sp(value: Float) = value * resources.displayMetrics.density
@@ -6326,110 +6085,40 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showCourseDetails(course: Course) {
-        if (detailOverlay != null) return
-        val overlay = FrameLayout(this).apply {
-            setBackgroundColor(Color.argb(145, 12, 18, 30))
-            isClickable = true
-            setOnClickListener { hideCourseDetails() }
-        }
-        val card = surfaceCard(dp(24f).toFloat()).apply {
-            setCardBackgroundColor(SCHEDULE_BACKGROUND)
-            setOnClickListener { }
-        }
-        val body = verticalLayout().apply { setPadding(dp(22), dp(20), dp(22), dp(20)) }
-        val titleRow = horizontalLayout().apply { gravity = Gravity.CENTER_VERTICAL }
-        titleRow.addView(text(course.name, 21f, TEXT_PRIMARY, Typeface.BOLD), LinearLayout.LayoutParams(0, -2, 1f))
-        if (!viewingPublicSchedule) {
-            titleRow.addView(ImageButton(this).apply {
-                setImageResource(R.drawable.ic_edit)
-                contentDescription = "修改课程"
-                setBackgroundColor(Color.TRANSPARENT)
-                setPadding(dp(8), dp(8), dp(8), dp(8))
-                setOnClickListener { showCourseEditor(course) }
-            }, LinearLayout.LayoutParams(dp(42), dp(42)))
-        }
-        titleRow.addView(text("×", 28f, TEXT_SECONDARY, Typeface.NORMAL).apply {
-            gravity = Gravity.CENTER
-            setOnClickListener { hideCourseDetails() }
-        }, LinearLayout.LayoutParams(dp(42), dp(42)))
-        body.addView(titleRow, spacedParams(dp(14)))
-        body.addView(detailLine("地点", "@${course.room}", R.drawable.ic_detail_location), spacedParams(dp(10)))
-        body.addView(detailLine("教师", course.teacher, R.drawable.ic_detail_teacher), spacedParams(dp(10)))
-        body.addView(detailLine("节次", "第 ${course.startSlot + 1}-${course.startSlot + course.slotCount} 节", R.drawable.ic_detail_time), spacedParams(dp(10)))
-        body.addView(detailLine("周数", course.weeks, R.drawable.ic_detail_week), matchWrapParams())
-        card.addView(body)
-        val width = minOf(dp(360f), resources.displayMetrics.widthPixels - dp(36f))
-        overlay.addView(card, FrameLayout.LayoutParams(width, -2, Gravity.CENTER))
-        pageHost.addView(overlay, matchParentParams())
-        detailOverlay = overlay
-        overlay.alpha = 0f
-        card.scaleX = .92f; card.scaleY = .92f
-        overlay.animate().alpha(1f).setDuration(160).start()
-        card.animate().scaleX(1f).scaleY(1f).setDuration(200).start()
-    }
-
-    private fun showCourseEditor(course: Course) {
-        if (viewingPublicSchedule) return
-        detailOverlay?.let { pageHost.removeView(it); detailOverlay = null }
-        if (editorOverlay != null) return
-        val overlay = FrameLayout(this).apply {
-            setBackgroundColor(Color.argb(145, 12, 18, 30))
-            isClickable = true
-            setOnClickListener { hideCourseEditor() }
-        }
-        val card = surfaceCard(dp(24f).toFloat()).apply {
-            setCardBackgroundColor(SCHEDULE_BACKGROUND)
-            setOnClickListener { }
-        }
-        val body = verticalLayout().apply { setPadding(dp(20), dp(18), dp(20), dp(18)) }
-        val titleRow = horizontalLayout().apply { gravity = Gravity.CENTER_VERTICAL }
-        titleRow.addView(text("修改课程", 20f, TEXT_PRIMARY, Typeface.BOLD), LinearLayout.LayoutParams(0, -2, 1f))
-        titleRow.addView(text("×", 28f, TEXT_SECONDARY, Typeface.NORMAL).apply {
-            gravity = Gravity.CENTER
-            setOnClickListener { hideCourseEditor() }
-        }, LinearLayout.LayoutParams(dp(42), dp(42)))
-        body.addView(titleRow, spacedParams(dp(12)))
-
-        val nameInput = editableCourseField("课程名", course.name)
-        val roomInput = editableCourseField("地点", course.room)
-        val teacherInput = editableCourseField("教师", course.teacher)
-        val weeksInput = editableCourseField("周数", course.weeks)
-        body.addView(nameInput.first, spacedParams(dp(10)))
-        body.addView(roomInput.first, spacedParams(dp(10)))
-        body.addView(teacherInput.first, spacedParams(dp(10)))
-        body.addView(weeksInput.first, matchWrapParams())
-        titleRow.addView(ImageButton(this).apply {
-            setImageResource(R.drawable.ic_check)
-            contentDescription = "保存修改"
-            setBackgroundColor(Color.TRANSPARENT)
-            setPadding(dp(8), dp(8), dp(8), dp(8))
-            setOnClickListener {
-                updateCourseCache(
-                    course,
-                    nameInput.second.text?.toString().orEmpty(),
-                    roomInput.second.text?.toString().orEmpty(),
-                    teacherInput.second.text?.toString().orEmpty(),
-                    weeksInput.second.text?.toString().orEmpty()
-                )
-                hideCourseEditor()
+        if (detailOverlay != null || courseDialogCapturePending) return
+        courseDialogCapturePending = true
+        captureUpdateBackdrop { pageSnapshot ->
+            courseDialogCapturePending = false
+            if (
+                isFinishing ||
+                isDestroyed ||
+                onLoginPage ||
+                currentMainSection != 0 ||
+                detailOverlay != null
+            ) {
+                pageSnapshot?.takeUnless(Bitmap::isRecycled)?.recycle()
+                return@captureUpdateBackdrop
             }
-        }, LinearLayout.LayoutParams(dp(42), dp(42)))
-        card.addView(body)
-        val width = minOf(dp(360f), resources.displayMetrics.widthPixels - dp(36f))
-        overlay.addView(card, FrameLayout.LayoutParams(width, -2, Gravity.CENTER))
-        pageHost.addView(overlay, matchParentParams())
-        editorOverlay = overlay
-
-        overlay.alpha = 0f; card.scaleX = .92f; card.scaleY = .92f
-        overlay.animate().alpha(1f).setDuration(160).start()
-        card.animate().scaleX(1f).scaleY(1f).setDuration(200).start()
-    }
-
-    private fun editableCourseField(label: String, value: String): Pair<TextInputLayout, TextInputEditText> {
-        val box = inputBox(label)
-        val input = input(InputType.TYPE_CLASS_TEXT).apply { setText(value) }
-        box.addView(input)
-        return box to input
+            val dialog = LiquidCourseDialogView(
+                context = this,
+                pageSnapshot = pageSnapshot,
+                courseName = course.name,
+                room = course.room,
+                teacher = course.teacher,
+                slotText = "第 ${course.startSlot + 1}-${course.startSlot + course.slotCount} 节",
+                weeks = course.weeks,
+                canEdit = !viewingPublicSchedule,
+                onSave = { name, room, teacher, weeks ->
+                    updateCourseCache(course, name, room, teacher, weeks)
+                    hideCourseDetails()
+                },
+                onDismiss = ::hideCourseDetails
+            )
+            pageHost.addView(dialog, matchParentParams())
+            detailOverlay = dialog
+            dialog.alpha = 0f
+            dialog.animate().alpha(1f).setDuration(180).start()
+        }
     }
 
     private fun updateCourseCache(original: Course, name: String, room: String, teacher: String, weeks: String) {
@@ -6443,37 +6132,32 @@ class MainActivity : ComponentActivity() {
         scheduleGrid?.setCourses(recolored)
     }
 
-    private fun detailLine(label: String, value: String, iconRes: Int): View {
-        val row = horizontalLayout().apply { gravity = Gravity.CENTER_VERTICAL }
-        row.addView(ImageView(this).apply {
-            setImageResource(iconRes)
-            imageTintList = ColorStateList.valueOf(PRIMARY_DARK)
-            setPadding(dp(2), dp(2), dp(2), dp(2))
-        }, LinearLayout.LayoutParams(dp(28), dp(28)))
-        row.addView(text(label, 12f, PRIMARY_DARK, Typeface.BOLD).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(4), 0, dp(8), 0)
-        }, LinearLayout.LayoutParams(dp(58), -2))
-        row.addView(text(value, 15f, TEXT_PRIMARY, Typeface.NORMAL).apply {
-            setPadding(dp(12), 0, 0, 0)
-        }, LinearLayout.LayoutParams(0, -2, 1f))
-        return row
-    }
-
     private fun hideCourseDetails() {
         val overlay = detailOverlay ?: return
+        detailOverlay = null
         overlay.animate().alpha(0f).setDuration(140).withEndAction {
             pageHost.removeView(overlay)
-            detailOverlay = null
+            overlay.releaseSnapshot()
         }.start()
     }
 
-    private fun hideCourseEditor() {
-        val overlay = editorOverlay ?: return
-        overlay.animate().alpha(0f).setDuration(140).withEndAction {
-            pageHost.removeView(overlay)
-            editorOverlay = null
-        }.start()
+    override fun onResume() {
+        super.onResume()
+        val automaticMode = ScheduleTimePolicy.currentMode()
+        if (automaticMode == scheduleMode) return
+        scheduleMode = automaticMode
+        scheduleGrid?.setScheduleMode(automaticMode)
+        CourseWidgetProvider.updateAll(this)
+        if (
+            pushEnabled &&
+            (
+                Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                    checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+                    PackageManager.PERMISSION_GRANTED
+                )
+        ) {
+            scheduleSystemCourseReminder()
+        }
     }
 
     override fun onDestroy() {
@@ -6481,8 +6165,15 @@ class MainActivity : ComponentActivity() {
         publicScheduleIndexCache.clear()
         updateDialogView?.releaseSnapshot()
         updateDialogView = null
+        scoreDetailOverlay?.releaseSnapshot()
+        scoreDetailOverlay = null
+        detailOverlay?.releaseSnapshot()
+        detailOverlay = null
+        emptyRoomFilterOverlay?.releaseSnapshot()
+        emptyRoomFilterOverlay = null
+        publicOptionOverlay?.releaseSnapshot()
+        publicOptionOverlay = null
         (shareOverlay as? LiquidPickerDialogView)?.releaseSnapshot()
-        (modeOverlay as? LiquidPickerDialogView)?.releaseSnapshot()
         actionMenuOverlay?.releaseSnapshot()
         clearUpdateDownloadReceiver()
         networkExecutor.shutdownNow()
@@ -6510,7 +6201,6 @@ class MainActivity : ComponentActivity() {
         private const val KEY_STUDENT_NAME = "student_name"
         private const val KEY_TERM = "term"
         private const val KEY_SCORE_TERM = "score_term"
-        private const val KEY_SCHEDULE_MODE = "schedule_mode"
         private const val KEY_COURSES = "courses_cache"
         private const val KEY_PUBLIC_SCHEDULE_SYNCED_TERM = "public_schedule_synced_term"
         private const val KEY_PUBLIC_SCHEDULE_HASH_PREFIX = "public_schedule_sha256_"

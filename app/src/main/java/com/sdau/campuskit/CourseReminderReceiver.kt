@@ -31,7 +31,7 @@ object CourseNotification {
             "课程提醒",
             NotificationManager.IMPORTANCE_HIGH
         ).apply {
-            description = "下一节课程提醒（默认静音）"
+            description = "下一节课程提醒"
             setSound(null, null)
             enableVibration(false)
             vibrationPattern = longArrayOf(0L)
@@ -111,7 +111,6 @@ object CourseReminderScheduler {
     private const val KEY_COURSES = "courses_cache"
     private const val KEY_PUSH_ENABLED = "push_enabled"
     private const val KEY_TERM = "term"
-    private const val KEY_SCHEDULE_MODE = "schedule_mode"
     private const val REMINDER_REQUEST_CODE = 3002
     private const val OFFICIAL_TERM = "2026-2027-1"
     private const val OFFICIAL_TERM_START_YEAR = 2026
@@ -128,8 +127,7 @@ object CourseReminderScheduler {
         }
         val courses = loadCourses(preferences.getString(KEY_COURSES, null))
         val term = preferences.getString(KEY_TERM, OFFICIAL_TERM).orEmpty().ifBlank { OFFICIAL_TERM }
-        val scheduleMode = preferences.getString(KEY_SCHEDULE_MODE, "SPRING").orEmpty()
-        val next = findNextReminder(courses, term, scheduleMode, Calendar.getInstance())
+        val next = findNextReminder(courses, term, Calendar.getInstance())
         cancel(applicationContext)
         if (next == null) return
 
@@ -169,7 +167,6 @@ object CourseReminderScheduler {
     private fun findNextReminder(
         courses: List<ReminderCourse>,
         term: String,
-        scheduleMode: String,
         now: Calendar
     ): NextReminder? {
         if (courses.isEmpty()) return null
@@ -180,11 +177,14 @@ object CourseReminderScheduler {
         val todayHasCourses = !CampusHolidayCalendar.isHoliday(today) && courses.any {
             it.day == todayIndex && courseVisibleInWeek(it, currentWeek)
         }
-        val starts = if (scheduleMode == "SUMMER") SUMMER_START_MINUTES else SPRING_START_MINUTES
-
         for (dayOffset in 0..147) {
             val date = (today.clone() as Calendar).apply { add(Calendar.DAY_OF_MONTH, dayOffset) }
             if (CampusHolidayCalendar.isHoliday(date)) continue
+            val starts = if (ScheduleTimePolicy.modeFor(date) == ScheduleMode.SUMMER) {
+                SUMMER_START_MINUTES
+            } else {
+                SPRING_START_MINUTES
+            }
             val week = weekForDate(date, termStart)
             if (week !in 1..20) continue
             val dayCourses = courses
