@@ -155,6 +155,136 @@ internal fun createEmptyRoomLiquidGroupCardView(
     )
 }
 
+internal fun createEmptyRoomLiquidFilterCardView(
+    context: Context,
+    label: String,
+    value: String,
+    pageBackgroundBitmap: Bitmap?,
+    pageBackgroundScrim: Int,
+    textPalette: ScheduleTextPalette,
+    onClick: () -> Unit
+): View = composeHostView(context) {
+    EmptyRoomLiquidFilterCard(
+        label = label,
+        value = value,
+        pageBackgroundBitmap = pageBackgroundBitmap,
+        pageBackgroundScrim = pageBackgroundScrim,
+        textPalette = textPalette,
+        onClick = onClick
+    )
+}
+
+@Composable
+private fun EmptyRoomLiquidFilterCard(
+    label: String,
+    value: String,
+    pageBackgroundBitmap: Bitmap?,
+    pageBackgroundScrim: Int,
+    textPalette: ScheduleTextPalette,
+    onClick: () -> Unit
+) {
+    val backdrop = rememberLayerBackdrop()
+    val pageBackgroundImage = remember(pageBackgroundBitmap) {
+        pageBackgroundBitmap?.asImageBitmap()
+    }
+    val pageGradient = Brush.linearGradient(
+        listOf(
+            Color(0xFFF3F2F9),
+            Color(0xFFF0F1F9),
+            Color(0xFFEBEFF8),
+            Color(0xFFE3EBF7),
+            Color(0xFFD9E5F4)
+        )
+    )
+    val shape = RoundedRectangle(20.dp)
+    val textPrimary = Color(textPalette.primary)
+    val textSecondary = Color(textPalette.secondary)
+    val textShadow = scheduleTextShadow(textPalette)
+    val secondaryWeight = if (textPalette.adaptive) FontWeight.Bold else FontWeight.Normal
+
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .clip(shape)
+    ) {
+        PageAlignedBackdropSource(
+            backdrop = backdrop,
+            pageBackgroundImage = pageBackgroundImage,
+            pageBackgroundScrim = pageBackgroundScrim,
+            pageGradient = pageGradient,
+            modifier = Modifier.matchParentSize()
+        )
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .heightIn(min = 54.dp)
+                .drawBackdrop(
+                    backdrop = backdrop,
+                    shape = { shape },
+                    effects = {
+                        colorControls(brightness = 0.10f, saturation = 0.80f)
+                        blur(7.dp.toPx())
+                        lens(14.dp.toPx(), 28.dp.toPx())
+                    },
+                    shadow = null,
+                    highlight = { Highlight.Default.copy(alpha = 0.46f) },
+                    onDrawSurface = {
+                        drawRect(Color(0xFFEEF1F8).copy(alpha = 0.22f))
+                    }
+                )
+                .clickable(
+                    interactionSource = null,
+                    indication = null,
+                    role = Role.Button,
+                    onClick = onClick
+                )
+                .padding(start = 12.dp, top = 6.dp, end = 9.dp, bottom = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(Modifier.weight(1f)) {
+                BasicText(
+                    label,
+                    modifier = Modifier.padding(bottom = 3.dp),
+                    style = TextStyle(
+                        color = textSecondary,
+                        fontSize = 11.sp,
+                        fontWeight = secondaryWeight,
+                        shadow = textShadow
+                    )
+                )
+                BasicText(
+                    value.ifBlank { "请选择" },
+                    style = TextStyle(
+                        color = textPrimary,
+                        fontSize = 13.5f.sp,
+                        fontWeight = FontWeight.Bold,
+                        shadow = textShadow
+                    ),
+                    maxLines = 1
+                )
+            }
+            Canvas(Modifier.size(width = 16.dp, height = 20.dp)) {
+                val strokeWidth = 1.7.dp.toPx()
+                val center = Offset(size.width * 0.5f, size.height * 0.58f)
+                drawLine(
+                    color = textSecondary,
+                    start = Offset(size.width * 0.25f, size.height * 0.40f),
+                    end = center,
+                    strokeWidth = strokeWidth,
+                    cap = StrokeCap.Round
+                )
+                drawLine(
+                    color = textSecondary,
+                    start = center,
+                    end = Offset(size.width * 0.75f, size.height * 0.40f),
+                    strokeWidth = strokeWidth,
+                    cap = StrokeCap.Round
+                )
+            }
+        }
+    }
+}
+
 @Composable
 private fun EmptyRoomLiquidGroupCard(
     groupKey: String,
@@ -183,6 +313,11 @@ private fun EmptyRoomLiquidGroupCard(
     val textPrimary = Color(textPalette.primary)
     val textShadow = scheduleTextShadow(textPalette)
     var expanded by remember(groupKey) { mutableStateOf(initiallyExpanded) }
+    val chevronRotation by animateFloatAsState(
+        targetValue = if (expanded) 180f else 0f,
+        animationSpec = tween(durationMillis = 220),
+        label = "emptyRoomGroupChevronRotation"
+    )
     val roomRows = remember(rooms) { rooms.chunked(2) }
 
     val cardShape = RoundedRectangle(20.dp)
@@ -219,7 +354,7 @@ private fun EmptyRoomLiquidGroupCard(
                 .animateContentSize(
                     animationSpec = spring(dampingRatio = 0.78f, stiffness = 420f)
                 )
-                .padding(horizontal = 15.dp, vertical = 14.dp)
+                .padding(horizontal = 15.dp, vertical = 18.dp)
         ) {
             Row(
                 Modifier
@@ -251,13 +386,29 @@ private fun EmptyRoomLiquidGroupCard(
                         shadow = textShadow
                     )
                 )
-                BasicText(
-                    if (expanded) "⌃" else "⌄",
-                    modifier = Modifier
-                        .widthIn(min = 32.dp)
-                        .padding(bottom = if (expanded) 0.dp else 4.dp),
-                    style = TextStyle(Color(accentColor), 20.sp, FontWeight.Bold)
-                )
+                Canvas(
+                    Modifier
+                        .size(width = 32.dp, height = 24.dp)
+                        .graphicsLayer { rotationZ = chevronRotation }
+                ) {
+                    val color = Color(accentColor)
+                    val strokeWidth = 2.dp.toPx()
+                    val center = Offset(size.width * 0.5f, size.height * 0.62f)
+                    drawLine(
+                        color = color,
+                        start = Offset(size.width * 0.30f, size.height * 0.40f),
+                        end = center,
+                        strokeWidth = strokeWidth,
+                        cap = StrokeCap.Round
+                    )
+                    drawLine(
+                        color = color,
+                        start = center,
+                        end = Offset(size.width * 0.70f, size.height * 0.40f),
+                        strokeWidth = strokeWidth,
+                        cap = StrokeCap.Round
+                    )
+                }
             }
 
             if (expanded) {

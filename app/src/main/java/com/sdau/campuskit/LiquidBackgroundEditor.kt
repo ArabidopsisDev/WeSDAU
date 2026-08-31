@@ -4,12 +4,9 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.os.SystemClock
 import android.widget.FrameLayout
-import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
@@ -48,9 +45,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.GraphicsLayerScope
 import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.DrawScope
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.graphicsLayer
@@ -574,103 +569,14 @@ private fun WallpaperApplyToast(
     backdrop: Backdrop,
     modifier: Modifier = Modifier
 ) {
-    val visible = state != WallpaperApplyToastState.HIDDEN
-    var lastVisibleState by remember { mutableStateOf(WallpaperApplyToastState.APPLYING) }
-    val displayState = if (visible) state else lastVisibleState
-    LaunchedEffect(state) {
-        if (state != WallpaperApplyToastState.HIDDEN) lastVisibleState = state
-    }
-    val reveal by animateFloatAsState(
-        targetValue = if (visible) 1f else 0f,
-        animationSpec = tween(durationMillis = if (visible) 180 else 130),
-        label = "wallpaperApplyToastReveal"
+    val success = state == WallpaperApplyToastState.SUCCESS
+    LiquidStatusToast(
+        visible = state != WallpaperApplyToastState.HIDDEN,
+        visual = if (success) LiquidToastVisual.SUCCESS else LiquidToastVisual.LOADING,
+        message = if (success) "背景图片已应用" else "正在应用背景…",
+        backdrop = backdrop,
+        modifier = modifier
     )
-    val loadingTransition = rememberInfiniteTransition(label = "wallpaperApplyToastLoading")
-    val loadingRotation by loadingTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 900, easing = LinearEasing)
-        ),
-        label = "wallpaperApplyToastLoadingRotation"
-    )
-    val accent = Color(0xFF0088FF)
-
-    Row(
-        modifier
-            .graphicsLayer {
-                alpha = reveal
-                translationY = (1f - reveal) * 10.dp.toPx()
-            }
-            .drawBackdrop(
-                backdrop = backdrop,
-                shape = { RoundedRectangle(24.dp) },
-                effects = {
-                    blur(14.dp.toPx())
-                    lens(3.dp.toPx(), 7.dp.toPx())
-                },
-                shadow = {
-                    Shadow(radius = 7.dp, color = Color.Black.copy(alpha = 0.10f))
-                },
-                innerShadow = {
-                    InnerShadow(radius = 2.dp, color = Color.White.copy(alpha = 0.28f))
-                },
-                onDrawSurface = { drawRect(Color.White.copy(alpha = 0.38f)) }
-            )
-            .padding(horizontal = 16.dp, vertical = 11.dp),
-        horizontalArrangement = Arrangement.spacedBy(11.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Box(
-            Modifier.size(30.dp),
-            contentAlignment = Alignment.Center
-        ) {
-            Canvas(
-                Modifier
-                    .size(19.dp)
-                    .graphicsLayer {
-                        rotationZ = if (displayState == WallpaperApplyToastState.APPLYING) loadingRotation else 0f
-                    }
-            ) {
-                if (displayState == WallpaperApplyToastState.SUCCESS) {
-                    drawLine(
-                        color = accent,
-                        start = Offset(size.width * 0.18f, size.height * 0.52f),
-                        end = Offset(size.width * 0.42f, size.height * 0.75f),
-                        strokeWidth = 2.5.dp.toPx(),
-                        cap = StrokeCap.Round
-                    )
-                    drawLine(
-                        color = accent,
-                        start = Offset(size.width * 0.42f, size.height * 0.75f),
-                        end = Offset(size.width * 0.84f, size.height * 0.28f),
-                        strokeWidth = 2.5.dp.toPx(),
-                        cap = StrokeCap.Round
-                    )
-                } else {
-                    drawCircle(
-                        color = accent.copy(alpha = 0.18f),
-                        style = Stroke(width = 2.3.dp.toPx())
-                    )
-                    drawArc(
-                        color = accent,
-                        startAngle = -90f,
-                        sweepAngle = 250f,
-                        useCenter = false,
-                        style = Stroke(width = 2.3.dp.toPx(), cap = StrokeCap.Round)
-                    )
-                }
-            }
-        }
-        BasicText(
-            if (displayState == WallpaperApplyToastState.SUCCESS) "背景图片已应用" else "正在应用背景…",
-            style = TextStyle(
-                color = Color(0xFF1C2230),
-                fontSize = 15.sp,
-                fontWeight = FontWeight.SemiBold
-            )
-        )
-    }
 }
 
 /** Ported from AndroidLiquidGlass-kmp/components/LiquidSlider.kt. */

@@ -35,6 +35,7 @@ import android.os.Environment
 import android.os.PowerManager
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.text.InputType
 import android.util.JsonWriter
 import android.util.TypedValue
@@ -229,6 +230,12 @@ class MainActivity : ComponentActivity() {
     private var backgroundEditorPendingSource: File? = null
     private var backgroundEditorPreviewBitmap: Bitmap? = null
     private var updateOverlay: View? = null
+    private var liquidToastOverlay: LiquidAppToastView? = null
+    private var liquidToastCapturePending = false
+    private var pendingLiquidToast: PendingLiquidToast? = null
+    private var liquidToastDismissRunnable: Runnable? = null
+    private var liquidToastDeferredRunnable: Runnable? = null
+    private var liquidToastLoadingStartedAt = 0L
     private var forceUpdateActive = false
     private var updateDialogView: LiquidUpdateDialogView? = null
     private var updateDialogCapturePending = false
@@ -319,6 +326,11 @@ class MainActivity : ComponentActivity() {
         val changelog: String,
         val url: String,
         val forceUpdate: Boolean = false
+    )
+    private data class PendingLiquidToast(
+        val message: String,
+        val visual: LiquidToastVisual,
+        val durationMillis: Long
     )
     private data class ExamCache(val term: String, val records: List<RemoteExam>)
     private data class EmptyRoomGroup(val title: String, val accent: Int, val rooms: List<String>)
@@ -609,6 +621,114 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun showLiquidToast(
+        message: String,
+        visual: LiquidToastVisual,
+        durationMillis: Long = 2_200L
+    ) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnUiThread { showLiquidToast(message, visual, durationMillis) }
+            return
+        }
+        if (visual == LiquidToastVisual.LOADING) {
+            liquidToastDeferredRunnable?.let(pageHost::removeCallbacks)
+            liquidToastDeferredRunnable = null
+            liquidToastLoadingStartedAt = SystemClock.uptimeMillis()
+        } else if (liquidToastLoadingStartedAt > 0L) {
+            val elapsed = SystemClock.uptimeMillis() - liquidToastLoadingStartedAt
+            val remaining = (900L - elapsed).coerceAtLeast(0L)
+            if (remaining > 0L) {
+                liquidToastDeferredRunnable?.let(pageHost::removeCallbacks)
+                lateinit var deferred: Runnable
+                deferred = Runnable {
+                    if (liquidToastDeferredRunnable !== deferred) return@Runnable
+                    liquidToastDeferredRunnable = null
+                    liquidToastLoadingStartedAt = 0L
+                    showLiquidToast(message, visual, durationMillis)
+                }
+                liquidToastDeferredRunnable = deferred
+                pageHost.postDelayed(deferred, remaining)
+                return
+            }
+            liquidToastLoadingStartedAt = 0L
+        }
+        val request = PendingLiquidToast(message, visual, durationMillis)
+        pendingLiquidToast = request
+        liquidToastDismissRunnable?.let(pageHost::removeCallbacks)
+        liquidToastDismissRunnable = null
+
+        liquidToastOverlay?.let { overlay ->
+            pendingLiquidToast = null
+            overlay.update(message, visual)
+            scheduleLiquidToastDismiss(overlay, durationMillis)
+            return
+        }
+        if (liquidToastCapturePending) return
+
+        liquidToastCapturePending = true
+        captureUpdateBackdrop { pageSnapshot ->
+            liquidToastCapturePending = false
+            val latest = pendingLiquidToast
+            pendingLiquidToast = null
+            if (latest == null || isFinishing || isDestroyed) {
+                pageSnapshot?.takeUnless(Bitmap::isRecycled)?.recycle()
+                return@captureUpdateBackdrop
+            }
+            val overlay = LiquidAppToastView(
+                context = this,
+                pageSnapshot = pageSnapshot,
+                initialMessage = latest.message,
+                initialVisual = latest.visual
+            )
+            pageHost.addView(overlay, matchParentParams())
+            liquidToastOverlay = overlay
+            scheduleLiquidToastDismiss(overlay, latest.durationMillis)
+        }
+    }
+
+    private fun scheduleLiquidToastDismiss(
+        overlay: LiquidAppToastView,
+        durationMillis: Long
+    ) {
+        if (durationMillis <= 0L) return
+        val dismissRunnable = Runnable {
+            if (liquidToastOverlay === overlay) dismissLiquidToast()
+        }
+        liquidToastDismissRunnable = dismissRunnable
+        pageHost.postDelayed(dismissRunnable, durationMillis)
+    }
+
+    private fun dismissLiquidToast() {
+        pendingLiquidToast = null
+        liquidToastDeferredRunnable?.let(pageHost::removeCallbacks)
+        liquidToastDeferredRunnable = null
+        liquidToastLoadingStartedAt = 0L
+        liquidToastDismissRunnable?.let(pageHost::removeCallbacks)
+        liquidToastDismissRunnable = null
+        val overlay = liquidToastOverlay ?: return
+        overlay.dismiss {
+            if (liquidToastOverlay === overlay) {
+                pageHost.removeView(overlay)
+                overlay.releaseSnapshot()
+                liquidToastOverlay = null
+            }
+        }
+    }
+
+    private fun clearLiquidToastImmediately() {
+        pendingLiquidToast = null
+        liquidToastDeferredRunnable?.let(pageHost::removeCallbacks)
+        liquidToastDeferredRunnable = null
+        liquidToastLoadingStartedAt = 0L
+        liquidToastDismissRunnable?.let(pageHost::removeCallbacks)
+        liquidToastDismissRunnable = null
+        liquidToastOverlay?.let { overlay ->
+            pageHost.removeView(overlay)
+            overlay.releaseSnapshot()
+        }
+        liquidToastOverlay = null
+    }
+
     private fun hideUpdateDialog() {
         val overlay = updateOverlay ?: return
         overlay.animate().alpha(0f).setDuration(140).withEndAction {
@@ -819,6 +939,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun swapPage(next: View, forward: Boolean, animate: Boolean) {
+        clearLiquidToastImmediately()
         val previous = pageHost.getChildAt(0)
         if (!animate || previous == null) {
             pageHost.removeAllViews()
@@ -1579,7 +1700,7 @@ class MainActivity : ComponentActivity() {
             examsLoading || (!hasLoaded && error.isNullOrBlank()) -> verticalLayout().apply {
                 gravity = Gravity.CENTER
                 addView(ProgressBar(this@MainActivity).apply {
-                    indeterminateTintList = ColorStateList.valueOf(PRIMARY)
+                    indeterminateTintList = ColorStateList.valueOf(THEME_BLUE)
                     contentDescription = "正在加载考试安排"
                 }, LinearLayout.LayoutParams(dp(34), dp(34)))
             }
@@ -1779,7 +1900,7 @@ class MainActivity : ComponentActivity() {
                         gravity = Gravity.CENTER
                         addView(ProgressBar(this@MainActivity).apply {
                             isIndeterminate = true
-                            indeterminateTintList = ColorStateList.valueOf(PRIMARY)
+                            indeterminateTintList = ColorStateList.valueOf(THEME_BLUE)
                             contentDescription = "正在查询空教室"
                         }, LinearLayout.LayoutParams(dp(36), dp(36)))
                         addView(text(
@@ -1853,9 +1974,9 @@ class MainActivity : ComponentActivity() {
         }, LinearLayout.LayoutParams(0, -2, 1f))
         val queryButton = ImageButton(this@MainActivity).apply {
             setImageResource(R.drawable.ic_search_room)
-            imageTintList = ColorStateList.valueOf(PRIMARY_DARK)
+            imageTintList = ColorStateList.valueOf(THEME_BLUE)
             scaleType = ImageView.ScaleType.CENTER
-            setPadding(dp(7), dp(7), dp(7), dp(7))
+            setPadding(dp(5), dp(5), dp(5), dp(5))
             contentDescription = if (emptyRoomsLoading) "正在查询空教室" else "查询空教室"
             isEnabled = !emptyRoomsLoading
             alpha = if (emptyRoomsLoading) .58f else 1f
@@ -1954,9 +2075,9 @@ class MainActivity : ComponentActivity() {
 
     private fun emptyRoomCollapseButton(expanded: Boolean, targetName: String): ImageButton = ImageButton(this).apply {
         setImageResource(R.drawable.ic_expand_chevron)
-        imageTintList = ColorStateList.valueOf(PRIMARY_DARK)
+        imageTintList = ColorStateList.valueOf(THEME_BLUE)
         scaleType = ImageView.ScaleType.CENTER
-        setPadding(dp(7), dp(7), dp(7), dp(7))
+        setPadding(dp(5), dp(5), dp(5), dp(5))
         background = ColorDrawable(Color.TRANSPARENT)
         rotation = if (expanded) 180f else 0f
         contentDescription = if (expanded) "折叠$targetName" else "展开$targetName"
@@ -2033,13 +2154,13 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun emptyRoomFilterCard(label: String, value: String, onClick: () -> Unit): View =
-        selectionFilterCard(
+        createEmptyRoomLiquidFilterCardView(
+            context = this,
             label = label,
             value = value,
-            field = null,
-            enabled = true,
-            showBottomDivider = false,
-            useSchedulePalette = true,
+            pageBackgroundBitmap = currentPageBackgroundBitmap,
+            pageBackgroundScrim = customBackgroundScrimColor(),
+            textPalette = scheduleTextPalette,
             onClick = onClick
         )
 
@@ -2049,7 +2170,6 @@ class MainActivity : ComponentActivity() {
         field: MaterialAutoCompleteTextView?,
         enabled: Boolean,
         showBottomDivider: Boolean,
-        useSchedulePalette: Boolean = false,
         onClick: () -> Unit
     ): View = MaterialCardView(this).apply {
         radius = dp(15f).toFloat()
@@ -2064,17 +2184,12 @@ class MainActivity : ComponentActivity() {
         val content = verticalLayout().apply { setPadding(dp(13), dp(10), dp(11), dp(10)) }
         val labelTextSize = if (showBottomDivider) 13f else 11f
         val valueTextSize = if (showBottomDivider) 15.5f else 13.5f
-        val primaryColor = if (useSchedulePalette) scheduleTextPalette.primary else TEXT_PRIMARY
-        val secondaryColor = if (useSchedulePalette) scheduleTextPalette.secondary else TEXT_SECONDARY
-        val secondaryTypeface = if (useSchedulePalette) secondaryTextTypeface() else Typeface.NORMAL
-        content.addView(text(label, labelTextSize, secondaryColor, secondaryTypeface).apply {
-            if (useSchedulePalette) applyScheduleTextHalo()
-        }, spacedParams(dp(5)))
+        content.addView(text(label, labelTextSize, TEXT_SECONDARY, Typeface.NORMAL), spacedParams(dp(5)))
         val valueRow = horizontalLayout().apply { gravity = Gravity.CENTER_VERTICAL }
         val displayValue = value.ifBlank { "请选择" }
         val valueView = field?.apply {
             setText(value, false)
-            setTextColor(primaryColor)
+            setTextColor(TEXT_PRIMARY)
             textSize = valueTextSize
             setTypeface(Typeface.DEFAULT, Typeface.BOLD)
             inputType = InputType.TYPE_NULL
@@ -2088,17 +2203,14 @@ class MainActivity : ComponentActivity() {
             maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
             setOnClickListener { if (enabled) onClick() }
-            if (useSchedulePalette) applyScheduleTextHalo()
-        } ?: text(displayValue, valueTextSize, primaryColor, Typeface.BOLD).apply {
+        } ?: text(displayValue, valueTextSize, TEXT_PRIMARY, Typeface.BOLD).apply {
             maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
-            if (useSchedulePalette) applyScheduleTextHalo()
         }
         valueRow.addView(valueView, LinearLayout.LayoutParams(0, -2, 1f))
         if (!showBottomDivider) {
-            valueRow.addView(text("⌄", 14f, secondaryColor, secondaryTypeface).apply {
+            valueRow.addView(text("⌄", 14f, TEXT_SECONDARY, Typeface.NORMAL).apply {
                 gravity = Gravity.CENTER
-                if (useSchedulePalette) applyScheduleTextHalo()
             }, LinearLayout.LayoutParams(dp(18), -2))
         }
         content.addView(valueRow, matchWrapParams())
@@ -2498,17 +2610,26 @@ class MainActivity : ComponentActivity() {
         }
 
         scoreExporting = true
-        Toast.makeText(this, "正在生成成绩图片…", Toast.LENGTH_SHORT).show()
+        showLiquidToast(
+            message = "正在生成成绩图片…",
+            visual = LiquidToastVisual.LOADING,
+            durationMillis = 0L
+        )
         networkExecutor.execute {
             var bitmap: Bitmap? = null
             try {
                 bitmap = createScoreBitmap(result)
                 saveScoreBitmap(bitmap, result.term)
                 runOnUiThread {
-                    Toast.makeText(this, "成绩图片已保存到 Pictures/WeSDAU", Toast.LENGTH_LONG).show()
+                    showLiquidToast(
+                        message = "成绩图片已保存到 Pictures/WeSDAU",
+                        visual = LiquidToastVisual.SUCCESS,
+                        durationMillis = 2_600L
+                    )
                 }
             } catch (error: Exception) {
                 runOnUiThread {
+                    dismissLiquidToast()
                     Toast.makeText(this, "保存成绩图片失败：${error.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
                 }
             } finally {
@@ -2819,7 +2940,7 @@ class MainActivity : ComponentActivity() {
                 gravity = Gravity.CENTER
                 addView(ProgressBar(this@MainActivity).apply {
                     isIndeterminate = true
-                    indeterminateTintList = ColorStateList.valueOf(PRIMARY)
+                    indeterminateTintList = ColorStateList.valueOf(THEME_BLUE)
                     contentDescription = "加载成绩"
                 }, LinearLayout.LayoutParams(dp(38), dp(38)))
             }
@@ -3968,7 +4089,11 @@ class MainActivity : ComponentActivity() {
             writeCourseCsv(csvFile, activeScheduleCourses())
             return pngFile to csvFile
         } catch (error: Exception) {
-            Toast.makeText(this, "导出失败：${error.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
+            showLiquidToast(
+                message = "导出失败：${error.message ?: "未知错误"}",
+                visual = LiquidToastVisual.ERROR,
+                durationMillis = 2_800L
+            )
             return null
         }
     }
@@ -3984,7 +4109,11 @@ class MainActivity : ComponentActivity() {
             return
         }
         scheduleExporting = true
-        Toast.makeText(this, "正在保存课表图片…", Toast.LENGTH_SHORT).show()
+        showLiquidToast(
+            message = "正在保存课表图片…",
+            visual = LiquidToastVisual.LOADING,
+            durationMillis = 0L
+        )
         networkExecutor.execute {
             var bitmap: Bitmap? = null
             try {
@@ -3997,10 +4126,15 @@ class MainActivity : ComponentActivity() {
                 }
                 saveScheduleBitmapToPictures(bitmap, displayName)
                 runOnUiThread {
-                    Toast.makeText(this, "课表图片已保存到 Pictures/WeSDAU", Toast.LENGTH_LONG).show()
+                    showLiquidToast(
+                        message = "课表图片已保存到 Pictures/WeSDAU",
+                        visual = LiquidToastVisual.SUCCESS,
+                        durationMillis = 2_600L
+                    )
                 }
             } catch (error: Exception) {
                 runOnUiThread {
+                    dismissLiquidToast()
                     Toast.makeText(this, "保存课表图片失败：${error.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
                 }
             } finally {
@@ -4208,7 +4342,11 @@ class MainActivity : ComponentActivity() {
             File(applicationInfo.sourceDir).copyTo(apk, overwrite = true)
             shareSingleFile(apk, "application/vnd.android.package-archive", "分享 WeSDAU课程表")
         } catch (error: Exception) {
-            Toast.makeText(this, "分享 APP 失败：${error.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
+            showLiquidToast(
+                message = "分享 APP 失败：${error.message ?: "未知错误"}",
+                visual = LiquidToastVisual.ERROR,
+                durationMillis = 2_800L
+            )
         }
         hideSharePicker()
     }
@@ -4341,7 +4479,11 @@ class MainActivity : ComponentActivity() {
             pushEnabled = false
             getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putBoolean(KEY_PUSH_ENABLED, false).apply()
             cancelSystemCourseReminder()
-            Toast.makeText(this, "课程提醒已关闭", Toast.LENGTH_SHORT).show()
+            showLiquidToast(
+                message = "课程提醒已关闭",
+                visual = LiquidToastVisual.BELL_OFF,
+                durationMillis = 1_800L
+            )
             return
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
@@ -4356,7 +4498,11 @@ class MainActivity : ComponentActivity() {
     private fun enablePushNotifications() {
         pushEnabled = true
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putBoolean(KEY_PUSH_ENABLED, true).apply()
-        Toast.makeText(this, "课程提醒已开启", Toast.LENGTH_SHORT).show()
+        showLiquidToast(
+            message = "课程提醒已开启",
+            visual = LiquidToastVisual.BELL_ON,
+            durationMillis = 1_800L
+        )
         requestBatteryOptimizationExemption()
         schedulePushNotifications()
         nextCourseForNow()?.let { course -> CourseNotification.show(this, course.name, course.room, courseTimeLabel(course)) }
@@ -6936,6 +7082,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         scheduleGrid?.releaseTransientCaches()
         publicScheduleIndexCache.clear()
+        clearLiquidToastImmediately()
         updateDialogView?.releaseSnapshot()
         updateDialogView = null
         scoreDetailOverlay?.releaseSnapshot()
@@ -7040,6 +7187,7 @@ class MainActivity : ComponentActivity() {
         private const val SURFACE = Color.WHITE
         private val TEXT_PRIMARY = Color.rgb(28, 34, 48)
         private val TEXT_SECONDARY = Color.rgb(102, 111, 133)
+        private val THEME_BLUE = Color.rgb(0, 136, 255)
         private val PRIMARY = Color.rgb(76, 92, 196)
         private val PRIMARY_DARK = Color.rgb(50, 64, 153)
         private val PRIMARY_CONTAINER = Color.rgb(232, 235, 255)
