@@ -67,6 +67,7 @@ class CourseWidgetProvider : AppWidgetProvider() {
         private const val KEY_PASSWORD = "password"
         private const val KEY_TERM = "term"
         private const val KEY_COURSES = "courses_cache"
+        private const val KEY_COURSES_PREFIX = "courses_cache_account"
         private const val KEY_CUSTOM_COURSES_PREFIX = "custom_courses_cache"
         private const val KEY_WIDGET_LAST_NETWORK_REFRESH = "widget_last_network_refresh"
         private const val WIDGET_NETWORK_REFRESH_INTERVAL = 24L * 60L * 60L * 1000L
@@ -176,9 +177,19 @@ class CourseWidgetProvider : AppWidgetProvider() {
                     put("foreground", Color.WHITE)
                 })
             }
-            preferences.edit().putString(KEY_COURSES, rows.toString()).apply()
+            val payload = rows.toString()
+            preferences.edit()
+                .putString(KEY_COURSES, payload)
+                .putString(courseCacheKey(account, term), payload)
+                .apply()
             CourseReminderScheduler.scheduleNext(context)
             return true
+        }
+
+        private fun courseCacheKey(account: String, term: String): String {
+            val safeAccount = account.replace(Regex("[^A-Za-z0-9_-]"), "_")
+            val safeTerm = term.replace(Regex("[^A-Za-z0-9_-]"), "_")
+            return "${KEY_COURSES_PREFIX}_${safeAccount}_$safeTerm"
         }
 
         private fun updateWidget(

@@ -74,6 +74,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.google.android.material.card.MaterialCardView
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.textfield.TextInputLayout
 import org.json.JSONArray
@@ -195,6 +196,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var publicMajorInput: MaterialAutoCompleteTextView
     private lateinit var publicClassInput: MaterialAutoCompleteTextView
     private var loginButton: LiquidTintedActionButtonView? = null
+    private var refreshScheduleButton: ImageButton? = null
+    private var scheduleRefreshRunning = false
     private var loginStatus: TextView? = null
     private var scheduleDate: TextView? = null
     private var scheduleWeek: TextView? = null
@@ -1129,6 +1132,27 @@ class MainActivity : ComponentActivity() {
             showSchedulePage()
             return
         }
+        if (activateCourseCache(id, selectedSemester)) {
+            val preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            val previousAccount = preferences.getString(KEY_ACCOUNT, "").orEmpty()
+            val previousTerm = preferences.getString(KEY_TERM, "").orEmpty()
+            val accountChanged = previousAccount != id
+            val studentName = cachedStudentName(id)
+            val loginEdit = preferences.edit()
+                .putString(KEY_ACCOUNT, id)
+                .putString(KEY_PASSWORD, pwd)
+                .putString(KEY_TERM, selectedSemester)
+                .putString(KEY_SCORE_TERM, selectedSemester)
+                .putString(KEY_STUDENT_NAME, studentName)
+            if (accountChanged || previousTerm != selectedSemester) {
+                loginEdit.remove(KEY_SCORES).remove(KEY_EXAMS)
+            }
+            loginEdit.apply()
+            saveStudentNameCache(id, studentName)
+            notifyCourseDataChanged()
+            showSchedulePage()
+            return
+        }
         loginButton?.setButtonEnabled(false)
         loginButton?.text = "正在查询课程…"
         networkExecutor.execute {
@@ -1151,6 +1175,7 @@ class MainActivity : ComponentActivity() {
                         .remove(KEY_SCORES)
                         .remove(KEY_EXAMS)
                         .apply()
+                    saveStudentNameCache(id, profile?.name.orEmpty())
                     saveCourseCache(courses)
                     loginButton?.setButtonEnabled(true)
                     loginButton?.text = "进入课程表"
@@ -3085,6 +3110,18 @@ class MainActivity : ComponentActivity() {
             setPadding(dp(11), dp(10), dp(11), dp(10))
             setOnClickListener { showLoginPage(true) }
         }, LinearLayout.LayoutParams(dp(48), dp(44)))
+        if (!viewingPublicSchedule) {
+            row.addView(ImageButton(this).apply {
+                refreshScheduleButton = this
+                setImageResource(R.drawable.ic_menu_refresh)
+                contentDescription = "刷新课表"
+                setBackgroundColor(Color.TRANSPARENT)
+                setPadding(dp(11), dp(10), dp(11), dp(10))
+                setOnClickListener { showRefreshScheduleConfirmation() }
+            }, LinearLayout.LayoutParams(dp(48), dp(44)))
+        } else {
+            refreshScheduleButton = null
+        }
         row.addView(ImageButton(this).apply {
             setImageResource(R.drawable.ic_more)
             contentDescription = "更多操作"
@@ -3094,6 +3131,84 @@ class MainActivity : ComponentActivity() {
         }, LinearLayout.LayoutParams(dp(56), dp(44)))
         header.addView(row, spacedParams(dp(6)))
         return header
+    }
+
+    private fun showRefreshScheduleConfirmation() {
+        if (scheduleRefreshRunning || viewingPublicSchedule) return
+        MaterialAlertDialogBuilder(this)
+            .setTitle("更新课表")
+            .setMessage("是否从教务系统重新获取并更新当前学期课表？")
+            .setNegativeButton("取消", null)
+            .setPositiveButton("确认更新") { _, _ -> refreshPersonalSchedule() }
+            .show()
+    }
+
+    private fun refreshPersonalSchedule() {
+        if (scheduleRefreshRunning || viewingPublicSchedule) return
+        val preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val account = preferences.getString(KEY_ACCOUNT, "").orEmpty()
+        val password = preferences.getString(KEY_PASSWORD, "").orEmpty()
+        val term = preferences.getString(KEY_TERM, "").orEmpty()
+        if (account.isBlank() || password.isBlank() || term.isBlank()) {
+            showLiquidToast(
+                message = "登录信息不完整，请重新登录后再刷新课表",
+                visual = LiquidToastVisual.ERROR,
+                durationMillis = 2_800L
+            )
+            return
+        }
+        if (account == "114514") {
+            saveCourseCache(sampleCourses())
+            scheduleGrid?.setCourses(loadCourseCache())
+            showLiquidToast("课表已更新", LiquidToastVisual.SUCCESS, 1_800L)
+            return
+        }
+
+        scheduleRefreshRunning = true
+        refreshScheduleButton?.apply {
+            isEnabled = false
+            alpha = .5f
+        }
+        showLiquidToast("正在从教务系统更新课表…", LiquidToastVisual.LOADING, 0L)
+        networkExecutor.execute {
+            try {
+                val remoteCourses = SdauCourseRepository().queryCourses(account, password, term)
+                val courses = recolorCourses(remoteCourses.map { remote ->
+                    Course(
+                        remote.day,
+                        remote.startSlot,
+                        remote.slotCount,
+                        remote.name,
+                        remote.room,
+                        remote.teacher,
+                        COURSE_COLORS.first(),
+                        Color.WHITE,
+                        remote.weeks
+                    )
+                })
+                runOnUiThread {
+                    saveCourseCache(courses, account, term)
+                    scheduleGrid?.setCourses(loadCourseCache())
+                    showLiquidToast("课表已更新", LiquidToastVisual.SUCCESS, 2_000L)
+                }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    showLiquidToast(
+                        message = "课表更新失败：${error.message ?: "未知错误"}",
+                        visual = LiquidToastVisual.ERROR,
+                        durationMillis = 3_000L
+                    )
+                }
+            } finally {
+                runOnUiThread {
+                    scheduleRefreshRunning = false
+                    refreshScheduleButton?.apply {
+                        isEnabled = true
+                        alpha = 1f
+                    }
+                }
+            }
+        }
     }
 
     private fun showUpdateMenu(anchor: View, fromBottom: Boolean = false) {
@@ -4818,7 +4933,10 @@ class MainActivity : ComponentActivity() {
     )
 
     private fun hasLocalCourseCache(): Boolean {
-        return getSharedPreferences(PREFS_NAME, MODE_PRIVATE).contains(KEY_COURSES)
+        val preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val account = preferences.getString(KEY_ACCOUNT, "").orEmpty()
+        val term = preferences.getString(KEY_TERM, "").orEmpty()
+        return account.isNotBlank() && term.isNotBlank() && activateCourseCache(account, term)
     }
 
     private fun publicScheduleFile(term: String): File {
@@ -5277,8 +5395,17 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun saveCourseCache(courses: List<Course>) {
-        saveCoursesToPreference(KEY_COURSES, courses.filterNot(Course::isCustom))
+    private fun saveCourseCache(
+        courses: List<Course>,
+        account: String = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .getString(KEY_ACCOUNT, "").orEmpty(),
+        term: String = selectedTerm()
+    ) {
+        val imported = courses.filterNot(Course::isCustom)
+        saveCoursesToPreference(KEY_COURSES, imported)
+        if (account.isNotBlank() && term.isNotBlank()) {
+            saveCoursesToPreference(courseCacheKey(account, term), imported)
+        }
         notifyCourseDataChanged()
     }
 
@@ -5320,7 +5447,62 @@ class MainActivity : ComponentActivity() {
         return recolorCourses(loadImportedCourseCache() + loadCustomCourseCache())
     }
 
-    private fun loadImportedCourseCache(): List<Course> = loadCoursesFromPreference(KEY_COURSES, false)
+    private fun loadImportedCourseCache(): List<Course> {
+        val preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val account = preferences.getString(KEY_ACCOUNT, "").orEmpty()
+        val term = preferences.getString(KEY_TERM, "").orEmpty()
+        if (account.isNotBlank() && term.isNotBlank()) {
+            val key = courseCacheKey(account, term)
+            if (preferences.contains(key)) return loadCoursesFromPreference(key, false)
+            if (preferences.contains(KEY_COURSES)) {
+                preferences.getString(KEY_COURSES, null)?.let { legacy ->
+                    preferences.edit().putString(key, legacy).apply()
+                }
+            }
+        }
+        return loadCoursesFromPreference(KEY_COURSES, false)
+    }
+
+    private fun activateCourseCache(account: String, term: String): Boolean {
+        val preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val key = courseCacheKey(account, term)
+        val cached = preferences.getString(key, null) ?: run {
+            val legacyBelongsToAccount = preferences.getString(KEY_ACCOUNT, "").orEmpty() == account &&
+                preferences.getString(KEY_TERM, "").orEmpty() == term
+            if (!legacyBelongsToAccount) return false
+            preferences.getString(KEY_COURSES, null)?.also { legacy ->
+                preferences.edit().putString(key, legacy).apply()
+            } ?: return false
+        }
+        preferences.edit().putString(KEY_COURSES, cached).apply()
+        return true
+    }
+
+    private fun courseCacheKey(account: String, term: String): String {
+        val safeAccount = account.replace(Regex("[^A-Za-z0-9_-]"), "_")
+        val safeTerm = term.replace(Regex("[^A-Za-z0-9_-]"), "_")
+        return "${KEY_COURSES_PREFIX}_${safeAccount}_$safeTerm"
+    }
+
+    private fun studentNameCacheKey(account: String): String {
+        val safeAccount = account.replace(Regex("[^A-Za-z0-9_-]"), "_")
+        return "${KEY_STUDENT_NAME_PREFIX}_$safeAccount"
+    }
+
+    private fun saveStudentNameCache(account: String, name: String) {
+        if (account.isBlank()) return
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+            .putString(studentNameCacheKey(account), name)
+            .apply()
+    }
+
+    private fun cachedStudentName(account: String): String {
+        val preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        return preferences.getString(studentNameCacheKey(account), null)
+            ?: preferences.getString(KEY_STUDENT_NAME, "").orEmpty()
+                .takeIf { preferences.getString(KEY_ACCOUNT, "").orEmpty() == account }
+            ?: ""
+    }
 
     private fun loadCustomCourseCache(): List<Course> = loadCoursesFromPreference(customCourseCacheKey(), true)
 
@@ -7688,9 +7870,11 @@ class MainActivity : ComponentActivity() {
         private const val KEY_ACCOUNT = "account"
         private const val KEY_PASSWORD = "password"
         private const val KEY_STUDENT_NAME = "student_name"
+        private const val KEY_STUDENT_NAME_PREFIX = "student_name_cache"
         private const val KEY_TERM = "term"
         private const val KEY_SCORE_TERM = "score_term"
         private const val KEY_COURSES = "courses_cache"
+        private const val KEY_COURSES_PREFIX = "courses_cache_account"
         private const val KEY_CUSTOM_COURSES_PREFIX = "custom_courses_cache"
         private const val KEY_PUBLIC_SCHEDULE_SYNCED_TERM = "public_schedule_synced_term"
         private const val KEY_PUBLIC_SCHEDULE_HASH_PREFIX = "public_schedule_sha256_"
