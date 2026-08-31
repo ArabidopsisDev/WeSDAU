@@ -22,7 +22,7 @@ android {
         minSdk = 26
         targetSdk = 34
         versionCode = 10
-        versionName = "0.3.6"
+        versionName = "0.3.7 beta"
         androidResources.localeFilters += arrayOf("zh", "en")
     }
 

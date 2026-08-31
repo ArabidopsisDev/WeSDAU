@@ -109,6 +109,7 @@ private data class ReminderCourse(
 object CourseReminderScheduler {
     private const val PREFS_NAME = "offline_login"
     private const val KEY_COURSES = "courses_cache"
+    private const val KEY_CUSTOM_COURSES_PREFIX = "custom_courses_cache"
     private const val KEY_PUSH_ENABLED = "push_enabled"
     private const val KEY_TERM = "term"
     private const val REMINDER_REQUEST_CODE = 3002
@@ -125,8 +126,12 @@ object CourseReminderScheduler {
             cancel(applicationContext)
             return
         }
-        val courses = loadCourses(preferences.getString(KEY_COURSES, null))
         val term = preferences.getString(KEY_TERM, OFFICIAL_TERM).orEmpty().ifBlank { OFFICIAL_TERM }
+        val customKey = "${KEY_CUSTOM_COURSES_PREFIX}_${term.replace(Regex("[^A-Za-z0-9_-]"), "_")}" 
+        val courses = loadCourses(
+            preferences.getString(KEY_COURSES, null),
+            preferences.getString(customKey, null)
+        )
         val next = findNextReminder(courses, term, Calendar.getInstance())
         cancel(applicationContext)
         if (next == null) return
@@ -222,22 +227,26 @@ object CourseReminderScheduler {
         return null
     }
 
-    private fun loadCourses(raw: String?): List<ReminderCourse> = runCatching {
-        val rows = JSONArray(raw ?: return emptyList())
-        buildList {
-            for (index in 0 until rows.length()) {
-                val row = rows.optJSONObject(index) ?: continue
-                add(ReminderCourse(
-                    day = row.optInt("day", -1),
-                    startSlot = row.optInt("startSlot", -1),
-                    slotCount = row.optInt("slotCount", 0),
-                    name = row.optString("name"),
-                    room = row.optString("room"),
-                    weeks = row.optString("weeks")
-                ))
+    private fun loadCourses(vararg rawCaches: String?): List<ReminderCourse> {
+        val courses = mutableListOf<ReminderCourse>()
+        rawCaches.filterNotNull().forEach { raw ->
+            runCatching {
+                val rows = JSONArray(raw)
+                for (index in 0 until rows.length()) {
+                    val row = rows.optJSONObject(index) ?: continue
+                    courses += ReminderCourse(
+                        day = row.optInt("day", -1),
+                        startSlot = row.optInt("startSlot", -1),
+                        slotCount = row.optInt("slotCount", 0),
+                        name = row.optString("name"),
+                        room = row.optString("room"),
+                        weeks = row.optString("weeks")
+                    )
+                }
             }
-        }.filter { it.day in 0..6 && it.name.isNotBlank() }
-    }.getOrDefault(emptyList())
+        }
+        return courses.filter { it.day in 0..6 && it.name.isNotBlank() }
+    }
 
     private fun courseVisibleInWeek(course: ReminderCourse, week: Int): Boolean {
         if (week <= 0) return false

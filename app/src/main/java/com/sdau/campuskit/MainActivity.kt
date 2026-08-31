@@ -50,6 +50,7 @@ import android.view.VelocityTracker
 import android.view.animation.PathInterpolator
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
+import android.view.WindowManager
 import android.net.Uri
 import android.provider.Settings
 import android.provider.MediaStore
@@ -1384,7 +1385,7 @@ class MainActivity : ComponentActivity() {
             loginStatus?.visibility = View.VISIBLE
             return
         }
-        publicScheduleCourses = buildPublicScheduleCourses(selected)
+        publicScheduleCourses = buildPublicScheduleCourses(selected, term)
         publicScheduleTerm = term
         publicScheduleLabel = "$publicCollegeSelection · $publicGradeSelection · $publicMajorSelection · $publicClassSelection"
         publicScheduleClassName = publicClassSelection
@@ -2140,11 +2141,22 @@ class MainActivity : ComponentActivity() {
             }
             addListener(object : android.animation.AnimatorListenerAdapter() {
                 override fun onAnimationEnd(animation: android.animation.Animator) {
-                    layoutParams.height = expandedLayoutHeight
-                    controls.layoutParams = layoutParams
-                    controls.alpha = 1f
-                    controls.translationY = 0f
-                    controls.visibility = if (expanding) View.VISIBLE else View.GONE
+                    if (expanding) {
+                        layoutParams.height = expandedLayoutHeight
+                        controls.layoutParams = layoutParams
+                        controls.alpha = 1f
+                        controls.translationY = 0f
+                        controls.visibility = View.VISIBLE
+                    } else {
+                        // Hide the zero-height view before restoring WRAP_CONTENT. Restoring
+                        // the expanded height while it is still visible produces a one-frame
+                        // layout jump at the end of the collapse animation.
+                        controls.visibility = View.GONE
+                        controls.alpha = 1f
+                        controls.translationY = 0f
+                        layoutParams.height = expandedLayoutHeight
+                        controls.layoutParams = layoutParams
+                    }
                     toggle.contentDescription = if (expanding) "折叠$targetName" else "展开$targetName"
                     toggle.isClickable = true
                 }
@@ -4215,21 +4227,33 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun recolorCourses(courses: List<Course>): List<Course> {
+    private fun recolorCourses(
+        courses: List<Course>,
+        term: String = selectedTerm(),
+        persistMapping: Boolean = true
+    ): List<Course> {
         val preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-        val stored = runCatching { JSONObject(preferences.getString(KEY_COLOR_MAP, "{}") ?: "{}") }.getOrDefault(JSONObject())
+        val stored = if (persistMapping) {
+            runCatching {
+                JSONObject(preferences.getString(KEY_COLOR_MAP, "{}") ?: "{}")
+            }.getOrDefault(JSONObject())
+        } else {
+            JSONObject()
+        }
         val allNames = courses.map { it.name }.distinct().sorted()
-        val actualWeek = weekForTerm(selectedTerm()).coerceAtLeast(1)
+        val actualWeek = weekForTerm(term).coerceAtLeast(1)
         val activeCourses = courses.filter { latestCourseWeek(it) >= actualWeek }
         val activeNames = activeCourses.map { it.name }.distinct()
         val activeNameSet = activeNames.toSet()
-        val neighbours = buildCourseNeighbourGraph(activeCourses, actualWeek)
+        val relations = buildCourseColorRelations(activeCourses, actualWeek)
         val usedActiveIndices = mutableSetOf<Int>()
         val indexByName = mutableMapOf<String, Int>()
 
-        // 先处理邻居最多的课程，能让密集区域优先获得差异最大的颜色。
+        // 同周出现的所有课程都参与色差约束，空间邻近的课程获得额外权重。
         val allocationOrder = activeNames.sortedWith(
-            compareByDescending<String> { neighbours[it]?.size ?: 0 }.thenBy { it }
+            compareByDescending<String> { relations[it]?.values?.sum() ?: 0.0 }
+                .thenByDescending { relations[it]?.size ?: 0 }
+                .thenBy { it }
         )
         val preferredOnly = activeNames.size <= COURSE_COLORS.size
         val candidateCount = if (preferredOnly) COURSE_COLORS.size else maxOf(COURSE_COLORS.size, activeNames.size + 8)
@@ -4239,17 +4263,31 @@ class MainActivity : ComponentActivity() {
                 addAll(0 until candidateCount)
                 if (storedIndex >= candidateCount) add(storedIndex)
             }.filterNot { it in usedActiveIndices }
-            val assignedNeighbourIndices = neighbours[name].orEmpty().mapNotNull { indexByName[it] }
-            val assignedAllIndices = indexByName.values.toList()
-            val chosen = candidateIndices.maxByOrNull { candidate ->
-                val color = courseColorAt(candidate)
-                val neighbourDistance = assignedNeighbourIndices
-                    .minOfOrNull { colorDistance(color, courseColorAt(it)) } ?: 420.0
-                val globalDistance = assignedAllIndices
-                    .minOfOrNull { colorDistance(color, courseColorAt(it)) } ?: 420.0
-                val stabilityBonus = if (candidate == storedIndex) 42.0 else 0.0
-                val generatedPenalty = if (candidate >= COURSE_COLORS.size) 55.0 else 0.0
-                neighbourDistance * 3.2 + globalDistance * .35 + stabilityBonus - generatedPenalty - candidate * .015
+            // 先硬性排除同一页面上过于接近的颜色，再用综合评分选择最优项。
+            // 课程很多、色板空间不足时逐级放宽阈值，避免所有候选都被淘汰。
+            val eligibleCandidates = listOf(
+                MIN_SAME_PAGE_COLOR_DISTANCE,
+                MIN_SAME_PAGE_COLOR_DISTANCE - 4.0,
+                MIN_SAME_PAGE_COLOR_DISTANCE - 8.0,
+                0.0
+            ).firstNotNullOfOrNull { threshold ->
+                candidateIndices.filter { candidate ->
+                    minimumRelatedColorDistance(
+                        name = name,
+                        candidateIndex = candidate,
+                        assignedIndices = indexByName,
+                        relations = relations
+                    ) >= threshold
+                }.takeIf { it.isNotEmpty() }
+            } ?: candidateIndices
+            val chosen = eligibleCandidates.maxByOrNull { candidate ->
+                courseColorAssignmentScore(
+                    name = name,
+                    candidateIndex = candidate,
+                    assignedIndices = indexByName,
+                    relations = relations,
+                    storedIndex = storedIndex
+                )
             } ?: generateSequence(0) { it + 1 }.first { it !in usedActiveIndices }
             indexByName[name] = chosen
             usedActiveIndices += chosen
@@ -4264,8 +4302,77 @@ class MainActivity : ComponentActivity() {
         }
         val activeMap = JSONObject()
         allNames.forEach { name -> activeMap.put(name, indexByName[name] ?: 0) }
-        preferences.edit().putString(KEY_COLOR_MAP, activeMap.toString()).apply()
+        if (persistMapping) {
+            preferences.edit().putString(KEY_COLOR_MAP, activeMap.toString()).apply()
+        }
         return courses.map { it.copy(background = courseColorAt(indexByName[it.name] ?: 0)) }
+    }
+
+    private fun minimumRelatedColorDistance(
+        name: String,
+        candidateIndex: Int,
+        assignedIndices: Map<String, Int>,
+        relations: Map<String, Map<String, Double>>
+    ): Double {
+        val courseRelations = relations[name].orEmpty()
+        return assignedIndices.asSequence()
+            .mapNotNull { (otherName, otherIndex) ->
+                if (courseRelations.containsKey(otherName)) {
+                    colorDistance(courseColorAt(candidateIndex), courseColorAt(otherIndex))
+                } else {
+                    null
+                }
+            }
+            .minOrNull() ?: 100.0
+    }
+
+    private fun courseColorAssignmentScore(
+        name: String,
+        candidateIndex: Int,
+        assignedIndices: Map<String, Int>,
+        relations: Map<String, Map<String, Double>>,
+        storedIndex: Int
+    ): Double {
+        val candidateColor = courseColorAt(candidateIndex)
+        var globalMinimum = Double.POSITIVE_INFINITY
+        var sameWeekMinimum = Double.POSITIVE_INFINITY
+        var nearbyMinimum = Double.POSITIVE_INFINITY
+        var weightedDistance = 0.0
+        var relationWeightTotal = 0.0
+        val courseRelations = relations[name].orEmpty()
+
+        assignedIndices.forEach { (otherName, otherIndex) ->
+            val distance = colorDistance(candidateColor, courseColorAt(otherIndex))
+            globalMinimum = minOf(globalMinimum, distance)
+            val relationWeight = courseRelations[otherName] ?: return@forEach
+            sameWeekMinimum = minOf(sameWeekMinimum, distance)
+            weightedDistance += distance * relationWeight
+            relationWeightTotal += relationWeight
+            if (relationWeight >= NEARBY_COURSE_COLOR_WEIGHT) {
+                nearbyMinimum = minOf(nearbyMinimum, distance)
+            }
+        }
+
+        val fallbackDistance = globalMinimum.takeIf(Double::isFinite) ?: 100.0
+        val pageDistance = sameWeekMinimum.takeIf(Double::isFinite) ?: fallbackDistance
+        val nearDistance = nearbyMinimum.takeIf(Double::isFinite) ?: pageDistance
+        val pageAverage = if (relationWeightTotal > 0.0) {
+            weightedDistance / relationWeightTotal
+        } else {
+            fallbackDistance
+        }
+        val stabilityBonus = if (candidateIndex == storedIndex) 4.0 else 0.0
+        val generatedPenalty = if (candidateIndex >= COURSE_COLORS.size) 6.0 else 0.0
+
+        // 最小同周色差是首要目标；邻近色差和平均色差负责打破相近方案，
+        // 历史颜色仅作为轻量偏好，不能再压过整页辨识度。
+        return pageDistance * 5.0 +
+            nearDistance * 1.8 +
+            pageAverage * 0.7 +
+            fallbackDistance * 0.45 +
+            stabilityBonus -
+            generatedPenalty -
+            candidateIndex * 0.001
     }
 
     private fun latestCourseWeek(course: Course): Int {
@@ -4277,22 +4384,31 @@ class MainActivity : ComponentActivity() {
         }?.coerceIn(1, 20) ?: 20
     }
 
-    private fun buildCourseNeighbourGraph(courses: List<Course>, fromWeek: Int): Map<String, Set<String>> {
-        val graph = courses.map { it.name }.distinct().associateWith { mutableSetOf<String>() }
+    private fun buildCourseColorRelations(
+        courses: List<Course>,
+        fromWeek: Int
+    ): Map<String, Map<String, Double>> {
+        val graph = courses.map { it.name }.distinct()
+            .associateWith { mutableMapOf<String, Double>() }
         for (firstIndex in courses.indices) {
             val first = courses[firstIndex]
             for (secondIndex in firstIndex + 1 until courses.size) {
                 val second = courses[secondIndex]
-                if (first.name == second.name || !courseBlocksAreNear(first, second)) continue
+                if (first.name == second.name) continue
                 val coexist = (fromWeek..20).any { week ->
                     courseVisibleInWeek(first, week) && courseVisibleInWeek(second, week)
                 }
                 if (!coexist) continue
-                graph[first.name]?.add(second.name)
-                graph[second.name]?.add(first.name)
+                val weight = if (courseBlocksAreNear(first, second)) {
+                    NEARBY_COURSE_COLOR_WEIGHT
+                } else {
+                    SAME_WEEK_COURSE_COLOR_WEIGHT
+                }
+                graph[first.name]?.merge(second.name, weight, ::maxOf)
+                graph[second.name]?.merge(first.name, weight, ::maxOf)
             }
         }
-        return graph.mapValues { it.value.toSet() }
+        return graph.mapValues { it.value.toMap() }
     }
 
     private fun courseBlocksAreNear(first: Course, second: Course): Boolean {
@@ -4309,15 +4425,42 @@ class MainActivity : ComponentActivity() {
         return if (dayGap == 0) slotGap <= 1 else slotGap == 0
     }
 
-    /** Compuphase 加权 RGB 距离，比直接比较色相更符合人眼对明暗与红蓝差异的感知。 */
+    /** OKLab 欧氏距离，能更准确地区分当前低饱和色板中的近似蓝、粉、紫色。 */
     private fun colorDistance(first: Int, second: Int): Double {
-        val redMean = (Color.red(first) + Color.red(second)) / 2.0
-        val red = Color.red(first) - Color.red(second)
-        val green = Color.green(first) - Color.green(second)
-        val blue = Color.blue(first) - Color.blue(second)
-        val weightRed = 2.0 + redMean / 256.0
-        val weightBlue = 2.0 + (255.0 - redMean) / 256.0
-        return kotlin.math.sqrt(weightRed * red * red + 4.0 * green * green + weightBlue * blue * blue)
+        val firstLab = colorToOklab(first)
+        val secondLab = colorToOklab(second)
+        val lightness = firstLab[0] - secondLab[0]
+        val greenRed = firstLab[1] - secondLab[1]
+        val blueYellow = firstLab[2] - secondLab[2]
+        return Math.sqrt(
+            lightness * lightness + greenRed * greenRed + blueYellow * blueYellow
+        ) * 100.0
+    }
+
+    private fun colorToOklab(color: Int): DoubleArray {
+        fun linearChannel(channel: Int): Double {
+            val normalized = channel / 255.0
+            return if (normalized <= 0.04045) {
+                normalized / 12.92
+            } else {
+                Math.pow((normalized + 0.055) / 1.055, 2.4)
+            }
+        }
+
+        val red = linearChannel(Color.red(color))
+        val green = linearChannel(Color.green(color))
+        val blue = linearChannel(Color.blue(color))
+        val l = 0.4122214708 * red + 0.5363325363 * green + 0.0514459929 * blue
+        val m = 0.2119034982 * red + 0.6806995451 * green + 0.1073969566 * blue
+        val s = 0.0883024619 * red + 0.2817188376 * green + 0.6299787005 * blue
+        val lRoot = Math.cbrt(l)
+        val mRoot = Math.cbrt(m)
+        val sRoot = Math.cbrt(s)
+        return doubleArrayOf(
+            0.2104542553 * lRoot + 0.7936177850 * mRoot - 0.0040720468 * sRoot,
+            1.9779984951 * lRoot - 2.4285922050 * mRoot + 0.4505937099 * sRoot,
+            0.0259040371 * lRoot + 0.7827717662 * mRoot - 0.8086757660 * sRoot
+        )
     }
 
     private fun courseColorAt(index: Int): Int {
@@ -5048,13 +5191,15 @@ class MainActivity : ComponentActivity() {
         }.getOrDefault(emptyList())
     }
 
-    private fun buildPublicScheduleCourses(records: List<RemotePublicCourse>): List<Course> {
-        val colors = records.map { it.name }.distinct().withIndex()
-            .associate { it.value to COURSE_COLORS[it.index % COURSE_COLORS.size] }
-        return records.map {
+    private fun buildPublicScheduleCourses(
+        records: List<RemotePublicCourse>,
+        term: String
+    ): List<Course> {
+        val courses = records.map {
             Course(it.day, it.startSlot, it.slotCount, it.name, it.room, it.teacher,
-                colors[it.name] ?: COURSE_COLORS.first(), Color.WHITE, it.weeks)
+                COURSE_COLORS.first(), Color.WHITE, it.weeks)
         }
+        return recolorCourses(courses, term = term, persistMapping = false)
     }
 
     private fun startPublicScheduleSyncIfNeeded(term: String) {
@@ -5118,7 +5263,7 @@ class MainActivity : ComponentActivity() {
                         viewingPublicSchedule && publicScheduleTerm == term -> {
                             val selected = loadSelectedPublicScheduleCourses(term)
                             if (selected.isNotEmpty()) {
-                                publicScheduleCourses = buildPublicScheduleCourses(selected)
+                                publicScheduleCourses = buildPublicScheduleCourses(selected, term)
                                 scheduleGrid?.setCourses(publicScheduleCourses)
                             }
                         }
@@ -5133,6 +5278,19 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun saveCourseCache(courses: List<Course>) {
+        saveCoursesToPreference(KEY_COURSES, courses.filterNot(Course::isCustom))
+        notifyCourseDataChanged()
+    }
+
+    private fun saveCustomCourseCache(courses: List<Course>) {
+        saveCoursesToPreference(
+            customCourseCacheKey(),
+            courses.filter(Course::isCustom).map { it.copy(isCustom = true) }
+        )
+        notifyCourseDataChanged()
+    }
+
+    private fun saveCoursesToPreference(key: String, courses: List<Course>) {
         val array = JSONArray()
         courses.forEach { course ->
             array.put(JSONObject().apply {
@@ -5145,29 +5303,45 @@ class MainActivity : ComponentActivity() {
                 put("weeks", course.weeks)
                 put("background", course.background)
                 put("foreground", course.foreground)
+                put("isCustom", course.isCustom)
             })
         }
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
-            .putString(KEY_COURSES, array.toString())
+            .putString(key, array.toString())
             .apply()
+    }
+
+    private fun notifyCourseDataChanged() {
         CourseWidgetProvider.updateAll(this)
         CourseReminderScheduler.scheduleNext(this)
     }
 
     private fun loadCourseCache(): List<Course> {
-        val raw = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_COURSES, null) ?: return emptyList()
+        return recolorCourses(loadImportedCourseCache() + loadCustomCourseCache())
+    }
+
+    private fun loadImportedCourseCache(): List<Course> = loadCoursesFromPreference(KEY_COURSES, false)
+
+    private fun loadCustomCourseCache(): List<Course> = loadCoursesFromPreference(customCourseCacheKey(), true)
+
+    private fun customCourseCacheKey(term: String = selectedTerm()): String =
+        "${KEY_CUSTOM_COURSES_PREFIX}_${term.replace(Regex("[^A-Za-z0-9_-]"), "_")}" 
+
+    private fun loadCoursesFromPreference(key: String, isCustom: Boolean): List<Course> {
+        val raw = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(key, null) ?: return emptyList()
         return try {
             val array = JSONArray(raw)
-            recolorCourses(buildList {
+            buildList {
                 for (index in 0 until array.length()) {
                     val item = array.getJSONObject(index)
                     add(Course(
                         item.getInt("day"), item.getInt("startSlot"), item.getInt("slotCount"),
                         item.getString("name"), item.getString("room"), item.getString("teacher"),
-                        item.getInt("background"), item.getInt("foreground"), item.optString("weeks", "")
+                        item.getInt("background"), item.getInt("foreground"), item.optString("weeks", ""),
+                        isCustom = isCustom
                     ))
                 }
-            }.ifEmpty { emptyList() })
+            }
         } catch (_: Exception) {
             emptyList()
         }
@@ -5717,7 +5891,18 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private data class Course(val day: Int, val startSlot: Int, val slotCount: Int, val name: String, val room: String, val teacher: String, val background: Int, val foreground: Int, val weeks: String = "")
+    private data class Course(
+        val day: Int,
+        val startSlot: Int,
+        val slotCount: Int,
+        val name: String,
+        val room: String,
+        val teacher: String,
+        val background: Int,
+        val foreground: Int,
+        val weeks: String = "",
+        val isCustom: Boolean = false
+    )
 
     private data class CoursePlacement(
         val course: Course,
@@ -6076,6 +6261,14 @@ class MainActivity : ComponentActivity() {
         private var backgroundSampleGridOffsetX = 0f
         private var backgroundSampleGridOffsetY = 0f
         private var backgroundSampleScrimColor = Color.TRANSPARENT
+        private var selectedAddWeek = -1
+        private var selectedAddDay = -1
+        private var selectedAddSlot = -1
+        private var selectedAddAlpha = 0f
+        private var selectedAddScale = 1f
+        private var addPlaceholderAnimator: ValueAnimator? = null
+        private var addPlaceholderFadeRunnable: Runnable? = null
+        private var addPlaceholderAnimationGeneration = 0
 
         init { setBackgroundColor(Color.TRANSPARENT); isFocusable = true; contentDescription = "开发测试周课程表，包含 9 门示例课程" }
 
@@ -6159,7 +6352,7 @@ class MainActivity : ComponentActivity() {
                         settleDraggedWeek(delta, velocityX)
                     } else {
                         if (kotlin.math.abs(dx) <= touchSlop && kotlin.math.abs(dy) <= touchSlop) {
-                            findCourseAt(event.x, event.y)?.let { showCourseDetails(it) }
+                            handleScheduleTap(event.x, event.y)
                         }
                         clearSwipeBitmaps()
                     }
@@ -6180,12 +6373,189 @@ class MainActivity : ComponentActivity() {
             return true
         }
 
-        fun setWeekIndex(index: Int) { clearSwipeBitmaps(); weekIndex = index; invalidate() }
+        fun setWeekIndex(index: Int) {
+            clearAddCourseSelection(invalidateView = false)
+            clearSwipeBitmaps()
+            weekIndex = index
+            invalidate()
+        }
         fun setScheduleMode(mode: ScheduleMode) { clearSwipeBitmaps(); scheduleMode = mode; invalidate() }
-        fun setCourses(updated: List<Course>) { clearSwipeBitmaps(); courses = updated; invalidate() }
+        fun setCourses(updated: List<Course>) {
+            clearAddCourseSelection(invalidateView = false)
+            clearSwipeBitmaps()
+            courses = updated
+            invalidate()
+        }
         fun refreshTextPalette() { clearSwipeBitmaps(); invalidate() }
 
+        private fun handleScheduleTap(x: Float, y: Float) {
+            val cell = findScheduleCellAt(x, y)
+            val tappedCourse = findCourseAt(x, y) ?: cell?.let { (day, slot) ->
+                courses.firstOrNull { course ->
+                    course.day == day &&
+                        slot >= course.startSlot &&
+                        slot < course.startSlot + course.slotCount &&
+                        courseVisibleOnScheduleDate(course, activeScheduleTerm(), weekIndex)
+                }
+            }
+            if (tappedCourse != null) {
+                clearAddCourseSelection()
+                showCourseDetails(tappedCourse)
+                return
+            }
+            if (cell == null || viewingPublicSchedule || weekIndex <= 0) {
+                fadeOutAddCourseSelection()
+                return
+            }
+            val (day, slot) = cell
+            if (selectedAddWeek == weekIndex && selectedAddDay == day && selectedAddSlot == slot) {
+                clearAddCourseSelection()
+                showAddCourse(day, slot, weekIndex)
+            } else {
+                animateAddCourseSelection(day, slot)
+                performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+            }
+        }
+
+        private fun findScheduleCellAt(x: Float, y: Float): Pair<Int, Int>? {
+            if (x < timeColumnWidth || y < headerHeight) return null
+            val day = ((x - timeColumnWidth) / dayColumnWidth).toInt()
+            val slot = ((y - headerHeight) / slotHeight).toInt()
+            return if (day in 0..6 && slot in 0..9) day to slot else null
+        }
+
+        private fun clearAddCourseSelection(invalidateView: Boolean = true) {
+            addPlaceholderAnimationGeneration++
+            addPlaceholderFadeRunnable?.let(::removeCallbacks)
+            addPlaceholderFadeRunnable = null
+            addPlaceholderAnimator?.cancel()
+            addPlaceholderAnimator = null
+            selectedAddWeek = -1
+            selectedAddDay = -1
+            selectedAddSlot = -1
+            selectedAddAlpha = 0f
+            selectedAddScale = 1f
+            if (invalidateView) {
+                clearSwipeBitmaps()
+                invalidate()
+            }
+        }
+
+        private fun animateAddCourseSelection(day: Int, slot: Int) {
+            val generation = ++addPlaceholderAnimationGeneration
+            addPlaceholderFadeRunnable?.let(::removeCallbacks)
+            addPlaceholderFadeRunnable = null
+            addPlaceholderAnimator?.cancel()
+            addPlaceholderAnimator = null
+            clearSwipeBitmaps()
+            val oldSelectionVisible = selectedAddWeek >= 0 && selectedAddAlpha > .01f
+            if (oldSelectionVisible) {
+                animateAddPlaceholderAlpha(0f, 90L, generation) {
+                    startAddCourseSelectionFadeIn(day, slot, generation)
+                }
+            } else {
+                startAddCourseSelectionFadeIn(day, slot, generation)
+            }
+        }
+
+        private fun startAddCourseSelectionFadeIn(day: Int, slot: Int, generation: Int) {
+            if (generation != addPlaceholderAnimationGeneration) return
+            selectedAddWeek = weekIndex
+            selectedAddDay = day
+            selectedAddSlot = slot
+            // 先给出轻微的即时反馈，再用缩放+透明度完成进入，避免点击后空等一帧。
+            selectedAddAlpha = .12f
+            selectedAddScale = .88f
+            animateAddPlaceholderAlpha(1f, 170L, generation) {
+                scheduleAddCourseSelectionFadeOut(day, slot, generation)
+            }
+        }
+
+        private fun scheduleAddCourseSelectionFadeOut(day: Int, slot: Int, generation: Int) {
+            if (generation != addPlaceholderAnimationGeneration) return
+            val fadeRunnable = Runnable {
+                if (
+                    generation == addPlaceholderAnimationGeneration &&
+                    selectedAddWeek == weekIndex && selectedAddDay == day && selectedAddSlot == slot
+                ) {
+                    animateAddPlaceholderAlpha(0f, 280L, generation) {
+                        if (generation == addPlaceholderAnimationGeneration) {
+                            selectedAddWeek = -1
+                            selectedAddDay = -1
+                            selectedAddSlot = -1
+                            selectedAddAlpha = 0f
+                            selectedAddScale = 1f
+                            invalidate()
+                        }
+                    }
+                }
+            }
+            addPlaceholderFadeRunnable = fadeRunnable
+            postDelayed(fadeRunnable, 1250L)
+        }
+
+        private fun fadeOutAddCourseSelection() {
+            if (selectedAddWeek < 0 || selectedAddAlpha <= .01f) {
+                clearAddCourseSelection()
+                return
+            }
+            val generation = ++addPlaceholderAnimationGeneration
+            addPlaceholderFadeRunnable?.let(::removeCallbacks)
+            addPlaceholderFadeRunnable = null
+            addPlaceholderAnimator?.cancel()
+            addPlaceholderAnimator = null
+            clearSwipeBitmaps()
+            animateAddPlaceholderAlpha(0f, 220L, generation) {
+                if (generation == addPlaceholderAnimationGeneration) {
+                    selectedAddWeek = -1
+                    selectedAddDay = -1
+                    selectedAddSlot = -1
+                    selectedAddAlpha = 0f
+                    selectedAddScale = 1f
+                    invalidate()
+                }
+            }
+        }
+
+        private fun animateAddPlaceholderAlpha(
+            targetAlpha: Float,
+            durationMillis: Long,
+            generation: Int,
+            onFinished: () -> Unit
+        ) {
+            var cancelled = false
+            val startAlpha = selectedAddAlpha
+            val startScale = selectedAddScale
+            val endScale = if (targetAlpha > startAlpha) 1f else .88f
+            addPlaceholderAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = durationMillis
+                interpolator = pageSettleInterpolator
+                addUpdateListener { animator ->
+                    if (generation == addPlaceholderAnimationGeneration) {
+                        val progress = animator.animatedValue as Float
+                        selectedAddAlpha = startAlpha + (targetAlpha - startAlpha) * progress
+                        selectedAddScale = startScale + (endScale - startScale) * progress
+                        postInvalidateOnAnimation()
+                    }
+                }
+                addListener(object : android.animation.AnimatorListenerAdapter() {
+                    override fun onAnimationCancel(animation: android.animation.Animator) {
+                        cancelled = true
+                    }
+
+                    override fun onAnimationEnd(animation: android.animation.Animator) {
+                        if (!cancelled && generation == addPlaceholderAnimationGeneration) {
+                            addPlaceholderAnimator = null
+                            onFinished()
+                        }
+                    }
+                })
+                start()
+            }
+        }
+
         fun releaseTransientCaches() {
+            clearAddCourseSelection(invalidateView = false)
             pageAnimator?.removeAllUpdateListeners()
             pageAnimator?.removeAllListeners()
             pageAnimator?.cancel()
@@ -6290,15 +6660,68 @@ class MainActivity : ComponentActivity() {
                 courseVisibleOnScheduleDate(it, activeScheduleTerm(), week)
             }
             val placements = buildCoursePlacements(visibleCourses)
-            val hasVisibleCourse = placements.isNotEmpty()
+            val showAddPlaceholder = !viewingPublicSchedule &&
+                selectedAddAlpha > .001f && week == selectedAddWeek &&
+                selectedAddDay in 0..6 && selectedAddSlot in 0..9 &&
+                visibleCourses.none { course ->
+                    course.day == selectedAddDay &&
+                        selectedAddSlot >= course.startSlot &&
+                        selectedAddSlot < course.startSlot + course.slotCount
+                }
+            val hasVisibleCourse = placements.isNotEmpty() || showAddPlaceholder
             placements.forEach { placement ->
                 drawCourse(canvas, placement.course, placement.column, placement.columnCount)
+            }
+            if (showAddPlaceholder) {
+                drawAddCoursePlaceholder(
+                    canvas,
+                    selectedAddDay,
+                    selectedAddSlot,
+                    selectedAddAlpha,
+                    selectedAddScale
+                )
             }
             if (!hasVisibleCourse) {
                 val centerX = timeColumnWidth + (desiredWidth - timeColumnWidth) / 2f
                 val groupCenterY = headerHeight + slotHeight * 4.5f
                 drawScheduleEmptyState(canvas, centerX, groupCenterY, week == 0)
             }
+            canvas.restoreToCount(save)
+        }
+
+        private fun drawAddCoursePlaceholder(
+            canvas: Canvas,
+            day: Int,
+            slot: Int,
+            alpha: Float,
+            scale: Float
+        ) {
+            val safeAlpha = alpha.coerceIn(0f, 1f)
+            val left = timeColumnWidth + day * dayColumnWidth + dp(2f)
+            val top = headerHeight + slot * slotHeight + dp(2f)
+            val right = left + dayColumnWidth - dp(4f)
+            val bottom = top + slotHeight - dp(4f)
+            val corner = minOf(dp(9f).toFloat(), dayColumnWidth * .12f)
+            rect.set(left.toFloat(), top.toFloat(), right.toFloat(), bottom.toFloat())
+            val centerX = rect.centerX()
+            val centerY = rect.centerY()
+            val drawScale = scale.coerceIn(.84f, 1.02f)
+            val save = canvas.save()
+            canvas.scale(drawScale, drawScale, centerX, centerY)
+            paint.shader = null
+            paint.style = Paint.Style.FILL
+            paint.color = Color.argb((126 * safeAlpha).toInt(), 226, 242, 255)
+            canvas.drawRoundRect(rect, corner, corner, paint)
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = dp(1.6f).toFloat()
+            paint.color = Color.argb((205 * safeAlpha).toInt(), 104, 177, 232)
+            canvas.drawRoundRect(rect, corner, corner, paint)
+            val radius = minOf(dp(12f).toFloat(), (rect.height() - dp(12f)) / 2f)
+            paint.strokeWidth = dp(2.4f).toFloat()
+            paint.strokeCap = Paint.Cap.ROUND
+            canvas.drawLine(centerX - radius, centerY, centerX + radius, centerY, paint)
+            canvas.drawLine(centerX, centerY - radius, centerX, centerY + radius, paint)
+            paint.strokeCap = Paint.Cap.BUTT
             canvas.restoreToCount(save)
         }
 
@@ -6517,6 +6940,7 @@ class MainActivity : ComponentActivity() {
                 addListener(object : android.animation.AnimatorListenerAdapter() {
                     override fun onAnimationEnd(animation: android.animation.Animator) {
                         if (delta != 0) {
+                            clearAddCourseSelection(invalidateView = false)
                             weekIndex = (weekIndex + delta).coerceIn(0, 20)
                             currentWeek = weekIndex
                             scheduleWeek?.text = formatWeekLabel(currentWeek)
@@ -7019,14 +7443,25 @@ class MainActivity : ComponentActivity() {
                 room = course.room,
                 teacher = course.teacher,
                 slotText = "第 ${course.startSlot + 1}-${course.startSlot + course.slotCount} 节",
+                scheduleTitle = courseDialogScheduleTitle(course.day, course.startSlot),
                 weeks = course.weeks,
                 canEdit = !viewingPublicSchedule,
-                onSave = { name, room, teacher, weeks ->
-                    updateCourseCache(course, name, room, teacher, weeks)
+                initialSlotCount = course.slotCount,
+                maxSlotCount = 10 - course.startSlot,
+                allowDurationEdit = course.isCustom,
+                onSave = { name, room, teacher, weeks, slotCount ->
+                    updateCourseCache(course, name, room, teacher, weeks, slotCount)
                     hideCourseDetails()
                 },
+                onDelete = if (!viewingPublicSchedule && course.isCustom) {
+                    {
+                        deleteCourseFromCache(course)
+                        hideCourseDetails()
+                    }
+                } else null,
                 onDismiss = ::hideCourseDetails
             )
+            window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
             pageHost.addView(dialog, matchParentParams())
             detailOverlay = dialog
             dialog.alpha = 0f
@@ -7034,16 +7469,144 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun updateCourseCache(original: Course, name: String, room: String, teacher: String, weeks: String) {
-        val updated = loadCourseCache().map { current ->
-            if (current.day == original.day && current.startSlot == original.startSlot && current.name == original.name) {
-                current.copy(name = name, room = room, teacher = teacher, weeks = weeks)
+    private fun showAddCourse(day: Int, startSlot: Int, week: Int) {
+        if (viewingPublicSchedule || detailOverlay != null || courseDialogCapturePending) return
+        val maxSlotCount = maximumInsertSlotCount(day, startSlot, week)
+        if (maxSlotCount <= 0) return
+        courseDialogCapturePending = true
+        captureUpdateBackdrop { pageSnapshot ->
+            courseDialogCapturePending = false
+            if (
+                isFinishing || isDestroyed || onLoginPage || currentMainSection != 0 ||
+                viewingPublicSchedule || detailOverlay != null
+            ) {
+                pageSnapshot?.takeUnless(Bitmap::isRecycled)?.recycle()
+                return@captureUpdateBackdrop
+            }
+            val defaultSlotCount = if (startSlot % 2 == 0) 2 else 1
+            val dialog = LiquidCourseDialogView(
+                context = this,
+                pageSnapshot = pageSnapshot,
+                courseName = "",
+                room = "",
+                teacher = "",
+                slotText = "第 ${startSlot + 1} 节",
+                scheduleTitle = courseDialogScheduleTitle(day, startSlot),
+                weeks = week.toString(),
+                canEdit = true,
+                creating = true,
+                initialSlotCount = minOf(defaultSlotCount, maxSlotCount),
+                maxSlotCount = maxSlotCount,
+                allowDurationEdit = true,
+                onSave = { name, room, teacher, weeks, slotCount ->
+                    addCourseToCache(day, startSlot, slotCount, name, room, teacher, weeks, week)
+                    hideCourseDetails()
+                },
+                onDismiss = ::hideCourseDetails
+            )
+            window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
+            pageHost.addView(dialog, matchParentParams())
+            detailOverlay = dialog
+            dialog.alpha = 0f
+            dialog.animate().alpha(1f).setDuration(180).start()
+        }
+    }
+
+    private fun maximumInsertSlotCount(day: Int, startSlot: Int, week: Int): Int {
+        val nextOccupiedSlot = loadCourseCache()
+            .filter { course ->
+                course.day == day &&
+                    courseVisibleOnScheduleDate(course, activeScheduleTerm(), week) &&
+                    course.startSlot > startSlot
+            }
+            .minOfOrNull(Course::startSlot)
+            ?: 10
+        return (nextOccupiedSlot - startSlot).coerceIn(1, 10 - startSlot)
+    }
+
+    private fun courseDialogScheduleTitle(day: Int, startSlot: Int): String {
+        val dayLabel = arrayOf("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+            .getOrElse(day) { "" }
+        val slotLabel = arrayOf(
+            "第一节", "第二节", "第三节", "第四节", "第五节",
+            "第六节", "第七节", "第八节", "第九节", "第十节"
+        ).getOrElse(startSlot) { "第 ${startSlot + 1} 节" }
+        return listOf(dayLabel, slotLabel).filter(String::isNotBlank).joinToString(" · ")
+    }
+
+    private fun addCourseToCache(
+        day: Int,
+        startSlot: Int,
+        slotCount: Int,
+        name: String,
+        room: String,
+        teacher: String,
+        weeks: String,
+        fallbackWeek: Int
+    ) {
+        val course = Course(
+            day = day,
+            startSlot = startSlot,
+            slotCount = slotCount.coerceIn(1, 10 - startSlot),
+            name = name.trim().ifBlank { "未命名课程" },
+            room = room.trim(),
+            teacher = teacher.trim(),
+            background = COURSE_COLORS.first(),
+            foreground = Color.WHITE,
+            weeks = weeks.trim().ifBlank { fallbackWeek.toString() },
+            isCustom = true
+        )
+        val customCourses = recolorCourses(loadCustomCourseCache() + course)
+        saveCustomCourseCache(customCourses)
+        scheduleGrid?.setCourses(loadCourseCache())
+    }
+
+    private fun updateCourseCache(
+        original: Course,
+        name: String,
+        room: String,
+        teacher: String,
+        weeks: String,
+        slotCount: Int
+    ) {
+        val source = if (original.isCustom) loadCustomCourseCache() else loadImportedCourseCache()
+        val updated = source.map { current ->
+            if (sameCourseRecord(current, original)) {
+                current.copy(
+                    name = name,
+                    room = room,
+                    teacher = teacher,
+                    weeks = weeks,
+                    slotCount = if (original.isCustom) {
+                        slotCount.coerceIn(1, 10 - current.startSlot)
+                    } else {
+                        current.slotCount
+                    }
+                )
             } else current
         }
         val recolored = recolorCourses(updated)
-        saveCourseCache(recolored)
-        scheduleGrid?.setCourses(recolored)
+        if (original.isCustom) saveCustomCourseCache(recolored) else saveCourseCache(recolored)
+        scheduleGrid?.setCourses(loadCourseCache())
     }
+
+    private fun deleteCourseFromCache(course: Course) {
+        if (!course.isCustom) return
+        val updated = loadCustomCourseCache().filterNot { current -> sameCourseRecord(current, course) }
+        val recolored = recolorCourses(updated)
+        saveCustomCourseCache(recolored)
+        scheduleGrid?.setCourses(loadCourseCache())
+    }
+
+    private fun sameCourseRecord(first: Course, second: Course): Boolean =
+        first.day == second.day &&
+            first.startSlot == second.startSlot &&
+            first.slotCount == second.slotCount &&
+            first.name == second.name &&
+            first.room == second.room &&
+            first.teacher == second.teacher &&
+            first.weeks == second.weeks &&
+            first.isCustom == second.isCustom
 
     private fun hideCourseDetails() {
         val overlay = detailOverlay ?: return
@@ -7051,6 +7614,7 @@ class MainActivity : ComponentActivity() {
         overlay.animate().alpha(0f).setDuration(140).withEndAction {
             pageHost.removeView(overlay)
             overlay.releaseSnapshot()
+            window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
         }.start()
     }
 
@@ -7127,6 +7691,7 @@ class MainActivity : ComponentActivity() {
         private const val KEY_TERM = "term"
         private const val KEY_SCORE_TERM = "score_term"
         private const val KEY_COURSES = "courses_cache"
+        private const val KEY_CUSTOM_COURSES_PREFIX = "custom_courses_cache"
         private const val KEY_PUBLIC_SCHEDULE_SYNCED_TERM = "public_schedule_synced_term"
         private const val KEY_PUBLIC_SCHEDULE_HASH_PREFIX = "public_schedule_sha256_"
         private const val KEY_SCORES = "scores_cache"
@@ -7153,6 +7718,9 @@ class MainActivity : ComponentActivity() {
         private const val OFFICIAL_TERM_START_YEAR = 2026
         private const val OFFICIAL_TERM_START_MONTH = Calendar.SEPTEMBER
         private const val OFFICIAL_TERM_START_DAY = 7
+        private const val SAME_WEEK_COURSE_COLOR_WEIGHT = 1.0
+        private const val NEARBY_COURSE_COLOR_WEIGHT = 3.0
+        private const val MIN_SAME_PAGE_COLOR_DISTANCE = 18.0
         private val COURSE_COLORS = intArrayOf(
             Color.rgb(130, 173, 247), Color.rgb(237, 184, 119), Color.rgb(120, 225, 208),
             Color.rgb(104, 154, 205), Color.rgb(232, 138, 117), Color.rgb(231, 121, 151),

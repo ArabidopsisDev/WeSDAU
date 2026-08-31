@@ -67,6 +67,7 @@ class CourseWidgetProvider : AppWidgetProvider() {
         private const val KEY_PASSWORD = "password"
         private const val KEY_TERM = "term"
         private const val KEY_COURSES = "courses_cache"
+        private const val KEY_CUSTOM_COURSES_PREFIX = "custom_courses_cache"
         private const val KEY_WIDGET_LAST_NETWORK_REFRESH = "widget_last_network_refresh"
         private const val WIDGET_NETWORK_REFRESH_INTERVAL = 24L * 60L * 60L * 1000L
         private const val OFFICIAL_TERM = "2026-2027-1"
@@ -319,14 +320,17 @@ class CourseWidgetProvider : AppWidgetProvider() {
         }
 
         private fun loadCourses(context: Context): List<WidgetCourse> {
-            val raw = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .getString(KEY_COURSES, null) ?: return emptyList()
-            return runCatching {
-                val rows = JSONArray(raw)
-                buildList {
+            val preferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val courses = mutableListOf<WidgetCourse>()
+            val term = preferences.getString(KEY_TERM, OFFICIAL_TERM).orEmpty().ifBlank { OFFICIAL_TERM }
+            val customKey = "${KEY_CUSTOM_COURSES_PREFIX}_${term.replace(Regex("[^A-Za-z0-9_-]"), "_")}" 
+            listOf(KEY_COURSES, customKey).forEach { key ->
+                val raw = preferences.getString(key, null) ?: return@forEach
+                runCatching {
+                    val rows = JSONArray(raw)
                     for (index in 0 until rows.length()) {
                         val row = rows.optJSONObject(index) ?: continue
-                        add(WidgetCourse(
+                        courses += WidgetCourse(
                             day = row.optInt("day", -1),
                             startSlot = row.optInt("startSlot", -1),
                             slotCount = row.optInt("slotCount", 0),
@@ -335,10 +339,11 @@ class CourseWidgetProvider : AppWidgetProvider() {
                             teacher = row.optString("teacher"),
                             weeks = row.optString("weeks"),
                             background = row.optInt("background", FALLBACK_COLORS[index % FALLBACK_COLORS.size])
-                        ))
+                        )
                     }
-                }.filter { it.day in 0..6 && it.name.isNotBlank() }
-            }.getOrDefault(emptyList())
+                }
+            }
+            return courses.filter { it.day in 0..6 && it.name.isNotBlank() }
         }
 
         private fun courseVisibleInWeek(course: WidgetCourse, week: Int): Boolean {

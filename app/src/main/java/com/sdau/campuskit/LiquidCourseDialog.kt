@@ -2,7 +2,15 @@ package com.sdau.campuskit
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Color as AndroidColor
+import android.text.Editable
+import android.text.InputType
+import android.text.TextWatcher
+import android.util.TypedValue
+import android.view.Gravity
 import android.view.View
+import android.view.inputmethod.EditorInfo
+import android.widget.EditText
 import android.widget.FrameLayout
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloat
@@ -25,23 +33,24 @@ import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.BasicText
-import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -60,20 +69,18 @@ import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
@@ -105,6 +112,7 @@ import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.tanh
 import kotlin.math.roundToInt
+import kotlinx.coroutines.delay
 /** Course details and editing form. */
 internal class LiquidCourseDialogView(
     context: Context,
@@ -113,9 +121,21 @@ internal class LiquidCourseDialogView(
     room: String,
     teacher: String,
     slotText: String,
+    scheduleTitle: String = slotText,
     weeks: String,
     canEdit: Boolean,
-    onSave: (name: String, room: String, teacher: String, weeks: String) -> Unit,
+    creating: Boolean = false,
+    initialSlotCount: Int = 1,
+    maxSlotCount: Int = 1,
+    allowDurationEdit: Boolean = false,
+    onSave: (
+        name: String,
+        room: String,
+        teacher: String,
+        weeks: String,
+        slotCount: Int
+    ) -> Unit,
+    onDelete: (() -> Unit)? = null,
     onDismiss: () -> Unit
 ) : FrameLayout(context) {
     init {
@@ -129,9 +149,15 @@ internal class LiquidCourseDialogView(
                     initialRoom = room,
                     initialTeacher = teacher,
                     slotText = slotText,
+                    scheduleTitle = scheduleTitle,
                     initialWeeks = weeks,
                     canEdit = canEdit,
+                    creating = creating,
+                    initialSlotCount = initialSlotCount,
+                    maxSlotCount = maxSlotCount,
+                    allowDurationEdit = allowDurationEdit,
                     onSave = onSave,
+                    onDelete = onDelete,
                     onDismiss = onDismiss
                 )
             },
@@ -146,8 +172,9 @@ internal class LiquidCourseDialogView(
     }
 }
 
-private enum class CourseDialogIcon { EDIT, SAVE }
+private enum class CourseDialogIcon { EDIT, SAVE, DELETE }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun LiquidCourseDialog(
     pageSnapshot: Bitmap?,
@@ -155,9 +182,21 @@ private fun LiquidCourseDialog(
     initialRoom: String,
     initialTeacher: String,
     slotText: String,
+    scheduleTitle: String,
     initialWeeks: String,
     canEdit: Boolean,
-    onSave: (name: String, room: String, teacher: String, weeks: String) -> Unit,
+    creating: Boolean,
+    initialSlotCount: Int,
+    maxSlotCount: Int,
+    allowDurationEdit: Boolean,
+    onSave: (
+        name: String,
+        room: String,
+        teacher: String,
+        weeks: String,
+        slotCount: Int
+    ) -> Unit,
+    onDelete: (() -> Unit)?,
     onDismiss: () -> Unit
 ) {
     val contentColor = Color(0xFF171923)
@@ -167,11 +206,29 @@ private fun LiquidCourseDialog(
     val dimColor = Color(0xFF29293A).copy(alpha = 0.23f)
     val snapshotImage = remember(pageSnapshot) { pageSnapshot?.asImageBitmap() }
     val backdrop = rememberLayerBackdrop()
-    var editing by remember { mutableStateOf(false) }
+    val density = LocalDensity.current
+    var editing by remember(creating) { mutableStateOf(creating) }
     var courseName by remember(initialCourseName) { mutableStateOf(initialCourseName) }
     var room by remember(initialRoom) { mutableStateOf(initialRoom) }
     var teacher by remember(initialTeacher) { mutableStateOf(initialTeacher) }
     var weeks by remember(initialWeeks) { mutableStateOf(initialWeeks) }
+    var slotCount by remember(initialSlotCount) { mutableStateOf(initialSlotCount.toString()) }
+    val availableSlotCount = maxSlotCount.coerceAtLeast(1)
+    val imeVisible = WindowInsets.isImeVisible
+    var keyboardRaised by remember { mutableStateOf(false) }
+    LaunchedEffect(imeVisible) {
+        if (imeVisible) {
+            keyboardRaised = true
+        } else {
+            delay(220)
+            keyboardRaised = false
+        }
+    }
+    val keyboardTranslationPx by animateFloatAsState(
+        targetValue = if (keyboardRaised) with(density) { (-118).dp.toPx() } else 0f,
+        animationSpec = tween(durationMillis = 150),
+        label = "courseDialogKeyboardTranslation"
+    )
 
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Box(
@@ -197,9 +254,7 @@ private fun LiquidCourseDialog(
                 .clickable(interactionSource = null, indication = null, onClick = onDismiss)
         )
         Box(
-            Modifier
-                .fillMaxSize()
-                .imePadding(),
+            Modifier.fillMaxSize(),
             contentAlignment = Alignment.Center
         ) {
             Column(
@@ -207,6 +262,7 @@ private fun LiquidCourseDialog(
                     .padding(horizontal = 28.dp)
                     .fillMaxWidth()
                     .widthIn(max = 372.dp)
+                    .graphicsLayer { translationY = keyboardTranslationPx }
                     .clip(RoundedRectangle(28.dp))
                     .drawBackdrop(
                         backdrop = backdrop,
@@ -232,11 +288,15 @@ private fun LiquidCourseDialog(
             ) {
                 Column(Modifier.weight(1f).padding(end = 10.dp)) {
                     BasicText(
-                        if (editing) "修改课程" else "课程详情",
+                        when {
+                            creating -> "添加课程 · $scheduleTitle"
+                            editing -> "修改课程 · $scheduleTitle"
+                            else -> "课程详情"
+                        },
                         style = TextStyle(secondaryColor, 12.sp, FontWeight.Medium)
                     )
                     BasicText(
-                        courseName.ifBlank { "未命名课程" },
+                        courseName.ifBlank { if (creating) "新课程" else "未命名课程" },
                         modifier = Modifier.padding(top = 4.dp),
                         style = TextStyle(contentColor, 20.sp, FontWeight.SemiBold)
                     )
@@ -249,13 +309,31 @@ private fun LiquidCourseDialog(
                             contentDescription = "修改课程",
                             onClick = { editing = true }
                         )
+                        if (onDelete != null) {
+                            CourseLiquidIconButton(
+                                backdrop = backdrop,
+                                icon = CourseDialogIcon.DELETE,
+                                contentDescription = "删除课程",
+                                onClick = onDelete
+                            )
+                        }
                     }
                     if (editing) {
                         CourseLiquidIconButton(
                             backdrop = backdrop,
                             icon = CourseDialogIcon.SAVE,
-                            contentDescription = "保存修改",
-                            onClick = { onSave(courseName, room, teacher, weeks) }
+                            contentDescription = if (creating) "添加课程" else "保存修改",
+                            onClick = {
+                                onSave(
+                                    courseName,
+                                    room,
+                                    teacher,
+                                    weeks,
+                                    slotCount.toIntOrNull()
+                                        ?.coerceIn(1, availableSlotCount)
+                                        ?: 1
+                                )
+                            }
                         )
                     }
                 }
@@ -273,23 +351,37 @@ private fun LiquidCourseDialog(
                     CourseLiquidTextField(
                         label = "课程名",
                         value = courseName,
+                        keyboardAlreadyVisible = keyboardRaised,
                         onValueChange = { courseName = it }
                     )
                     CourseLiquidTextField(
                         label = "地点",
                         value = room,
+                        keyboardAlreadyVisible = keyboardRaised,
                         onValueChange = { room = it }
                     )
                     CourseLiquidTextField(
                         label = "教师",
                         value = teacher,
+                        keyboardAlreadyVisible = keyboardRaised,
                         onValueChange = { teacher = it }
                     )
                     CourseLiquidTextField(
-                        label = "周数",
+                        label = "周数（如1-16；1，2，3；7，8，9，11-16）",
                         value = weeks,
+                        keyboardAlreadyVisible = keyboardRaised,
                         onValueChange = { weeks = it }
                     )
+                    if (creating || allowDurationEdit) {
+                        CourseLiquidTextField(
+                            label = "持续节数（1-$availableSlotCount）",
+                            value = slotCount,
+                            keyboardAlreadyVisible = keyboardRaised,
+                            onValueChange = { input ->
+                                slotCount = input.filter(Char::isDigit).take(2)
+                            }
+                        )
+                    }
                 } else {
                     CourseDetailLine(
                         label = "地点",
@@ -363,10 +455,10 @@ private fun CourseDetailLine(
 private fun CourseLiquidTextField(
     label: String,
     value: String,
+    keyboardAlreadyVisible: Boolean,
     onValueChange: (String) -> Unit
 ) {
     val contentColor = Color(0xFF171923)
-    val accentColor = Color(0xFF0088FF)
     val fieldShape = RoundedCornerShape(16.dp)
     Column(
         Modifier
@@ -381,14 +473,58 @@ private fun CourseLiquidTextField(
             .padding(horizontal = 14.dp, vertical = 7.dp)
     ) {
         BasicText(label, style = TextStyle(contentColor.copy(alpha = 0.62f), 10.sp, FontWeight.Medium))
-        BasicTextField(
-            value = value,
-            onValueChange = onValueChange,
-            modifier = Modifier.fillMaxWidth().padding(top = 3.dp),
-            textStyle = TextStyle(contentColor, 15.sp, FontWeight.Medium),
-            cursorBrush = SolidColor(accentColor),
-            singleLine = true
+        AndroidView(
+            factory = { context ->
+                CourseEditText(context).apply {
+                    setTextColor(AndroidColor.rgb(23, 25, 35))
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+                    setSingleLine(true)
+                    includeFontPadding = false
+                    gravity = Gravity.CENTER_VERTICAL
+                    background = null
+                    setPadding(0, 0, 0, 0)
+                    inputType = InputType.TYPE_CLASS_TEXT
+                    imeOptions = EditorInfo.IME_ACTION_NEXT
+                }
+            },
+            update = { field ->
+                field.onCourseTextChanged = onValueChange
+                field.updateCourseText(value)
+                // When the IME is already on screen, changing fields must only move
+                // the input connection. Requesting showSoftInput again makes several
+                // OEM keyboards replay their complete entrance animation.
+                field.showSoftInputOnFocus = !keyboardAlreadyVisible
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(28.dp)
+                .padding(top = 1.dp)
         )
+    }
+}
+
+private class CourseEditText(context: Context) : EditText(context) {
+    var onCourseTextChanged: (String) -> Unit = {}
+    private var applyingExternalText = false
+
+    init {
+        addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                if (!applyingExternalText) onCourseTextChanged(s?.toString().orEmpty())
+            }
+
+            override fun afterTextChanged(s: Editable?) = Unit
+        })
+    }
+
+    fun updateCourseText(value: String) {
+        if (text?.toString() == value) return
+        applyingExternalText = true
+        setText(value)
+        setSelection(value.length)
+        applyingExternalText = false
     }
 }
 
@@ -406,7 +542,7 @@ private fun CourseLiquidIconButton(
         animationSpec = spring(dampingRatio = 0.62f, stiffness = 420f),
         label = "courseDialogIconScale"
     )
-    val accentColor = Color(0xFF0088FF)
+    val accentColor = if (icon == CourseDialogIcon.DELETE) Color(0xFFF05252) else Color(0xFF0088FF)
     Box(
         Modifier
             .size(44.dp)
@@ -449,8 +585,16 @@ private fun CourseLiquidIconButton(
                 modifier = Modifier.size(20.dp),
                 colorFilter = ColorFilter.tint(accentColor)
             )
+            CourseDialogIcon.DELETE -> Canvas(Modifier.size(20.dp)) {
+                val stroke = 2.dp.toPx()
+                drawLine(accentColor, Offset(size.width * .25f, size.height * .28f), Offset(size.width * .75f, size.height * .28f), stroke, StrokeCap.Round)
+                drawLine(accentColor, Offset(size.width * .40f, size.height * .18f), Offset(size.width * .60f, size.height * .18f), stroke, StrokeCap.Round)
+                drawLine(accentColor, Offset(size.width * .31f, size.height * .38f), Offset(size.width * .36f, size.height * .82f), stroke, StrokeCap.Round)
+                drawLine(accentColor, Offset(size.width * .69f, size.height * .38f), Offset(size.width * .64f, size.height * .82f), stroke, StrokeCap.Round)
+                drawLine(accentColor, Offset(size.width * .36f, size.height * .82f), Offset(size.width * .64f, size.height * .82f), stroke, StrokeCap.Round)
+                drawLine(accentColor, Offset(size.width * .44f, size.height * .43f), Offset(size.width * .44f, size.height * .70f), stroke * .8f, StrokeCap.Round)
+                drawLine(accentColor, Offset(size.width * .56f, size.height * .43f), Offset(size.width * .56f, size.height * .70f), stroke * .8f, StrokeCap.Round)
+            }
         }
     }
 }
-
-
