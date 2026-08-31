@@ -62,6 +62,7 @@ import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -114,6 +115,7 @@ internal fun createScoreLiquidScrollPageView(
     scoreColors: List<Int>,
     pageBackgroundBitmap: Bitmap?,
     pageBackgroundScrim: Int,
+    textPalette: ScheduleTextPalette,
     termSelectorExpanded: State<Boolean>,
     onTermClick: (android.graphics.Rect) -> Unit,
     onScoreClick: (RemoteScore) -> Unit,
@@ -124,6 +126,7 @@ internal fun createScoreLiquidScrollPageView(
         scoreColors = scoreColors,
         pageBackgroundBitmap = pageBackgroundBitmap,
         pageBackgroundScrim = pageBackgroundScrim,
+        textPalette = textPalette,
         termSelectorExpanded = termSelectorExpanded.value,
         onTermClick = onTermClick,
         onScoreClick = onScoreClick,
@@ -136,6 +139,7 @@ internal fun createScoreTermSelectorView(
     term: String,
     pageBackgroundBitmap: Bitmap?,
     pageBackgroundScrim: Int,
+    textPalette: ScheduleTextPalette,
     termSelectorExpanded: State<Boolean>,
     onTermClick: (android.graphics.Rect) -> Unit
 ): View = composeHostView(context) {
@@ -167,7 +171,7 @@ internal fun createScoreTermSelectorView(
             term = term,
             backdrop = backdrop,
             expanded = termSelectorExpanded.value,
-            hasCustomBackground = pageBackgroundImage != null,
+            textPalette = textPalette,
             onClick = onTermClick
         )
     }
@@ -178,12 +182,13 @@ private fun ScoreTermSelector(
     term: String,
     backdrop: Backdrop,
     expanded: Boolean,
-    hasCustomBackground: Boolean,
+    textPalette: ScheduleTextPalette,
     onClick: (android.graphics.Rect) -> Unit
 ) {
-    val textPrimary = Color(0xFF1C2230)
-    val textSecondary = Color(0xFF666F85)
-    val termFontWeight = if (hasCustomBackground) FontWeight.Bold else FontWeight.Normal
+    val textPrimary = Color(textPalette.primary)
+    val textSecondary = Color(textPalette.secondary)
+    val textShadow = scheduleTextShadow(textPalette)
+    val termFontWeight = if (textPalette.adaptive) FontWeight.Bold else FontWeight.Normal
     var bounds by remember { mutableStateOf<android.graphics.Rect?>(null) }
     val arrowRotation by animateFloatAsState(
         targetValue = if (expanded) 180f else 0f,
@@ -224,7 +229,15 @@ private fun ScoreTermSelector(
             .padding(start = 11.dp, top = 8.dp, end = 9.dp, bottom = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        BasicText(term, style = TextStyle(textPrimary, 12.sp, termFontWeight))
+        BasicText(
+            term,
+            style = TextStyle(
+                color = textPrimary,
+                fontSize = 12.sp,
+                fontWeight = termFontWeight,
+                shadow = textShadow
+            )
+        )
         Canvas(
             modifier = Modifier
                 .padding(start = 5.dp)
@@ -257,6 +270,7 @@ private fun ScoreLiquidScrollPage(
     scoreColors: List<Int>,
     pageBackgroundBitmap: Bitmap?,
     pageBackgroundScrim: Int,
+    textPalette: ScheduleTextPalette,
     termSelectorExpanded: Boolean,
     onTermClick: (android.graphics.Rect) -> Unit,
     onScoreClick: (RemoteScore) -> Unit,
@@ -266,10 +280,11 @@ private fun ScoreLiquidScrollPage(
     val pageBackgroundImage = remember(pageBackgroundBitmap) {
         pageBackgroundBitmap?.asImageBitmap()
     }
-    val secondaryFontWeight = if (pageBackgroundImage != null) FontWeight.Bold else FontWeight.Normal
-    val scoreMetricFontWeight = if (pageBackgroundImage != null) FontWeight.ExtraBold else FontWeight.Bold
-    val textPrimary = Color(0xFF1C2230)
-    val textSecondary = Color(0xFF666F85)
+    val secondaryFontWeight = if (textPalette.adaptive) FontWeight.Bold else FontWeight.Normal
+    val scoreMetricFontWeight = if (textPalette.adaptive) FontWeight.ExtraBold else FontWeight.Bold
+    val textPrimary = Color(textPalette.primary)
+    val textSecondary = Color(textPalette.secondary)
+    val textShadow = scheduleTextShadow(textPalette)
     val pageGradient = Brush.linearGradient(
         listOf(
             Color(0xFFF3F2F9),
@@ -303,13 +318,18 @@ private fun ScoreLiquidScrollPage(
             ) {
                 BasicText(
                     "成绩",
-                    style = TextStyle(textPrimary, 28.sp, FontWeight.Bold)
+                    style = TextStyle(
+                        color = textPrimary,
+                        fontSize = 28.sp,
+                        fontWeight = FontWeight.Bold,
+                        shadow = textShadow
+                    )
                 )
                 ScoreTermSelector(
                     term = result.term,
                     backdrop = backdrop,
                     expanded = termSelectorExpanded,
-                    hasCustomBackground = pageBackgroundImage != null,
+                    textPalette = textPalette,
                     onClick = onTermClick
                 )
             }
@@ -341,6 +361,7 @@ private fun ScoreLiquidScrollPage(
                     valueColor = Color(0xFFF56C7E),
                     textSecondary = textSecondary,
                     secondaryFontWeight = secondaryFontWeight,
+                    secondaryShadow = textShadow,
                     valueFontWeight = scoreMetricFontWeight
                 )
                 ScoreMetric(
@@ -349,6 +370,7 @@ private fun ScoreLiquidScrollPage(
                     valueColor = Color(0xFF838CC7),
                     textSecondary = textSecondary,
                     secondaryFontWeight = secondaryFontWeight,
+                    secondaryShadow = textShadow,
                     valueFontWeight = scoreMetricFontWeight
                 )
                 ScoreMetric(
@@ -357,6 +379,7 @@ private fun ScoreLiquidScrollPage(
                     valueColor = Color(0xFF324099),
                     textSecondary = textSecondary,
                     secondaryFontWeight = secondaryFontWeight,
+                    secondaryShadow = textShadow,
                     valueFontWeight = scoreMetricFontWeight
                 )
             }
@@ -387,7 +410,12 @@ private fun ScoreLiquidScrollPage(
                             BasicText(
                                 record.courseName.ifBlank { "未命名课程" },
                                 modifier = Modifier.padding(bottom = 7.dp),
-                                style = TextStyle(textPrimary, 16.sp, FontWeight.Bold)
+                                style = TextStyle(
+                                    color = textPrimary,
+                                    fontSize = 16.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    shadow = textShadow
+                                )
                             )
                             val details = buildList {
                                 if (record.courseCode.isNotBlank()) add(record.courseCode)
@@ -395,7 +423,12 @@ private fun ScoreLiquidScrollPage(
                             }.joinToString("  ·  ")
                             BasicText(
                                 details.ifBlank { "课程成绩" },
-                                style = TextStyle(textSecondary, 12.sp, secondaryFontWeight)
+                                style = TextStyle(
+                                    color = textSecondary,
+                                    fontSize = 12.sp,
+                                    fontWeight = secondaryFontWeight,
+                                    shadow = textShadow
+                                )
                             )
                         }
                         Box(
@@ -435,6 +468,7 @@ private fun androidx.compose.foundation.layout.RowScope.ScoreMetric(
     valueColor: Color,
     textSecondary: Color,
     secondaryFontWeight: FontWeight,
+    secondaryShadow: Shadow?,
     valueFontWeight: FontWeight
 ) {
     Column(
@@ -446,9 +480,26 @@ private fun androidx.compose.foundation.layout.RowScope.ScoreMetric(
             modifier = Modifier.padding(bottom = 5.dp),
             style = TextStyle(valueColor, 21.sp, valueFontWeight)
         )
-        BasicText(label, style = TextStyle(textSecondary, 11.sp, secondaryFontWeight))
+        BasicText(
+            label,
+            style = TextStyle(
+                color = textSecondary,
+                fontSize = 11.sp,
+                fontWeight = secondaryFontWeight,
+                shadow = secondaryShadow
+            )
+        )
     }
 }
+
+private fun scheduleTextShadow(textPalette: ScheduleTextPalette): Shadow? =
+    if (textPalette.adaptive) {
+        Shadow(
+            color = Color(textPalette.halo),
+            offset = Offset.Zero,
+            blurRadius = 1.6f
+        )
+    } else null
 
 @Composable
 private fun SurfaceLiquidExportButton(

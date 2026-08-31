@@ -126,73 +126,119 @@ internal fun createCampusLiquidBottomTabsView(
     pageBackgroundBitmap: Bitmap?,
     pageBackgroundScrim: Int,
     onTabSelected: (Int, View) -> Unit
-): View = ComposeView(context).apply {
-    setBackgroundColor(android.graphics.Color.TRANSPARENT)
-    setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnDetachedFromWindow)
-    setContent {
-        var selectedIndex by rememberSaveable { mutableIntStateOf(initialIndex) }
-        var hostOffsetInPage by remember { mutableStateOf(Offset.Zero) }
-        var pageSize by remember { mutableStateOf(IntSize.Zero) }
-        val backgroundImage = remember(pageBackgroundBitmap) {
-            pageBackgroundBitmap?.asImageBitmap()
-        }
-        val backdrop = remember(hostOffsetInPage, pageSize, backgroundImage, pageBackgroundScrim) {
-            SilkyPageGradientBackdrop(
-                hostOffsetInPage = hostOffsetInPage,
-                pageSize = pageSize,
-                pageBackgroundImage = backgroundImage,
-                pageBackgroundScrim = Color(pageBackgroundScrim)
-            )
-        }
+): CampusLiquidBottomTabsView = CampusLiquidBottomTabsView(
+    context = context,
+    initialIndex = initialIndex,
+    pageBackgroundBitmap = pageBackgroundBitmap,
+    pageBackgroundScrim = pageBackgroundScrim,
+    onTabSelected = onTabSelected
+)
 
-        Box(
-            Modifier
-                .fillMaxSize()
-                .onGloballyPositioned {
-                    val page = this@apply.parent as? View ?: return@onGloballyPositioned
-                    val hostLocation = IntArray(2)
-                    val pageLocation = IntArray(2)
-                    this@apply.getLocationInWindow(hostLocation)
-                    page.getLocationInWindow(pageLocation)
-                    val nextOffset = Offset(
-                        (hostLocation[0] - pageLocation[0]).toFloat(),
-                        (hostLocation[1] - pageLocation[1]).toFloat()
-                    )
-                    val nextSize = IntSize(page.width, page.height)
-                    if (hostOffsetInPage != nextOffset) hostOffsetInPage = nextOffset
-                    if (pageSize != nextSize) pageSize = nextSize
-                },
-            contentAlignment = Alignment.BottomCenter
-        ) {
-            Box(Modifier.padding(bottom = 18.dp)) {
-                LiquidBottomTabs(
-                    selectedTabIndex = { selectedIndex },
-                    onTabSelected = { index ->
-                        selectedIndex = index
-                        onTabSelected(index, this@apply)
-                    },
-                    backdrop = backdrop,
-                    tabsCount = 4,
-                    containerHeight = 54.dp,
-                    indicatorHeight = 46.dp,
-                    containerSurfaceAlpha = 0.34f,
-                    modifier = Modifier
-                        .width(216.dp)
-                        .height(54.dp)
+internal class CampusLiquidBottomTabsView(
+    context: Context,
+    initialIndex: Int,
+    pageBackgroundBitmap: Bitmap?,
+    pageBackgroundScrim: Int,
+    private val onTabSelected: (Int, View) -> Unit
+) : FrameLayout(context) {
+    private var backgroundBitmapState by mutableStateOf(pageBackgroundBitmap)
+    private var backgroundScrimState by mutableIntStateOf(pageBackgroundScrim)
+    private var backgroundCropState by mutableStateOf<BackgroundCropSpec?>(null)
+
+    init {
+        setBackgroundColor(android.graphics.Color.TRANSPARENT)
+        val composeView = ComposeView(context).apply {
+            setBackgroundColor(android.graphics.Color.TRANSPARENT)
+            setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnDetachedFromWindow)
+            setContent {
+                var selectedIndex by rememberSaveable { mutableIntStateOf(initialIndex) }
+                var hostOffsetInPage by remember { mutableStateOf(Offset.Zero) }
+                var pageSize by remember { mutableStateOf(IntSize.Zero) }
+                val pageBackgroundBitmap = backgroundBitmapState
+                val pageBackgroundScrim = backgroundScrimState
+                val pageBackgroundCrop = backgroundCropState
+                val backgroundImage = remember(pageBackgroundBitmap) {
+                    pageBackgroundBitmap?.asImageBitmap()
+                }
+                val backdrop = remember(
+                    hostOffsetInPage,
+                    pageSize,
+                    backgroundImage,
+                    pageBackgroundScrim,
+                    pageBackgroundCrop
                 ) {
-                    repeat(4) { index ->
-                        LiquidBottomTab(
-                            onClick = {
-                                if (selectedIndex == index) onTabSelected(index, this@apply)
-                                else selectedIndex = index
-                            }
+                    SilkyPageGradientBackdrop(
+                        hostOffsetInPage = hostOffsetInPage,
+                        pageSize = pageSize,
+                        pageBackgroundImage = backgroundImage,
+                        pageBackgroundScrim = Color(pageBackgroundScrim),
+                        pageBackgroundCrop = pageBackgroundCrop
+                    )
+                }
+
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .onGloballyPositioned {
+                            val page = this@CampusLiquidBottomTabsView.parent as? View
+                                ?: return@onGloballyPositioned
+                            val hostLocation = IntArray(2)
+                            val pageLocation = IntArray(2)
+                            this@CampusLiquidBottomTabsView.getLocationInWindow(hostLocation)
+                            page.getLocationInWindow(pageLocation)
+                            val nextOffset = Offset(
+                                (hostLocation[0] - pageLocation[0]).toFloat(),
+                                (hostLocation[1] - pageLocation[1]).toFloat()
+                            )
+                            val nextSize = IntSize(page.width, page.height)
+                            if (hostOffsetInPage != nextOffset) hostOffsetInPage = nextOffset
+                            if (pageSize != nextSize) pageSize = nextSize
+                        },
+                    contentAlignment = Alignment.BottomCenter
+                ) {
+                    Box(Modifier.padding(bottom = 18.dp)) {
+                        LiquidBottomTabs(
+                            selectedTabIndex = { selectedIndex },
+                            onTabSelected = { index ->
+                                selectedIndex = index
+                                onTabSelected(index, this@CampusLiquidBottomTabsView)
+                            },
+                            backdrop = backdrop,
+                            tabsCount = 4,
+                            containerHeight = 54.dp,
+                            indicatorHeight = 46.dp,
+                            containerSurfaceAlpha = 0.34f,
+                            modifier = Modifier
+                                .width(216.dp)
+                                .height(54.dp)
                         ) {
-                            LegacyNavigationIcon(index)
+                            repeat(4) { index ->
+                                LiquidBottomTab(
+                                    onClick = {
+                                        if (selectedIndex == index) {
+                                            onTabSelected(index, this@CampusLiquidBottomTabsView)
+                                        } else selectedIndex = index
+                                    }
+                                ) {
+                                    LegacyNavigationIcon(index)
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+        addView(composeView, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+    }
+
+    fun updatePageBackground(
+        bitmap: Bitmap?,
+        scrim: Int,
+        crop: BackgroundCropSpec? = null
+    ) {
+        backgroundBitmapState = bitmap
+        backgroundScrimState = scrim
+        backgroundCropState = crop
     }
 }
 
@@ -304,7 +350,8 @@ internal class SilkyPageGradientBackdrop(
     private val hostOffsetInPage: Offset,
     private val pageSize: IntSize,
     private val pageBackgroundImage: ImageBitmap? = null,
-    private val pageBackgroundScrim: Color = Color.Transparent
+    private val pageBackgroundScrim: Color = Color.Transparent,
+    private val pageBackgroundCrop: BackgroundCropSpec? = null
 ) : Backdrop {
     override val isCoordinatesDependent: Boolean = true
 
@@ -319,15 +366,34 @@ internal class SilkyPageGradientBackdrop(
         val pageWidth = pageSize.width.takeIf { it > 0 }?.toFloat() ?: size.width
         val pageHeight = pageSize.height.takeIf { it > 0 }?.toFloat() ?: size.height
         val image = pageBackgroundImage
+        drawRect(
+            brush = Brush.linearGradient(
+                colors = silkyGradientSamples,
+                start = Offset(-targetOffsetInPage.x, -targetOffsetInPage.y),
+                end = Offset(
+                    pageWidth - targetOffsetInPage.x,
+                    pageHeight - targetOffsetInPage.y
+                )
+            )
+        )
         if (image != null) {
+            val crop = pageBackgroundCrop
+            val cropLeft = (crop?.left ?: 0f) * image.width
+            val cropTop = (crop?.top ?: 0f) * image.height
+            val cropRight = (crop?.right ?: 1f) * image.width
+            val cropBottom = (crop?.bottom ?: 1f) * image.height
+            val cropWidth = (cropRight - cropLeft).coerceAtLeast(1f)
+            val cropHeight = (cropBottom - cropTop).coerceAtLeast(1f)
+            val cropCenterX = (cropLeft + cropRight) / 2f
+            val cropCenterY = (cropTop + cropBottom) / 2f
             val scale = maxOf(
-                pageWidth / image.width.coerceAtLeast(1),
-                pageHeight / image.height.coerceAtLeast(1)
+                pageWidth / cropWidth,
+                pageHeight / cropHeight
             )
             val scaledWidth = image.width * scale
             val scaledHeight = image.height * scale
-            val pageImageLeft = (pageWidth - scaledWidth) / 2f
-            val pageImageTop = (pageHeight - scaledHeight) / 2f
+            val pageImageLeft = pageWidth / 2f - cropCenterX * scale
+            val pageImageTop = pageHeight / 2f - cropCenterY * scale
             drawImage(
                 image = image,
                 dstOffset = IntOffset(
@@ -340,17 +406,6 @@ internal class SilkyPageGradientBackdrop(
                 )
             )
             if (pageBackgroundScrim.alpha > 0f) drawRect(pageBackgroundScrim)
-        } else {
-            drawRect(
-                brush = Brush.linearGradient(
-                    colors = silkyGradientSamples,
-                    start = Offset(-targetOffsetInPage.x, -targetOffsetInPage.y),
-                    end = Offset(
-                        pageWidth - targetOffsetInPage.x,
-                        pageHeight - targetOffsetInPage.y
-                    )
-                )
-            )
         }
     }
 }

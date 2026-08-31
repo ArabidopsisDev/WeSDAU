@@ -61,6 +61,7 @@ import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -117,13 +118,15 @@ internal fun createExamLiquidScrollPageView(
     term: String,
     records: List<RemoteExam>,
     pageBackgroundBitmap: Bitmap?,
-    pageBackgroundScrim: Int
+    pageBackgroundScrim: Int,
+    textPalette: ScheduleTextPalette
 ): View = composeHostView(context) {
     ExamLiquidScrollPage(
         term = term,
         records = records,
         pageBackgroundBitmap = pageBackgroundBitmap,
-        pageBackgroundScrim = pageBackgroundScrim
+        pageBackgroundScrim = pageBackgroundScrim,
+        textPalette = textPalette
     )
 }
 
@@ -136,6 +139,7 @@ internal fun createEmptyRoomLiquidGroupCardView(
     initiallyExpanded: Boolean,
     pageBackgroundBitmap: Bitmap?,
     pageBackgroundScrim: Int,
+    textPalette: ScheduleTextPalette,
     onExpandedChanged: (Boolean) -> Unit
 ): View = composeHostView(context) {
     EmptyRoomLiquidGroupCard(
@@ -146,6 +150,7 @@ internal fun createEmptyRoomLiquidGroupCardView(
         initiallyExpanded = initiallyExpanded,
         pageBackgroundBitmap = pageBackgroundBitmap,
         pageBackgroundScrim = pageBackgroundScrim,
+        textPalette = textPalette,
         onExpandedChanged = onExpandedChanged
     )
 }
@@ -159,6 +164,7 @@ private fun EmptyRoomLiquidGroupCard(
     initiallyExpanded: Boolean,
     pageBackgroundBitmap: Bitmap?,
     pageBackgroundScrim: Int,
+    textPalette: ScheduleTextPalette,
     onExpandedChanged: (Boolean) -> Unit
 ) {
     val backdrop = rememberLayerBackdrop()
@@ -174,7 +180,8 @@ private fun EmptyRoomLiquidGroupCard(
             Color(0xFFD9E5F4)
         )
     )
-    val textPrimary = Color(0xFF1C2230)
+    val textPrimary = Color(textPalette.primary)
+    val textShadow = scheduleTextShadow(textPalette)
     var expanded by remember(groupKey) { mutableStateOf(initiallyExpanded) }
     val roomRows = remember(rooms) { rooms.chunked(2) }
 
@@ -237,7 +244,12 @@ private fun EmptyRoomLiquidGroupCard(
                 BasicText(
                     title,
                     modifier = Modifier.weight(1f),
-                    style = TextStyle(textPrimary, 16.sp, FontWeight.Bold)
+                    style = TextStyle(
+                        color = textPrimary,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold,
+                        shadow = textShadow
+                    )
                 )
                 BasicText(
                     if (expanded) "⌃" else "⌄",
@@ -278,7 +290,12 @@ private fun EmptyRoomLiquidGroupCard(
                                 ) {
                                     BasicText(
                                         room,
-                                        style = TextStyle(textPrimary, 14.sp, FontWeight.Bold)
+                                        style = TextStyle(
+                                            color = textPrimary,
+                                            fontSize = 14.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            shadow = textShadow
+                                        )
                                     )
                                 }
                             }
@@ -296,16 +313,18 @@ private fun ExamLiquidScrollPage(
     term: String,
     records: List<RemoteExam>,
     pageBackgroundBitmap: Bitmap?,
-    pageBackgroundScrim: Int
+    pageBackgroundScrim: Int,
+    textPalette: ScheduleTextPalette
 ) {
     val backdrop = rememberLayerBackdrop()
     val pageBackgroundImage = remember(pageBackgroundBitmap) {
         pageBackgroundBitmap?.asImageBitmap()
     }
-    val secondaryFontWeight = if (pageBackgroundImage != null) FontWeight.ExtraBold else FontWeight.Normal
-    val courseNameFontWeight = if (pageBackgroundImage != null) FontWeight.ExtraBold else FontWeight.Bold
-    val textPrimary = Color(0xFF1C2230)
-    val textSecondary = Color(0xFF666F85)
+    val secondaryFontWeight = if (textPalette.adaptive) FontWeight.ExtraBold else FontWeight.Normal
+    val courseNameFontWeight = if (textPalette.adaptive) FontWeight.ExtraBold else FontWeight.Bold
+    val textPrimary = Color(textPalette.primary)
+    val textSecondary = Color(textPalette.secondary)
+    val textShadow = scheduleTextShadow(textPalette)
     val pageGradient = Brush.linearGradient(
         listOf(
             Color(0xFFF3F2F9),
@@ -342,12 +361,22 @@ private fun ExamLiquidScrollPage(
             BasicText(
                 "考试安排",
                 modifier = Modifier.padding(bottom = 7.dp),
-                style = TextStyle(textPrimary, 28.sp, FontWeight.Bold)
+                style = TextStyle(
+                    color = textPrimary,
+                    fontSize = 28.sp,
+                    fontWeight = FontWeight.Bold,
+                    shadow = textShadow
+                )
             )
             BasicText(
                 "$term 学期 · ${records.size} 门考试",
                 modifier = Modifier.padding(bottom = 18.dp),
-                style = TextStyle(textSecondary, 13.sp, secondaryFontWeight)
+                style = TextStyle(
+                    color = textSecondary,
+                    fontSize = 13.sp,
+                    fontWeight = secondaryFontWeight,
+                    shadow = textShadow
+                )
             )
 
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -368,7 +397,12 @@ private fun ExamLiquidScrollPage(
                         BasicText(
                             exam.courseName.ifBlank { "未命名考试" },
                             modifier = Modifier.padding(bottom = 15.dp),
-                            style = TextStyle(textPrimary, 18.sp, courseNameFontWeight)
+                            style = TextStyle(
+                                color = textPrimary,
+                                fontSize = 18.sp,
+                                fontWeight = courseNameFontWeight,
+                                shadow = textShadow
+                            )
                         )
                         Row(
                             Modifier
@@ -381,6 +415,7 @@ private fun ExamLiquidScrollPage(
                                 textPrimary = textPrimary,
                                 textSecondary = textSecondary,
                                 secondaryFontWeight = secondaryFontWeight,
+                                textShadow = textShadow,
                                 modifier = Modifier.weight(1f)
                             )
                             ExamDetail(
@@ -389,6 +424,7 @@ private fun ExamLiquidScrollPage(
                                 textPrimary = textPrimary,
                                 textSecondary = textSecondary,
                                 secondaryFontWeight = secondaryFontWeight,
+                                textShadow = textShadow,
                                 modifier = Modifier.weight(1f)
                             )
                         }
@@ -399,6 +435,7 @@ private fun ExamLiquidScrollPage(
                                 textPrimary = textPrimary,
                                 textSecondary = textSecondary,
                                 secondaryFontWeight = secondaryFontWeight,
+                                textShadow = textShadow,
                                 modifier = Modifier.weight(1f)
                             )
                             ExamDetail(
@@ -407,6 +444,7 @@ private fun ExamLiquidScrollPage(
                                 textPrimary = textPrimary,
                                 textSecondary = textSecondary,
                                 secondaryFontWeight = secondaryFontWeight,
+                                textShadow = textShadow,
                                 modifier = Modifier.weight(1f)
                             )
                         }
@@ -424,17 +462,37 @@ private fun ExamDetail(
     textPrimary: Color,
     textSecondary: Color,
     secondaryFontWeight: FontWeight,
+    textShadow: Shadow?,
     modifier: Modifier = Modifier
 ) {
     Column(modifier) {
         BasicText(
             label,
             modifier = Modifier.padding(bottom = 5.dp),
-            style = TextStyle(textSecondary, 12.sp, secondaryFontWeight)
+            style = TextStyle(
+                color = textSecondary,
+                fontSize = 12.sp,
+                fontWeight = secondaryFontWeight,
+                shadow = textShadow
+            )
         )
         BasicText(
             value.ifBlank { "-" },
-            style = TextStyle(textPrimary, 15.sp, FontWeight.Bold)
+            style = TextStyle(
+                color = textPrimary,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Bold,
+                shadow = textShadow
+            )
         )
     }
 }
+
+private fun scheduleTextShadow(textPalette: ScheduleTextPalette): Shadow? =
+    if (textPalette.adaptive) {
+        Shadow(
+            color = Color(textPalette.halo),
+            offset = Offset.Zero,
+            blurRadius = 1.6f
+        )
+    } else null

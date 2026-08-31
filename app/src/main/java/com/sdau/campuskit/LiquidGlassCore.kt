@@ -289,6 +289,14 @@ internal fun composeHostView(
     setContent(content)
 }
 
+internal data class ScheduleTextPalette(
+    val primary: Int,
+    val secondary: Int,
+    val halo: Int,
+    val adaptive: Boolean,
+    val usesDarkForeground: Boolean
+)
+
 
 /**
  * Exports one page-aligned source for glass children. The custom image is center-cropped
@@ -333,6 +341,10 @@ internal fun PageAlignedBackdropSource(
         if (pageBackgroundImage == null) {
             Box(Modifier.fillMaxSize().background(pageGradient))
         } else if (sourceReady) {
+            // Processed custom wallpapers can contain per-pixel alpha. Keep the same
+            // default gradient underneath so every liquid surface samples exactly the
+            // composition visible on the page.
+            Box(Modifier.fillMaxSize().background(pageGradient))
             Canvas(Modifier.fillMaxSize()) {
                 val viewportWidth = windowSize.width.takeIf { it > 0 } ?: size.width.roundToInt()
                 val viewportHeight = windowSize.height.takeIf { it > 0 } ?: size.height.roundToInt()
@@ -362,4 +374,3 @@ internal fun PageAlignedBackdropSource(
         }
     }
 }
-

@@ -21,8 +21,8 @@ android {
         applicationId = "com.sdau.campuskit"
         minSdk = 26
         targetSdk = 34
-        versionCode = 9
-        versionName = "0.3.5"
+        versionCode = 10
+        versionName = "0.3.6"
         androidResources.localeFilters += arrayOf("zh", "en")
     }
 
@@ -68,7 +68,7 @@ androidComponents {
     onVariants(selector().withBuildType("release")) { variant ->
         variant.outputs.forEach { output ->
             output.outputFileName.set(
-                output.versionName.map { versionName -> "CampusKit_V$versionName.apk" }
+                output.versionName.map { versionName -> "WeSDAU_V$versionName.apk" }
             )
         }
     }

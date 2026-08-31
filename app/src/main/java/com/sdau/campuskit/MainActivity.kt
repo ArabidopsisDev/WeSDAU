@@ -25,7 +25,6 @@ import android.graphics.Typeface
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
-import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.LayerDrawable
@@ -67,9 +66,11 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.mutableStateOf
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.core.graphics.ColorUtils
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import com.google.android.material.card.MaterialCardView
 import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.textfield.TextInputLayout
@@ -93,6 +94,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.math.abs
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
     private class EmptyRoomPriorityScrollView(context: Context) : ScrollView(context) {
@@ -194,8 +196,24 @@ class MainActivity : ComponentActivity() {
     private var loginStatus: TextView? = null
     private var scheduleDate: TextView? = null
     private var scheduleWeek: TextView? = null
+    private var scheduleVersion: TextView? = null
     private var scheduleGrid: ScheduleGridView? = null
+    private var scheduleTextPalette = ScheduleTextPalette(
+        primary = Color.rgb(28, 34, 48),
+        secondary = Color.rgb(73, 80, 94),
+        halo = Color.TRANSPARENT,
+        adaptive = false,
+        usesDarkForeground = true
+    )
     private var currentPageBackgroundBitmap: Bitmap? = null
+    private var liveScheduleBackgroundBitmap: Bitmap? = null
+    private var liveScheduleBackgroundCrop: BackgroundCropSpec? = null
+    private var liveScheduleBackgroundScrimColor: Int? = null
+    private var pendingSchedulePalettePreview: SchedulePalettePreview? = null
+    private var schedulePalettePreviewFramePosted = false
+    private var schedulePageRoot: FrameLayout? = null
+    private var schedulePageBackgroundImage: ImageView? = null
+    private var schedulePageBackgroundScrim: View? = null
     private var mainSectionHost: FrameLayout? = null
     private var currentMainSection = 0
     private var mainSectionTransitionGeneration = 0
@@ -207,6 +225,9 @@ class MainActivity : ComponentActivity() {
     private var publicOptionOverlay: LiquidPickerDialogView? = null
     private var shareOverlay: View? = null
     private var actionMenuOverlay: LiquidActionMenuView? = null
+    private var backgroundEditorOverlay: LiquidBackgroundEditorView? = null
+    private var backgroundEditorPendingSource: File? = null
+    private var backgroundEditorPreviewBitmap: Bitmap? = null
     private var updateOverlay: View? = null
     private var forceUpdateActive = false
     private var updateDialogView: LiquidUpdateDialogView? = null
@@ -247,7 +268,7 @@ class MainActivity : ComponentActivity() {
         }
     }
     private var pendingPushEnable = false
-    private var bottomNavigation: View? = null
+    private var bottomNavigation: CampusLiquidBottomTabsView? = null
     private var scoresLoading = false
     private var scoreExporting = false
     private var scheduleExporting = false
@@ -274,8 +295,9 @@ class MainActivity : ComponentActivity() {
     private val networkExecutor = Executors.newSingleThreadExecutor()
     private val publicSyncExecutor = Executors.newSingleThreadExecutor()
     private val updateExecutor = Executors.newSingleThreadExecutor()
+    private val backgroundExecutor = Executors.newSingleThreadExecutor()
     private val backgroundPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        uri?.let(::saveCustomBackground)
+        uri?.let(::prepareCustomBackground)
     }
     @Suppress("DEPRECATION")
     private val currentVersionCode: Int by lazy {
@@ -300,6 +322,11 @@ class MainActivity : ComponentActivity() {
     )
     private data class ExamCache(val term: String, val records: List<RemoteExam>)
     private data class EmptyRoomGroup(val title: String, val accent: Int, val rooms: List<String>)
+    private data class SchedulePalettePreview(
+        val bitmap: Bitmap,
+        val crop: BackgroundCropSpec,
+        val scrimColor: Int
+    )
     private data class PublicScheduleIndex(
         val hierarchy: Map<String, Map<String, Map<String, Set<String>>>>,
         val recordCount: Int,
@@ -318,6 +345,7 @@ class MainActivity : ComponentActivity() {
         startPublicScheduleSyncIfNeeded(inferredCurrentTerm())
         if (hasLocalCourseCache()) showSchedulePage() else showLoginPage(false)
         checkForOnlineUpdate()
+        window.decorView.post(::hideSystemNavigationBar)
     }
 
     private fun checkForOnlineUpdate() {
@@ -631,7 +659,7 @@ class MainActivity : ComponentActivity() {
         swapPage(buildLoginPage(), false, animate)
     }
 
-    private fun showSchedulePage() {
+    private fun showSchedulePage(animate: Boolean = true) {
         scheduleMode = ScheduleTimePolicy.currentMode()
         onLoginPage = false
         hideKeyboard()
@@ -649,7 +677,9 @@ class MainActivity : ComponentActivity() {
         setSystemBars(if (immersiveBackground) Color.TRANSPARENT else GRADIENT_START)
         window.navigationBarColor = GRADIENT_END
         WindowCompat.setDecorFitsSystemWindows(window, !immersiveBackground)
-        swapPage(buildSchedulePage(), true, true)
+        val schedulePage = buildSchedulePage()
+        applyScheduleStatusBarAppearance()
+        swapPage(schedulePage, true, animate)
     }
 
     private fun selectedTerm(): String = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
@@ -777,6 +807,15 @@ class MainActivity : ComponentActivity() {
         var flags = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) flags = flags or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
         window.decorView.systemUiVisibility = flags
+        hideSystemNavigationBar()
+    }
+
+    private fun hideSystemNavigationBar() {
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            hide(WindowInsetsCompat.Type.navigationBars())
+        }
     }
 
     private fun swapPage(next: View, forward: Boolean, animate: Boolean) {
@@ -1246,19 +1285,32 @@ class MainActivity : ComponentActivity() {
 
     private fun buildSchedulePage(): View {
         val page = FrameLayout(this).apply { background = SilkyGradientDrawable() }
+        schedulePageRoot = page
+        liveScheduleBackgroundBitmap = null
+        liveScheduleBackgroundCrop = null
+        liveScheduleBackgroundScrimColor = null
+        pendingSchedulePalettePreview = null
+        schedulePageBackgroundImage = null
+        schedulePageBackgroundScrim = null
         val customBackground = loadCustomBackgroundBitmap()
+        val backgroundScrim = customBackgroundScrimColor()
         currentPageBackgroundBitmap = customBackground
+        scheduleTextPalette = resolveScheduleTextPalette(customBackground, backgroundScrim)
         customBackground?.let { backgroundBitmap ->
-            page.addView(ImageView(this).apply {
+            val backgroundImage = ImageView(this).apply {
                 scaleType = ImageView.ScaleType.CENTER_CROP
                 setImageBitmap(backgroundBitmap)
                 contentDescription = null
                 importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-            }, FrameLayout.LayoutParams(-1, -1))
-            page.addView(View(this).apply {
-                setBackgroundColor(CUSTOM_BACKGROUND_SCRIM)
+            }
+            val scrimView = View(this).apply {
+                setBackgroundColor(backgroundScrim)
                 importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-            }, FrameLayout.LayoutParams(-1, -1))
+            }
+            schedulePageBackgroundImage = backgroundImage
+            schedulePageBackgroundScrim = scrimView
+            page.addView(backgroundImage, FrameLayout.LayoutParams(-1, -1))
+            page.addView(scrimView, FrameLayout.LayoutParams(-1, -1))
         }
         val navigationVisibleHeight = dp(54)
         val navigationHostHeight = dp(116)
@@ -1277,7 +1329,7 @@ class MainActivity : ComponentActivity() {
             this,
             currentMainSection,
             customBackground,
-            CUSTOM_BACKGROUND_SCRIM
+            backgroundScrim
         ) { index, _ -> showMainSection(index) }
         bottomNavigation = navigation
         val navigationLayoutParams = FrameLayout.LayoutParams(
@@ -1310,10 +1362,18 @@ class MainActivity : ComponentActivity() {
         scheduleGrid?.setWeekIndex(currentWeek)
         content.addView(scheduleGrid, LinearLayout.LayoutParams(-1, 0, 1f))
         section.addView(content, FrameLayout.LayoutParams(-1, -1))
-        section.addView(text(appDisplayVersion, 10f, Color.rgb(145, 150, 162), Typeface.NORMAL).apply {
+        val versionLabel = text(
+            appDisplayVersion,
+            10f,
+            scheduleTextPalette.secondary,
+            if (scheduleTextPalette.adaptive) Typeface.BOLD else Typeface.NORMAL
+        ).apply {
             gravity = Gravity.CENTER
             includeFontPadding = false
-        }, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply {
+            applyScheduleTextHalo()
+        }
+        scheduleVersion = versionLabel
+        section.addView(versionLabel, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply {
             rightMargin = dp(10)
             bottomMargin = dp(6)
         })
@@ -1504,8 +1564,17 @@ class MainActivity : ComponentActivity() {
             setBackgroundColor(Color.TRANSPARENT)
         }
         val body = verticalLayout().apply { setPadding(dp(20), dp(18), dp(20), dp(28)) }
-        body.addView(text("考试安排", 28f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(7)))
-        body.addView(text("$term 学期", 13f, TEXT_SECONDARY, secondaryTextTypeface()), matchWrapParams())
+        body.addView(text("考试安排", 28f, scheduleTextPalette.primary, Typeface.BOLD).apply {
+            applyScheduleTextHalo()
+        }, spacedParams(dp(7)))
+        body.addView(text(
+            "$term 学期",
+            13f,
+            scheduleTextPalette.secondary,
+            secondaryTextTypeface()
+        ).apply {
+            applyScheduleTextHalo()
+        }, matchWrapParams())
         val stateView = when {
             examsLoading || (!hasLoaded && error.isNullOrBlank()) -> verticalLayout().apply {
                 gravity = Gravity.CENTER
@@ -1518,9 +1587,10 @@ class MainActivity : ComponentActivity() {
                 gravity = Gravity.CENTER
                 setPadding(dp(22), dp(20), dp(22), dp(20))
                 addView(text("!", 20f, ERROR, Typeface.BOLD).apply { gravity = Gravity.CENTER }, LinearLayout.LayoutParams(dp(48), dp(42)))
-                addView(text(error, 14f, TEXT_SECONDARY, secondaryTextTypeface()).apply {
+                addView(text(error, 14f, scheduleTextPalette.secondary, secondaryTextTypeface()).apply {
                     gravity = Gravity.CENTER
                     setLineSpacing(dp(3).toFloat(), 1f)
+                    applyScheduleTextHalo()
                 }, matchWrapParams())
                 isClickable = true
                 contentDescription = "考试安排加载失败，点击重试"
@@ -1547,12 +1617,19 @@ class MainActivity : ComponentActivity() {
         addView(AcademicEmptyIllustration(this@MainActivity, type), LinearLayout.LayoutParams(dp(158), dp(132)).apply {
             bottomMargin = dp(14)
         })
-        addView(text(title, 18f, TEXT_PRIMARY, Typeface.BOLD).apply {
+        addView(text(title, 18f, scheduleTextPalette.primary, Typeface.BOLD).apply {
             gravity = Gravity.CENTER
+            applyScheduleTextHalo()
         }, spacedParams(dp(10)))
-        addView(text(description, 13f, TEXT_SECONDARY, secondaryTextTypeface()).apply {
+        addView(text(
+            description,
+            13f,
+            scheduleTextPalette.secondary,
+            secondaryTextTypeface()
+        ).apply {
             gravity = Gravity.CENTER
             setLineSpacing(dp(4).toFloat(), 1f)
+            applyScheduleTextHalo()
         }, matchWrapParams())
     }
 
@@ -1562,7 +1639,8 @@ class MainActivity : ComponentActivity() {
             term = term,
             records = records,
             pageBackgroundBitmap = currentPageBackgroundBitmap,
-            pageBackgroundScrim = CUSTOM_BACKGROUND_SCRIM
+            pageBackgroundScrim = customBackgroundScrimColor(),
+            textPalette = scheduleTextPalette
         )
     }
 
@@ -1665,7 +1743,9 @@ class MainActivity : ComponentActivity() {
             setBackgroundColor(Color.TRANSPARENT)
         }
         val body = verticalLayout().apply { setPadding(dp(20), dp(18), dp(20), dp(28)) }
-        body.addView(text("空教室查询", 28f, TEXT_PRIMARY, Typeface.BOLD), spacedParams(dp(18)))
+        body.addView(text("空教室查询", 28f, scheduleTextPalette.primary, Typeface.BOLD).apply {
+            applyScheduleTextHalo()
+        }, spacedParams(dp(18)))
         body.addView(buildEmptyRoomQueryPanel(), spacedParams(dp(26)))
 
         if (shouldShowResultSection) {
@@ -1673,14 +1753,24 @@ class MainActivity : ComponentActivity() {
                 gravity = Gravity.CENTER_VERTICAL
                 setPadding(dp(16), 0, dp(16), 0)
             }
-            resultHeader.addView(text("查询结果", 20f, TEXT_PRIMARY, Typeface.BOLD), LinearLayout.LayoutParams(0, -2, 1f))
+            resultHeader.addView(text(
+                "查询结果",
+                20f,
+                scheduleTextPalette.primary,
+                Typeface.BOLD
+            ).apply {
+                applyScheduleTextHalo()
+            }, LinearLayout.LayoutParams(0, -2, 1f))
             body.addView(resultHeader, spacedParams(dp(7)))
             body.addView(text(
                 "${emptyRoomCampus} · 第${emptyRoomWeek}周 · ${emptyRoomWeekdayLabel(emptyRoomWeekday)} · ${emptyRoomSectionLabel(emptyRoomSectionCode)}",
                 12f,
-                TEXT_SECONDARY,
+                scheduleTextPalette.secondary,
                 secondaryTextTypeface()
-            ).apply { setPadding(dp(16), 0, dp(16), 0) }, spacedParams(dp(15)))
+            ).apply {
+                setPadding(dp(16), 0, dp(16), 0)
+                applyScheduleTextHalo()
+            }, spacedParams(dp(15)))
 
             val state = when {
                 emptyRoomsLoading -> emptyRoomResultSurface().apply {
@@ -1692,8 +1782,14 @@ class MainActivity : ComponentActivity() {
                             indeterminateTintList = ColorStateList.valueOf(PRIMARY)
                             contentDescription = "正在查询空教室"
                         }, LinearLayout.LayoutParams(dp(36), dp(36)))
-                        addView(text("正在整理空闲教室", 13f, TEXT_SECONDARY, secondaryTextTypeface()).apply {
+                        addView(text(
+                            "正在整理空闲教室",
+                            13f,
+                            scheduleTextPalette.secondary,
+                            secondaryTextTypeface()
+                        ).apply {
                             gravity = Gravity.CENTER
+                            applyScheduleTextHalo()
                         }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(14) })
                     }
                     addView(loading, FrameLayout.LayoutParams(-1, dp(260)))
@@ -1706,9 +1802,15 @@ class MainActivity : ComponentActivity() {
                         addView(text("!", 21f, ERROR, Typeface.BOLD).apply { gravity = Gravity.CENTER }, LinearLayout.LayoutParams(dp(50), dp(44)).apply {
                             bottomMargin = dp(8)
                         })
-                        addView(text(emptyRoomLoadError.orEmpty(), 14f, TEXT_SECONDARY, secondaryTextTypeface()).apply {
+                        addView(text(
+                            emptyRoomLoadError.orEmpty(),
+                            14f,
+                            scheduleTextPalette.secondary,
+                            secondaryTextTypeface()
+                        ).apply {
                             gravity = Gravity.CENTER
                             setLineSpacing(dp(4).toFloat(), 1f)
+                            applyScheduleTextHalo()
                         }, matchWrapParams())
                     }
                     addView(errorView, FrameLayout.LayoutParams(-1, dp(260)))
@@ -1741,7 +1843,14 @@ class MainActivity : ComponentActivity() {
             background = ColorDrawable(Color.TRANSPARENT)
         }
         val titleRow = horizontalLayout().apply { gravity = Gravity.CENTER_VERTICAL }
-        titleRow.addView(text("查询条件", 20f, TEXT_PRIMARY, Typeface.BOLD), LinearLayout.LayoutParams(0, -2, 1f))
+        titleRow.addView(text(
+            "查询条件",
+            20f,
+            scheduleTextPalette.primary,
+            Typeface.BOLD
+        ).apply {
+            applyScheduleTextHalo()
+        }, LinearLayout.LayoutParams(0, -2, 1f))
         val queryButton = ImageButton(this@MainActivity).apply {
             setImageResource(R.drawable.ic_search_room)
             imageTintList = ColorStateList.valueOf(PRIMARY_DARK)
@@ -1924,7 +2033,15 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun emptyRoomFilterCard(label: String, value: String, onClick: () -> Unit): View =
-        selectionFilterCard(label, value, null, true, false, onClick)
+        selectionFilterCard(
+            label = label,
+            value = value,
+            field = null,
+            enabled = true,
+            showBottomDivider = false,
+            useSchedulePalette = true,
+            onClick = onClick
+        )
 
     private fun selectionFilterCard(
         label: String,
@@ -1932,6 +2049,7 @@ class MainActivity : ComponentActivity() {
         field: MaterialAutoCompleteTextView?,
         enabled: Boolean,
         showBottomDivider: Boolean,
+        useSchedulePalette: Boolean = false,
         onClick: () -> Unit
     ): View = MaterialCardView(this).apply {
         radius = dp(15f).toFloat()
@@ -1946,12 +2064,17 @@ class MainActivity : ComponentActivity() {
         val content = verticalLayout().apply { setPadding(dp(13), dp(10), dp(11), dp(10)) }
         val labelTextSize = if (showBottomDivider) 13f else 11f
         val valueTextSize = if (showBottomDivider) 15.5f else 13.5f
-        content.addView(text(label, labelTextSize, TEXT_SECONDARY, Typeface.NORMAL), spacedParams(dp(5)))
+        val primaryColor = if (useSchedulePalette) scheduleTextPalette.primary else TEXT_PRIMARY
+        val secondaryColor = if (useSchedulePalette) scheduleTextPalette.secondary else TEXT_SECONDARY
+        val secondaryTypeface = if (useSchedulePalette) secondaryTextTypeface() else Typeface.NORMAL
+        content.addView(text(label, labelTextSize, secondaryColor, secondaryTypeface).apply {
+            if (useSchedulePalette) applyScheduleTextHalo()
+        }, spacedParams(dp(5)))
         val valueRow = horizontalLayout().apply { gravity = Gravity.CENTER_VERTICAL }
         val displayValue = value.ifBlank { "请选择" }
         val valueView = field?.apply {
             setText(value, false)
-            setTextColor(TEXT_PRIMARY)
+            setTextColor(primaryColor)
             textSize = valueTextSize
             setTypeface(Typeface.DEFAULT, Typeface.BOLD)
             inputType = InputType.TYPE_NULL
@@ -1965,14 +2088,17 @@ class MainActivity : ComponentActivity() {
             maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
             setOnClickListener { if (enabled) onClick() }
-        } ?: text(displayValue, valueTextSize, TEXT_PRIMARY, Typeface.BOLD).apply {
+            if (useSchedulePalette) applyScheduleTextHalo()
+        } ?: text(displayValue, valueTextSize, primaryColor, Typeface.BOLD).apply {
             maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
+            if (useSchedulePalette) applyScheduleTextHalo()
         }
         valueRow.addView(valueView, LinearLayout.LayoutParams(0, -2, 1f))
         if (!showBottomDivider) {
-            valueRow.addView(text("⌄", 14f, TEXT_SECONDARY, Typeface.NORMAL).apply {
+            valueRow.addView(text("⌄", 14f, secondaryColor, secondaryTypeface).apply {
                 gravity = Gravity.CENTER
+                if (useSchedulePalette) applyScheduleTextHalo()
             }, LinearLayout.LayoutParams(dp(18), -2))
         }
         content.addView(valueRow, matchWrapParams())
@@ -2010,7 +2136,8 @@ class MainActivity : ComponentActivity() {
                 rooms = group.rooms,
                 initiallyExpanded = groupExpanded,
                 pageBackgroundBitmap = currentPageBackgroundBitmap,
-                pageBackgroundScrim = CUSTOM_BACKGROUND_SCRIM
+                pageBackgroundScrim = customBackgroundScrimColor(),
+                textPalette = scheduleTextPalette
             ) { expanded ->
                 if (expanded) collapsedEmptyRoomGroups.remove(groupStateKey)
                 else collapsedEmptyRoomGroups.add(groupStateKey)
@@ -2336,7 +2463,8 @@ class MainActivity : ComponentActivity() {
             result = result,
             scoreColors = result.records.map { scoreColor(it.score) },
             pageBackgroundBitmap = currentPageBackgroundBitmap,
-            pageBackgroundScrim = CUSTOM_BACKGROUND_SCRIM,
+            pageBackgroundScrim = customBackgroundScrimColor(),
+            textPalette = scheduleTextPalette,
             termSelectorExpanded = scoreTermSelectorExpanded,
             onTermClick = ::requestScoreTermPicker,
             onScoreClick = ::showScoreDetail,
@@ -2640,12 +2768,15 @@ class MainActivity : ComponentActivity() {
 
     private fun addGradeHeader(body: LinearLayout, term: String) {
         val header = horizontalLayout().apply { gravity = Gravity.CENTER_VERTICAL }
-        header.addView(text("成绩", 28f, TEXT_PRIMARY, Typeface.BOLD), LinearLayout.LayoutParams(0, -2, 1f))
+        header.addView(text("成绩", 28f, scheduleTextPalette.primary, Typeface.BOLD).apply {
+            applyScheduleTextHalo()
+        }, LinearLayout.LayoutParams(0, -2, 1f))
         val selector = createScoreTermSelectorView(
             context = this,
             term = term,
             pageBackgroundBitmap = currentPageBackgroundBitmap,
-            pageBackgroundScrim = CUSTOM_BACKGROUND_SCRIM,
+            pageBackgroundScrim = customBackgroundScrimColor(),
+            textPalette = scheduleTextPalette,
             termSelectorExpanded = scoreTermSelectorExpanded,
             onTermClick = ::requestScoreTermPicker
         )
@@ -2673,9 +2804,10 @@ class MainActivity : ComponentActivity() {
                 gravity = Gravity.CENTER
                 setPadding(dp(22), dp(20), dp(22), dp(20))
                 addView(text("!", 22f, ERROR, Typeface.BOLD).apply { gravity = Gravity.CENTER }, LinearLayout.LayoutParams(dp(52), dp(44)).apply { bottomMargin = dp(10) })
-                addView(text(error, 14f, TEXT_SECONDARY, secondaryTextTypeface()).apply {
+                addView(text(error, 14f, scheduleTextPalette.secondary, secondaryTextTypeface()).apply {
                     gravity = Gravity.CENTER
                     setLineSpacing(dp(4).toFloat(), 1f)
+                    applyScheduleTextHalo()
                 }, matchWrapParams())
             }
             hasLoadedResult -> buildAcademicEmptyState(
@@ -2800,10 +2932,16 @@ class MainActivity : ComponentActivity() {
             if (viewingPublicSchedule) publicScheduleClassName else todayLabel(),
             26f,
             20f,
-            TEXT_PRIMARY,
+            scheduleTextPalette.primary,
             Typeface.BOLD
-        )
-        scheduleWeek = fixedAdaptiveText(formatWeekLabel(currentWeek), 13f, 11f, TEXT_PRIMARY, Typeface.NORMAL)
+        ).apply { applyScheduleTextHalo() }
+        scheduleWeek = fixedAdaptiveText(
+            formatWeekLabel(currentWeek),
+            13f,
+            11f,
+            scheduleTextPalette.primary,
+            if (scheduleTextPalette.adaptive) Typeface.BOLD else Typeface.NORMAL
+        ).apply { applyScheduleTextHalo() }
         group.addView(scheduleDate, spacedParams(dp(7)))
         group.addView(scheduleWeek, matchWrapParams())
         row.addView(group, LinearLayout.LayoutParams(0, -2, 1f))
@@ -2907,6 +3045,13 @@ class MainActivity : ComponentActivity() {
                 if (hasCustomBackground()) {
                     add(
                         LiquidMenuAction(
+                            title = "调整背景",
+                            iconRes = R.drawable.ic_menu_background_adjust,
+                            onClick = { hideActionMenu { showExistingBackgroundEditor() } }
+                        )
+                    )
+                    add(
+                        LiquidMenuAction(
                             title = "恢复默认背景",
                             iconRes = R.drawable.ic_menu_restore,
                             onClick = { hideActionMenu { clearCustomBackground() } }
@@ -2943,15 +3088,193 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun customBackgroundFile(): File = File(filesDir, CUSTOM_BACKGROUND_FILE_NAME)
+    private fun customBackgroundSourceFile(): File = File(filesDir, CUSTOM_BACKGROUND_SOURCE_FILE_NAME)
+    private fun customBackgroundPendingSourceFile(): File =
+        File(filesDir, "$CUSTOM_BACKGROUND_SOURCE_FILE_NAME.tmp")
 
     private fun hasCustomBackground(): Boolean {
         return getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
             .getBoolean(KEY_CUSTOM_BACKGROUND, false) && customBackgroundFile().isFile
     }
 
-    private fun saveCustomBackground(uri: Uri) {
-        val temporaryFile = File(filesDir, "$CUSTOM_BACKGROUND_FILE_NAME.tmp")
+    private fun customBackgroundScrimColor(): Int {
+        val clarity = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .getFloat(KEY_CUSTOM_BACKGROUND_CLARITY, DEFAULT_BACKGROUND_CLARITY)
+            .coerceIn(MIN_BACKGROUND_CLARITY, 1f)
+        val alpha = ((1f - clarity) * 255f).roundToInt()
+        return Color.argb(alpha, 238, 241, 248)
+    }
+
+    private fun resolveScheduleTextPalette(
+        background: Bitmap?,
+        scrimColor: Int,
+        crop: BackgroundCropSpec? = null,
+        previousUsesDarkForeground: Boolean? = null
+    ): ScheduleTextPalette {
+        if (background == null || background.isRecycled) {
+            return ScheduleTextPalette(
+                primary = Color.rgb(28, 34, 48),
+                secondary = Color.rgb(102, 111, 133),
+                halo = Color.TRANSPARENT,
+                adaptive = false,
+                usesDarkForeground = true
+            )
+        }
+
+        val darkPrimary = Color.rgb(28, 34, 48)
+        val darkSecondary = Color.rgb(65, 72, 85)
+        val lightPrimary = Color.rgb(250, 250, 252)
+        val lightSecondary = Color.rgb(231, 234, 240)
+        var darkContrastTotal = 0.0
+        var lightContrastTotal = 0.0
+        val columns = 24
+        val rows = 36
+        val cropLeft = crop?.left?.coerceIn(0f, 1f) ?: 0f
+        val cropTop = crop?.top?.coerceIn(0f, 1f) ?: 0f
+        val cropRight = crop?.right?.coerceIn(cropLeft + 0.0001f, 1f) ?: 1f
+        val cropBottom = crop?.bottom?.coerceIn(cropTop + 0.0001f, 1f) ?: 1f
+        for (row in 0 until rows) {
+            val yRatio = cropTop + (row + 0.5f) / rows * (cropBottom - cropTop)
+            val y = (yRatio * background.height)
+                .roundToInt().coerceIn(0, background.height - 1)
+            val gradientColor = GRADIENT_COLORS[
+                (row * GRADIENT_COLORS.size / rows).coerceIn(GRADIENT_COLORS.indices)
+            ]
+            for (column in 0 until columns) {
+                val xRatio = cropLeft + (column + 0.5f) / columns * (cropRight - cropLeft)
+                val x = (xRatio * background.width)
+                    .roundToInt().coerceIn(0, background.width - 1)
+                val wallpaperColor = ColorUtils.compositeColors(
+                    background.getPixel(x, y),
+                    gradientColor
+                )
+                val finalColor = ColorUtils.compositeColors(scrimColor, wallpaperColor)
+                darkContrastTotal +=
+                    ColorUtils.calculateContrast(darkPrimary, finalColor) * 0.62 +
+                    ColorUtils.calculateContrast(darkSecondary, finalColor) * 0.38
+                lightContrastTotal +=
+                    ColorUtils.calculateContrast(lightPrimary, finalColor) * 0.62 +
+                    ColorUtils.calculateContrast(lightSecondary, finalColor) * 0.38
+            }
+        }
+        val contrastDelta = (darkContrastTotal - lightContrastTotal) /
+            (kotlin.math.abs(darkContrastTotal) + kotlin.math.abs(lightContrastTotal))
+                .coerceAtLeast(1.0)
+        val useDarkForeground = when (previousUsesDarkForeground) {
+            true -> contrastDelta >= -0.025
+            false -> contrastDelta > 0.025
+            null -> contrastDelta >= 0.0
+        }
+        return if (useDarkForeground) {
+            ScheduleTextPalette(
+                primary = darkPrimary,
+                secondary = darkSecondary,
+                halo = Color.argb(100, 255, 255, 255),
+                adaptive = true,
+                usesDarkForeground = true
+            )
+        } else {
+            ScheduleTextPalette(
+                primary = lightPrimary,
+                secondary = lightSecondary,
+                halo = Color.argb(96, 0, 0, 0),
+                adaptive = true,
+                usesDarkForeground = false
+            )
+        }
+    }
+
+    private fun enqueueSchedulePalettePreview(
+        bitmap: Bitmap,
+        crop: BackgroundCropSpec,
+        scrimColor: Int
+    ) {
+        pendingSchedulePalettePreview = SchedulePalettePreview(bitmap, crop, scrimColor)
+        if (schedulePalettePreviewFramePosted) return
+        val page = schedulePageRoot ?: return
+        schedulePalettePreviewFramePosted = true
+        page.postOnAnimation {
+            schedulePalettePreviewFramePosted = false
+            val preview = pendingSchedulePalettePreview
+            pendingSchedulePalettePreview = null
+            if (
+                preview == null ||
+                backgroundEditorOverlay == null ||
+                preview.bitmap.isRecycled
+            ) return@postOnAnimation
+            val previousForeground = scheduleTextPalette
+                .takeIf(ScheduleTextPalette::adaptive)
+                ?.usesDarkForeground
+            val palette = resolveScheduleTextPalette(
+                background = preview.bitmap,
+                scrimColor = preview.scrimColor,
+                crop = preview.crop,
+                previousUsesDarkForeground = previousForeground
+            )
+            applyScheduleTextPalette(palette)
+        }
+    }
+
+    private fun applyScheduleTextPalette(palette: ScheduleTextPalette) {
+        if (palette == scheduleTextPalette) return
+        scheduleTextPalette = palette
+        scheduleDate?.apply {
+            setTextColor(palette.primary)
+            setTypeface(Typeface.DEFAULT, Typeface.BOLD)
+            applyScheduleTextHalo()
+        }
+        scheduleWeek?.apply {
+            setTextColor(palette.primary)
+            setTypeface(
+                Typeface.DEFAULT,
+                if (palette.adaptive) Typeface.BOLD else Typeface.NORMAL
+            )
+            applyScheduleTextHalo()
+        }
+        scheduleVersion?.apply {
+            setTextColor(palette.secondary)
+            setTypeface(
+                Typeface.DEFAULT,
+                if (palette.adaptive) Typeface.BOLD else Typeface.NORMAL
+            )
+            applyScheduleTextHalo()
+        }
+        scheduleGrid?.refreshTextPalette()
+        applyScheduleStatusBarAppearance()
+    }
+
+    private fun clearLiveScheduleBackgroundPreview() {
+        liveScheduleBackgroundBitmap = null
+        liveScheduleBackgroundCrop = null
+        liveScheduleBackgroundScrimColor = null
+        pendingSchedulePalettePreview = null
+    }
+
+    private fun TextView.applyScheduleTextHalo() {
+        if (scheduleTextPalette.adaptive) {
+            setShadowLayer(dp(0.72f).toFloat(), 0f, 0f, scheduleTextPalette.halo)
+        } else {
+            setShadowLayer(0f, 0f, 0f, Color.TRANSPARENT)
+        }
+    }
+
+    private fun applyScheduleStatusBarAppearance() {
+        var flags = window.decorView.systemUiVisibility
+        flags = if (scheduleTextPalette.usesDarkForeground) {
+            flags or View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+        } else {
+            flags and View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR.inv()
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            flags = flags or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+        }
+        window.decorView.systemUiVisibility = flags
+    }
+
+    private fun prepareCustomBackground(uri: Uri) {
+        val temporaryFile = customBackgroundPendingSourceFile()
         try {
+            temporaryFile.delete()
             var copiedBytes = 0L
             contentResolver.openInputStream(uri)?.use { input ->
                 FileOutputStream(temporaryFile, false).use { output ->
@@ -2968,21 +3291,15 @@ class MainActivity : ComponentActivity() {
                 }
             } ?: throw IllegalArgumentException("无法读取所选图片")
 
-            if (decodeCustomBackground(temporaryFile) == null) {
+            val sourceBitmap = loadBackgroundBitmap(temporaryFile)
+            if (sourceBitmap == null) {
                 throw IllegalArgumentException("所选文件不是受支持的图片")
             }
-            val destination = customBackgroundFile()
-            if (destination.exists() && !destination.delete()) {
-                throw IllegalStateException("无法替换原背景图片")
-            }
-            if (!temporaryFile.renameTo(destination)) {
-                throw IllegalStateException("无法保存背景图片")
-            }
-            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
-                .putBoolean(KEY_CUSTOM_BACKGROUND, true)
-                .apply()
-            Toast.makeText(this, "背景图片已应用", Toast.LENGTH_SHORT).show()
-            showSchedulePage()
+            showBackgroundEditor(
+                sourceFile = temporaryFile,
+                sourceBitmap = sourceBitmap,
+                pendingSelection = true
+            )
         } catch (error: Exception) {
             temporaryFile.delete()
             Toast.makeText(
@@ -2993,10 +3310,346 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun showExistingBackgroundEditor() {
+        val source = customBackgroundSourceFile()
+        if (!source.isFile) {
+            val current = customBackgroundFile()
+            if (!current.isFile) return
+            runCatching { current.copyTo(source, overwrite = true) }.onFailure {
+                Toast.makeText(this, "无法读取当前背景图片", Toast.LENGTH_LONG).show()
+                return
+            }
+        }
+        val bitmap = loadBackgroundBitmap(source)
+        if (bitmap == null) {
+            Toast.makeText(this, "无法读取当前背景图片", Toast.LENGTH_LONG).show()
+            return
+        }
+        showBackgroundEditor(source, bitmap, pendingSelection = false)
+    }
+
+    private fun showBackgroundEditor(
+        sourceFile: File,
+        sourceBitmap: Bitmap,
+        pendingSelection: Boolean
+    ) {
+        hideBackgroundEditor(deletePendingSource = true)
+        val preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val initialClarity = preferences.getFloat(
+            KEY_CUSTOM_BACKGROUND_CLARITY,
+            DEFAULT_BACKGROUND_CLARITY
+        ).coerceIn(MIN_BACKGROUND_CLARITY, 1f)
+        val initialCrop = if (pendingSelection) null else savedBackgroundCrop(preferences)
+        lateinit var editor: LiquidBackgroundEditorView
+        editor = LiquidBackgroundEditorView(
+            context = this,
+            sourceBitmap = sourceBitmap,
+            initialClarity = initialClarity,
+            initialCrop = initialCrop,
+            onPreview = { crop, clarity ->
+                updateLiveBackgroundPreview(sourceBitmap, crop, clarity)
+            },
+            onCancel = {
+                hideBackgroundEditor(
+                    deletePendingSource = pendingSelection,
+                    restoreScheduleBackground = true
+                )
+            },
+            onApply = { crop, clarity ->
+                val selectedSource = sourceFile
+                editor.beginApplySequence {
+                    persistCustomBackground(selectedSource, pendingSelection, crop, clarity) { success ->
+                        if (success) {
+                            editor.setApplyToastState(WallpaperApplyToastState.SUCCESS)
+                            editor.postDelayed({
+                                if (backgroundEditorOverlay === editor) {
+                                    hideBackgroundEditor(deletePendingSource = false) {
+                                        showSchedulePage(animate = false)
+                                    }
+                                }
+                            }, 850L)
+                        } else if (backgroundEditorOverlay === editor) {
+                            hideBackgroundEditor(
+                                deletePendingSource = pendingSelection,
+                                restoreScheduleBackground = true
+                            )
+                        } else {
+                            showSchedulePage(animate = false)
+                        }
+                    }
+                }
+            }
+        )
+        backgroundEditorPendingSource = if (pendingSelection) sourceFile else null
+        backgroundEditorOverlay = editor
+        pageHost.addView(editor, matchParentParams())
+    }
+
+    private fun updateLiveBackgroundPreview(
+        sourceBitmap: Bitmap,
+        crop: BackgroundCropSpec,
+        clarity: Float
+    ) {
+        val page = schedulePageRoot ?: return
+        val backgroundImage = schedulePageBackgroundImage ?: ImageView(this).apply {
+            scaleType = ImageView.ScaleType.MATRIX
+            contentDescription = null
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            page.addView(this, 0, FrameLayout.LayoutParams(-1, -1))
+            schedulePageBackgroundImage = this
+        }
+        val scrimView = schedulePageBackgroundScrim ?: View(this).apply {
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            val imageIndex = page.indexOfChild(backgroundImage)
+            page.addView(this, (imageIndex + 1).coerceAtLeast(1), FrameLayout.LayoutParams(-1, -1))
+            schedulePageBackgroundScrim = this
+        }
+        if (backgroundEditorPreviewBitmap !== sourceBitmap) {
+            backgroundEditorPreviewBitmap = sourceBitmap
+            backgroundImage.scaleType = ImageView.ScaleType.MATRIX
+            backgroundImage.setImageBitmap(sourceBitmap)
+        }
+        val scrimAlpha = ((1f - clarity.coerceIn(MIN_BACKGROUND_CLARITY, 1f)) * 255f)
+            .roundToInt()
+        val previewScrim = Color.argb(scrimAlpha, 238, 241, 248)
+        scrimView.setBackgroundColor(previewScrim)
+        liveScheduleBackgroundBitmap = sourceBitmap
+        liveScheduleBackgroundCrop = crop
+        liveScheduleBackgroundScrimColor = previewScrim
+        enqueueSchedulePalettePreview(sourceBitmap, crop, previewScrim)
+        bottomNavigation?.updatePageBackground(sourceBitmap, previewScrim, crop)
+
+        fun updateMatrix() {
+            val viewportWidth = backgroundImage.width.takeIf { it > 0 }
+                ?: page.width.takeIf { it > 0 }
+                ?: resources.displayMetrics.widthPixels
+            val viewportHeight = backgroundImage.height.takeIf { it > 0 }
+                ?: page.height.takeIf { it > 0 }
+                ?: resources.displayMetrics.heightPixels
+            val sourceWidth = sourceBitmap.width.coerceAtLeast(1).toFloat()
+            val sourceHeight = sourceBitmap.height.coerceAtLeast(1).toFloat()
+            val cropWidth = ((crop.right - crop.left) * sourceWidth).coerceAtLeast(1f)
+            val cropHeight = ((crop.bottom - crop.top) * sourceHeight).coerceAtLeast(1f)
+            val cropCenterX = (crop.left + crop.right) * sourceWidth / 2f
+            val cropCenterY = (crop.top + crop.bottom) * sourceHeight / 2f
+            val scale = maxOf(viewportWidth / cropWidth, viewportHeight / cropHeight)
+            backgroundImage.imageMatrix = Matrix().apply {
+                setScale(scale, scale)
+                postTranslate(
+                    viewportWidth / 2f - cropCenterX * scale,
+                    viewportHeight / 2f - cropCenterY * scale
+                )
+            }
+        }
+        if (backgroundImage.width > 0 && backgroundImage.height > 0) updateMatrix()
+        else backgroundImage.post(::updateMatrix)
+    }
+
+    private fun hideBackgroundEditor(
+        deletePendingSource: Boolean,
+        restoreScheduleBackground: Boolean = false,
+        afterDismiss: (() -> Unit)? = null
+    ) {
+        val editor = backgroundEditorOverlay
+        val pendingSource = backgroundEditorPendingSource
+        if (editor == null) {
+            if (deletePendingSource) pendingSource?.delete()
+            backgroundEditorPendingSource = null
+            afterDismiss?.invoke()
+            return
+        }
+        backgroundEditorOverlay = null
+        backgroundEditorPendingSource = null
+        editor.dismiss {
+            if (restoreScheduleBackground) {
+                restoreScheduleBackgroundAfterEditor()
+            } else {
+                schedulePageBackgroundImage?.setImageDrawable(null)
+            }
+            clearLiveScheduleBackgroundPreview()
+            backgroundEditorPreviewBitmap = null
+            pageHost.removeView(editor)
+            editor.releaseBitmap()
+            if (deletePendingSource) pendingSource?.delete()
+            afterDismiss?.invoke()
+        }
+    }
+
+    private fun restoreScheduleBackgroundAfterEditor() {
+        val page = schedulePageRoot ?: return
+        clearLiveScheduleBackgroundPreview()
+        val restoredBitmap = currentPageBackgroundBitmap
+        if (restoredBitmap != null && !restoredBitmap.isRecycled) {
+            val restoredScrim = customBackgroundScrimColor()
+            val backgroundImage = schedulePageBackgroundImage ?: ImageView(this).apply {
+                contentDescription = null
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                page.addView(this, 0, FrameLayout.LayoutParams(-1, -1))
+                schedulePageBackgroundImage = this
+            }
+            backgroundImage.scaleType = ImageView.ScaleType.CENTER_CROP
+            backgroundImage.setImageBitmap(restoredBitmap)
+
+            val scrimView = schedulePageBackgroundScrim ?: View(this).apply {
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                val imageIndex = page.indexOfChild(backgroundImage)
+                page.addView(this, imageIndex + 1, FrameLayout.LayoutParams(-1, -1))
+                schedulePageBackgroundScrim = this
+            }
+            scrimView.setBackgroundColor(restoredScrim)
+            bottomNavigation?.updatePageBackground(
+                restoredBitmap,
+                restoredScrim
+            )
+            applyScheduleTextPalette(resolveScheduleTextPalette(restoredBitmap, restoredScrim))
+        } else {
+            schedulePageBackgroundImage?.let(page::removeView)
+            schedulePageBackgroundScrim?.let(page::removeView)
+            schedulePageBackgroundImage = null
+            schedulePageBackgroundScrim = null
+            bottomNavigation?.updatePageBackground(null, Color.TRANSPARENT)
+            applyScheduleTextPalette(resolveScheduleTextPalette(null, Color.TRANSPARENT))
+        }
+    }
+
+    private fun persistCustomBackground(
+        sourceFile: File,
+        pendingSelection: Boolean,
+        crop: BackgroundCropSpec,
+        clarity: Float,
+        onComplete: (Boolean) -> Unit
+    ) {
+        backgroundExecutor.execute {
+            val output = File(filesDir, "$CUSTOM_BACKGROUND_FILE_NAME.tmp")
+            val destinationBackup = File(filesDir, "$CUSTOM_BACKGROUND_FILE_NAME.bak")
+            val sourceBackup = File(filesDir, "$CUSTOM_BACKGROUND_SOURCE_FILE_NAME.bak")
+            val result = runCatching {
+                output.delete()
+                destinationBackup.delete()
+                sourceBackup.delete()
+                writeProcessedBackground(sourceFile, output, crop)
+                if (pendingSelection) {
+                    val sourceDestination = customBackgroundSourceFile()
+                    if (sourceDestination.exists() && !sourceDestination.renameTo(sourceBackup)) {
+                        throw IllegalStateException("无法备份原始背景图片")
+                    }
+                    if (!sourceFile.renameTo(sourceDestination)) {
+                        if (sourceBackup.isFile) sourceBackup.renameTo(sourceDestination)
+                        throw IllegalStateException("无法保存原始背景图片")
+                    }
+                }
+                val destination = customBackgroundFile()
+                if (destination.exists() && !destination.renameTo(destinationBackup)) {
+                    if (pendingSelection) {
+                        customBackgroundSourceFile().delete()
+                        if (sourceBackup.isFile) sourceBackup.renameTo(customBackgroundSourceFile())
+                    }
+                    throw IllegalStateException("无法备份原背景图片")
+                }
+                if (!output.renameTo(destination)) {
+                    if (destinationBackup.isFile) destinationBackup.renameTo(destination)
+                    if (pendingSelection) {
+                        customBackgroundSourceFile().delete()
+                        if (sourceBackup.isFile) sourceBackup.renameTo(customBackgroundSourceFile())
+                    }
+                    throw IllegalStateException("无法保存背景图片")
+                }
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                    .putBoolean(KEY_CUSTOM_BACKGROUND, true)
+                    .putFloat(
+                        KEY_CUSTOM_BACKGROUND_CLARITY,
+                        clarity.coerceIn(MIN_BACKGROUND_CLARITY, 1f)
+                    )
+                    .putFloat(KEY_CUSTOM_BACKGROUND_CROP_LEFT, crop.left)
+                    .putFloat(KEY_CUSTOM_BACKGROUND_CROP_TOP, crop.top)
+                    .putFloat(KEY_CUSTOM_BACKGROUND_CROP_RIGHT, crop.right)
+                    .putFloat(KEY_CUSTOM_BACKGROUND_CROP_BOTTOM, crop.bottom)
+                    .commit()
+                destinationBackup.delete()
+                sourceBackup.delete()
+            }
+            output.delete()
+            destinationBackup.delete()
+            sourceBackup.delete()
+            if (pendingSelection && sourceFile.isFile) sourceFile.delete()
+            runOnUiThread {
+                result.onSuccess {
+                    onComplete(true)
+                }.onFailure { error ->
+                    Toast.makeText(
+                        this,
+                        error.message?.takeIf(String::isNotBlank) ?: "背景图片设置失败",
+                        Toast.LENGTH_LONG
+                    ).show()
+                    onComplete(false)
+                }
+            }
+        }
+    }
+
+    private fun writeProcessedBackground(
+        sourceFile: File,
+        outputFile: File,
+        crop: BackgroundCropSpec
+    ) {
+        val source = loadBackgroundBitmap(sourceFile)
+            ?: throw IllegalArgumentException("无法读取所选图片")
+        try {
+            val left = (crop.left.coerceIn(0f, 1f) * source.width).roundToInt()
+                .coerceIn(0, source.width - 1)
+            val top = (crop.top.coerceIn(0f, 1f) * source.height).roundToInt()
+                .coerceIn(0, source.height - 1)
+            val right = (crop.right.coerceIn(0f, 1f) * source.width).roundToInt()
+                .coerceIn(left + 1, source.width)
+            val bottom = (crop.bottom.coerceIn(0f, 1f) * source.height).roundToInt()
+                .coerceIn(top + 1, source.height)
+            val cropped = Bitmap.createBitmap(source, left, top, right - left, bottom - top)
+            val output = Bitmap.createBitmap(cropped.width, cropped.height, Bitmap.Config.ARGB_8888)
+            try {
+                val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+                Canvas(output).drawBitmap(cropped, 0f, 0f, paint)
+                FileOutputStream(outputFile, false).use { stream ->
+                    if (!output.compress(Bitmap.CompressFormat.PNG, 100, stream)) {
+                        throw IllegalStateException("无法保存背景图片")
+                    }
+                }
+            } finally {
+                output.recycle()
+                if (cropped !== source && !cropped.isRecycled) cropped.recycle()
+            }
+        } finally {
+            if (!source.isRecycled) source.recycle()
+        }
+    }
+
+    private fun savedBackgroundCrop(
+        preferences: android.content.SharedPreferences
+    ): BackgroundCropSpec? {
+        if (!preferences.contains(KEY_CUSTOM_BACKGROUND_CROP_LEFT)) return null
+        val crop = BackgroundCropSpec(
+            preferences.getFloat(KEY_CUSTOM_BACKGROUND_CROP_LEFT, 0f),
+            preferences.getFloat(KEY_CUSTOM_BACKGROUND_CROP_TOP, 0f),
+            preferences.getFloat(KEY_CUSTOM_BACKGROUND_CROP_RIGHT, 1f),
+            preferences.getFloat(KEY_CUSTOM_BACKGROUND_CROP_BOTTOM, 1f)
+        )
+        return crop.takeIf {
+            it.left in 0f..1f && it.top in 0f..1f &&
+                it.right in 0f..1f && it.bottom in 0f..1f &&
+                it.right > it.left && it.bottom > it.top
+        }
+    }
+
     private fun clearCustomBackground() {
         customBackgroundFile().delete()
+        customBackgroundSourceFile().delete()
+        customBackgroundPendingSourceFile().delete()
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
             .remove(KEY_CUSTOM_BACKGROUND)
+            .remove(KEY_CUSTOM_BACKGROUND_CLARITY)
+            .remove(KEY_CUSTOM_BACKGROUND_CROP_LEFT)
+            .remove(KEY_CUSTOM_BACKGROUND_CROP_TOP)
+            .remove(KEY_CUSTOM_BACKGROUND_CROP_RIGHT)
+            .remove(KEY_CUSTOM_BACKGROUND_CROP_BOTTOM)
             .apply()
         Toast.makeText(this, "已恢复默认背景", Toast.LENGTH_SHORT).show()
         showSchedulePage()
@@ -3004,8 +3657,10 @@ class MainActivity : ComponentActivity() {
 
     private fun loadCustomBackgroundBitmap(): Bitmap? {
         if (!hasCustomBackground()) return null
-        val file = customBackgroundFile()
-        return runCatching {
+        return loadBackgroundBitmap(customBackgroundFile())
+    }
+
+    private fun loadBackgroundBitmap(file: File): Bitmap? = runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 ImageDecoder.decodeBitmap(ImageDecoder.createSource(file)) { decoder, info, _ ->
                     decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
@@ -3034,37 +3689,6 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }.getOrNull()
-    }
-
-    private fun decodeCustomBackground(file: File): Drawable? = runCatching {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            ImageDecoder.decodeDrawable(ImageDecoder.createSource(file)) { decoder, info, _ ->
-                val sourceWidth = info.size.width.coerceAtLeast(1)
-                val sourceHeight = info.size.height.coerceAtLeast(1)
-                val longestSide = maxOf(sourceWidth, sourceHeight)
-                if (longestSide > MAX_CUSTOM_BACKGROUND_DIMENSION) {
-                    val scale = MAX_CUSTOM_BACKGROUND_DIMENSION.toFloat() / longestSide
-                    decoder.setTargetSize(
-                        (sourceWidth * scale).toInt().coerceAtLeast(1),
-                        (sourceHeight * scale).toInt().coerceAtLeast(1)
-                    )
-                }
-            }
-        } else {
-            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeFile(file.absolutePath, bounds)
-            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@runCatching null
-            var sampleSize = 1
-            while (maxOf(bounds.outWidth, bounds.outHeight) / sampleSize > MAX_CUSTOM_BACKGROUND_DIMENSION) {
-                sampleSize *= 2
-            }
-            val bitmap = BitmapFactory.decodeFile(
-                file.absolutePath,
-                BitmapFactory.Options().apply { inSampleSize = sampleSize }
-            ) ?: return@runCatching null
-            BitmapDrawable(resources, bitmap)
-        }
-    }.getOrNull()
 
     private fun buildExportCoursePlacements(visibleCourses: List<Course>): List<CoursePlacement> {
         val result = mutableListOf<CoursePlacement>()
@@ -4594,6 +5218,14 @@ class MainActivity : ComponentActivity() {
     @Deprecated("Use OnBackInvokedDispatcher on newer Android versions")
     override fun onBackPressed() {
         if (forceUpdateActive) return
+        if (backgroundEditorOverlay != null) {
+            if (backgroundEditorOverlay?.isApplyingBackground() == true) return
+            hideBackgroundEditor(
+                deletePendingSource = backgroundEditorPendingSource != null,
+                restoreScheduleBackground = true
+            )
+            return
+        }
         if (emptyRoomFilterOverlay != null) {
             hideEmptyRoomFilterPicker()
             return
@@ -5293,6 +5925,11 @@ class MainActivity : ComponentActivity() {
         private val touchSlop = viewConfiguration.scaledTouchSlop
         private val pageMinimumFlingVelocity = viewConfiguration.scaledMinimumFlingVelocity
         private val pageMaximumFlingVelocity = viewConfiguration.scaledMaximumFlingVelocity
+        private var backgroundSamplePageWidth = 0f
+        private var backgroundSamplePageHeight = 0f
+        private var backgroundSampleGridOffsetX = 0f
+        private var backgroundSampleGridOffsetY = 0f
+        private var backgroundSampleScrimColor = Color.TRANSPARENT
 
         init { setBackgroundColor(Color.TRANSPARENT); isFocusable = true; contentDescription = "开发测试周课程表，包含 9 门示例课程" }
 
@@ -5400,6 +6037,7 @@ class MainActivity : ComponentActivity() {
         fun setWeekIndex(index: Int) { clearSwipeBitmaps(); weekIndex = index; invalidate() }
         fun setScheduleMode(mode: ScheduleMode) { clearSwipeBitmaps(); scheduleMode = mode; invalidate() }
         fun setCourses(updated: List<Course>) { clearSwipeBitmaps(); courses = updated; invalidate() }
+        fun refreshTextPalette() { clearSwipeBitmaps(); invalidate() }
 
         fun releaseTransientCaches() {
             pageAnimator?.removeAllUpdateListeners()
@@ -5413,6 +6051,7 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onDraw(canvas: Canvas) {
+            prepareBackgroundTextSampling()
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val currentNode = cachedCurrentNode
                 if (currentNode != null && cachedCurrentWeek == weekIndex) {
@@ -5532,7 +6171,7 @@ class MainActivity : ComponentActivity() {
                 centerX,
                 titleCenterY,
                 sp(18f),
-                TEXT_PRIMARY,
+                scheduleTextPalette.primary,
                 Typeface.BOLD
             )
             drawCenteredText(
@@ -5541,8 +6180,8 @@ class MainActivity : ComponentActivity() {
                 centerX,
                 descriptionCenterY,
                 sp(13f),
-                TEXT_SECONDARY,
-                secondaryTextTypeface()
+                scheduleTextPalette.secondary,
+                if (scheduleTextPalette.adaptive) Typeface.BOLD else secondaryTextTypeface()
             )
         }
 
@@ -5840,14 +6479,22 @@ class MainActivity : ComponentActivity() {
             val today = Calendar.getInstance()
             val month = monthDate.get(Calendar.MONTH) + 1
             val monthSize = fittedGridTextSize(month.toString(), sp(14f), timeColumnWidth - dp(6f), Typeface.BOLD)
-            drawCenteredText(canvas, month.toString(), timeColumnWidth / 2f, dp(14f).toFloat(), monthSize, TEXT_PRIMARY, Typeface.BOLD)
+            drawCenteredText(
+                canvas,
+                month.toString(),
+                timeColumnWidth / 2f,
+                dp(14f).toFloat(),
+                monthSize,
+                scheduleTextPalette.primary,
+                Typeface.BOLD
+            )
             drawCenteredText(
                 canvas,
                 "月",
                 timeColumnWidth / 2f,
                 dp(31f).toFloat(),
                 sp(9f),
-                TEXT_PRIMARY,
+                scheduleTextPalette.secondary,
                 if (currentPageBackgroundBitmap != null) Typeface.BOLD else Typeface.NORMAL
             )
             for (day in 0..6) {
@@ -5856,13 +6503,13 @@ class MainActivity : ComponentActivity() {
                 headerDate.add(Calendar.DAY_OF_MONTH, day)
                 val isToday = headerDate.get(Calendar.YEAR) == today.get(Calendar.YEAR) &&
                     headerDate.get(Calendar.DAY_OF_YEAR) == today.get(Calendar.DAY_OF_YEAR)
-                val textColor = if (isToday) Color.rgb(22, 27, 39) else Color.rgb(142, 149, 166)
+                val textColor = if (isToday) scheduleTextPalette.primary else scheduleTextPalette.secondary
                 drawCenteredText(
                     canvas,
                     dayNames[day],
                     center,
                     dp(14f).toFloat(),
-                    sp(if (isToday) 12.6f else 11.7f),
+                    sp(if (isToday) 13.3f else 11.5f),
                     textColor,
                     if (isToday || currentPageBackgroundBitmap != null) Typeface.BOLD else Typeface.NORMAL,
                     extraBold = isToday
@@ -5872,7 +6519,7 @@ class MainActivity : ComponentActivity() {
                     dateForDay(day, week),
                     center,
                     dp(31f).toFloat(),
-                    sp(if (isToday) 8.6f else 7.8f),
+                    sp(if (isToday) 9.4f else 7.7f),
                     textColor,
                     if (isToday || currentPageBackgroundBitmap != null) Typeface.BOLD else Typeface.NORMAL,
                     extraBold = isToday
@@ -5907,9 +6554,34 @@ class MainActivity : ComponentActivity() {
                     fittedGridTextSize(times[slot][0], sp(10f), timeColumnWidth - dp(4f), Typeface.NORMAL),
                     fittedGridTextSize(times[slot][1], sp(10f), timeColumnWidth - dp(4f), Typeface.NORMAL)
                 )
-                drawCenteredText(canvas, slotLabel, center, (top + dp(15f)).toFloat(), slotSize, TEXT_PRIMARY, Typeface.BOLD)
-                drawCenteredText(canvas, times[slot][0], center, (top + dp(30f)).toFloat(), timeSize, TEXT_PRIMARY, Typeface.NORMAL)
-                drawCenteredText(canvas, times[slot][1], center, (top + dp(43f)).toFloat(), timeSize, TEXT_PRIMARY, Typeface.NORMAL)
+                val timeStyle = if (scheduleTextPalette.adaptive) Typeface.BOLD else Typeface.NORMAL
+                drawCenteredText(
+                    canvas,
+                    slotLabel,
+                    center,
+                    (top + dp(15f)).toFloat(),
+                    slotSize,
+                    scheduleTextPalette.primary,
+                    Typeface.BOLD
+                )
+                drawCenteredText(
+                    canvas,
+                    times[slot][0],
+                    center,
+                    (top + dp(30f)).toFloat(),
+                    timeSize,
+                    scheduleTextPalette.secondary,
+                    timeStyle
+                )
+                drawCenteredText(
+                    canvas,
+                    times[slot][1],
+                    center,
+                    (top + dp(43f)).toFloat(),
+                    timeSize,
+                    scheduleTextPalette.secondary,
+                    timeStyle
+                )
             }
         }
 
@@ -6012,6 +6684,116 @@ class MainActivity : ComponentActivity() {
             return result
         }
 
+        private fun prepareBackgroundTextSampling() {
+            val page = schedulePageRoot
+            val bitmap = liveScheduleBackgroundBitmap ?: currentPageBackgroundBitmap
+            if (
+                !scheduleTextPalette.adaptive ||
+                page == null ||
+                bitmap == null ||
+                bitmap.isRecycled ||
+                page.width <= 0 ||
+                page.height <= 0 ||
+                !isAttachedToWindow
+            ) {
+                backgroundSamplePageWidth = 0f
+                backgroundSamplePageHeight = 0f
+                return
+            }
+            val pageLocation = IntArray(2)
+            val gridLocation = IntArray(2)
+            page.getLocationInWindow(pageLocation)
+            getLocationInWindow(gridLocation)
+            backgroundSamplePageWidth = page.width.toFloat()
+            backgroundSamplePageHeight = page.height.toFloat()
+            backgroundSampleGridOffsetX = (gridLocation[0] - pageLocation[0]).toFloat()
+            backgroundSampleGridOffsetY = (gridLocation[1] - pageLocation[1]).toFloat()
+            backgroundSampleScrimColor =
+                liveScheduleBackgroundScrimColor ?: customBackgroundScrimColor()
+        }
+
+        private fun localScheduleHaloColor(
+            textColor: Int,
+            centerX: Float,
+            centerY: Float,
+            measuredTextWidth: Float,
+            textSize: Float
+        ): Int {
+            val bitmap = liveScheduleBackgroundBitmap ?: currentPageBackgroundBitmap
+            val pageWidth = backgroundSamplePageWidth
+            val pageHeight = backgroundSamplePageHeight
+            if (
+                bitmap == null ||
+                bitmap.isRecycled ||
+                pageWidth <= 0f ||
+                pageHeight <= 0f
+            ) return scheduleTextPalette.halo
+
+            val previewCrop = liveScheduleBackgroundCrop
+            val cropWidth = previewCrop
+                ?.let { (it.right - it.left) * bitmap.width }
+                ?.coerceAtLeast(1f)
+                ?: bitmap.width.toFloat()
+            val cropHeight = previewCrop
+                ?.let { (it.bottom - it.top) * bitmap.height }
+                ?.coerceAtLeast(1f)
+                ?: bitmap.height.toFloat()
+            val cropCenterX = previewCrop
+                ?.let { (it.left + it.right) * bitmap.width / 2f }
+                ?: bitmap.width / 2f
+            val cropCenterY = previewCrop
+                ?.let { (it.top + it.bottom) * bitmap.height / 2f }
+                ?: bitmap.height / 2f
+            val imageScale = maxOf(pageWidth / cropWidth, pageHeight / cropHeight)
+            val imageLeft = pageWidth / 2f - cropCenterX * imageScale
+            val imageTop = pageHeight / 2f - cropCenterY * imageScale
+            val pageCenterX = backgroundSampleGridOffsetX + centerX
+            val pageCenterY = backgroundSampleGridOffsetY + centerY
+            val halfWidth = (measuredTextWidth * 0.52f)
+                .coerceIn(dp(8f).toFloat(), dp(90f).toFloat())
+            val halfHeight = (textSize * 0.55f).coerceAtLeast(dp(4f).toFloat())
+            val opaqueTextColor = ColorUtils.setAlphaComponent(textColor, 255)
+            var contrastTotal = 0.0
+            var sampleCount = 0
+
+            for (row in 0 until 3) {
+                val pageY = (pageCenterY - halfHeight + halfHeight * row)
+                    .coerceIn(0f, pageHeight - 1f)
+                val gradientIndex = ((pageY / pageHeight) * (GRADIENT_COLORS.size - 1))
+                    .roundToInt().coerceIn(GRADIENT_COLORS.indices)
+                for (column in 0 until 7) {
+                    val pageX = (pageCenterX - halfWidth + halfWidth * column / 3f)
+                        .coerceIn(0f, pageWidth - 1f)
+                    val sourceX = ((pageX - imageLeft) / imageScale)
+                        .roundToInt().coerceIn(0, bitmap.width - 1)
+                    val sourceY = ((pageY - imageTop) / imageScale)
+                        .roundToInt().coerceIn(0, bitmap.height - 1)
+                    val wallpaperColor = ColorUtils.compositeColors(
+                        bitmap.getPixel(sourceX, sourceY),
+                        GRADIENT_COLORS[gradientIndex]
+                    )
+                    val finalColor = ColorUtils.compositeColors(
+                        backgroundSampleScrimColor,
+                        wallpaperColor
+                    )
+                    contrastTotal += ColorUtils.calculateContrast(opaqueTextColor, finalColor)
+                    sampleCount++
+                }
+            }
+            val contrast = contrastTotal / sampleCount.coerceAtLeast(1)
+            val baseAlpha = Color.alpha(scheduleTextPalette.halo)
+            val alphaScale = when {
+                contrast >= 7.0 -> 0.56f
+                contrast >= 4.5 -> 0.74f
+                contrast >= 3.0 -> 1f
+                else -> 1.28f
+            }
+            return ColorUtils.setAlphaComponent(
+                scheduleTextPalette.halo,
+                (baseAlpha * alphaScale).roundToInt().coerceIn(48, 132)
+            )
+        }
+
         private fun drawCenteredText(
             canvas: Canvas,
             value: String,
@@ -6022,15 +6804,31 @@ class MainActivity : ComponentActivity() {
             style: Int,
             extraBold: Boolean = false
         ) {
-            paint.style = Paint.Style.FILL
             paint.textSize = size
-            paint.color = color
             paint.typeface = Typeface.create(Typeface.DEFAULT, style)
             paint.isFakeBoldText = extraBold
             paint.textAlign = Paint.Align.CENTER
             val metrics = paint.fontMetrics
-            canvas.drawText(value, centerX, centerY - (metrics.ascent + metrics.descent) / 2f, paint)
+            val baseline = centerY - (metrics.ascent + metrics.descent) / 2f
+            if (scheduleTextPalette.adaptive) {
+                paint.style = Paint.Style.STROKE
+                paint.strokeWidth = maxOf(dp(0.40f).toFloat(), size * 0.045f)
+                paint.strokeJoin = Paint.Join.ROUND
+                paint.color = localScheduleHaloColor(
+                    textColor = color,
+                    centerX = centerX,
+                    centerY = centerY,
+                    measuredTextWidth = paint.measureText(value),
+                    textSize = size
+                )
+                canvas.drawText(value, centerX, baseline, paint)
+            }
+            paint.style = if (extraBold) Paint.Style.FILL_AND_STROKE else Paint.Style.FILL
+            paint.strokeWidth = if (extraBold) maxOf(dp(0.18f).toFloat(), size * 0.008f) else 0f
+            paint.color = color
+            canvas.drawText(value, centerX, baseline, paint)
             paint.isFakeBoldText = false
+            paint.strokeWidth = 0f
             paint.textAlign = Paint.Align.LEFT
         }
 
@@ -6112,6 +6910,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        hideSystemNavigationBar()
         val automaticMode = ScheduleTimePolicy.currentMode()
         if (automaticMode == scheduleMode) return
         scheduleMode = automaticMode
@@ -6129,6 +6928,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) hideSystemNavigationBar()
+    }
+
     override fun onDestroy() {
         scheduleGrid?.releaseTransientCaches()
         publicScheduleIndexCache.clear()
@@ -6144,10 +6948,15 @@ class MainActivity : ComponentActivity() {
         publicOptionOverlay = null
         (shareOverlay as? LiquidPickerDialogView)?.releaseSnapshot()
         actionMenuOverlay?.releaseSnapshot()
+        backgroundEditorOverlay?.releaseBitmap()
+        backgroundEditorOverlay = null
+        backgroundEditorPendingSource?.delete()
+        backgroundEditorPendingSource = null
         clearUpdateDownloadReceiver()
         networkExecutor.shutdownNow()
         publicSyncExecutor.shutdownNow()
         updateExecutor.shutdownNow()
+        backgroundExecutor.shutdownNow()
         super.onDestroy()
     }
 
@@ -6181,7 +6990,13 @@ class MainActivity : ComponentActivity() {
         private const val KEY_BATTERY_PROMPTED = "battery_prompted"
         private const val KEY_UPDATE_STARTED_CODE = "update_started_code"
         private const val KEY_CUSTOM_BACKGROUND = "custom_background"
+        private const val KEY_CUSTOM_BACKGROUND_CLARITY = "custom_background_clarity"
+        private const val KEY_CUSTOM_BACKGROUND_CROP_LEFT = "custom_background_crop_left"
+        private const val KEY_CUSTOM_BACKGROUND_CROP_TOP = "custom_background_crop_top"
+        private const val KEY_CUSTOM_BACKGROUND_CROP_RIGHT = "custom_background_crop_right"
+        private const val KEY_CUSTOM_BACKGROUND_CROP_BOTTOM = "custom_background_crop_bottom"
         private const val CUSTOM_BACKGROUND_FILE_NAME = "custom_schedule_background"
+        private const val CUSTOM_BACKGROUND_SOURCE_FILE_NAME = "custom_schedule_background_source"
         private const val MAX_CUSTOM_BACKGROUND_BYTES = 30L * 1024L * 1024L
         private const val MAX_CUSTOM_BACKGROUND_DIMENSION = 2048
         private const val VERSION_URL = "https://raw.giteeusercontent.com/sleexy/onlinedata/raw/master/WeSDAU_Class_Schedule_version.json"
@@ -6211,7 +7026,8 @@ class MainActivity : ComponentActivity() {
         private val PUBLIC_TOGGLE_BACKGROUND = Color.rgb(239, 241, 243)
         private val PUBLIC_TOGGLE_OUTLINE = Color.rgb(143, 199, 246)
         private val SCHEDULE_BACKGROUND = Color.rgb(238, 242, 250)
-        private val CUSTOM_BACKGROUND_SCRIM = Color.argb(92, 238, 241, 248)
+        private const val DEFAULT_BACKGROUND_CLARITY = 0.64f
+        private const val MIN_BACKGROUND_CLARITY = 0.40f
         private val GRADIENT_COLORS = intArrayOf(
             Color.rgb(243, 242, 249), // #F3F2F9
             Color.rgb(240, 241, 249), // #F0F1F9
